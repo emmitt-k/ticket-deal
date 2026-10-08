@@ -155,34 +155,31 @@ make test-race       # prove 1k concurrent reservations → exactly N winners
 Then for the daily dev loop:
 
 ```bash
+# Run the system
 make all-services    # start api + worker + watcher in background (logs → logs/)
 make dashboard-bg    # start the k6 live dashboard on http://localhost:8082/
+open http://localhost:8082/      # watch load tests in real time
 make status          # see what is running + DB/Redis counts
 make logs            # tail all background logs
-```
 
-`make stop` cleans up `api/worker/watcher/dashboard`; `make stop-loadtest` cleans up any backgrounded k6 burst/ramp.
-
-### Smoke test (full happy path)
-
-```bash
-# 1. Start the three processes in the background
-make all-services                # api + worker + watcher; logs → logs/
-
-# 2. Mint a JWT (godotenv picks up .env)
+# Test it
+make all-services
 JWT=$(USER_ID=smoke-user EVENT_ID=1 make -s mintjwt)
-
-# 3. POST /enter to be admitted (or hit the queue if event is full)
 curl -sS -X POST http://localhost:8080/api/tickets/enter \
   -H "Content-Type: application/json" -d '{"user_id":"smoke-user","event_id":1}'
-
-# 4. POST /reserve with the token → 200 + reservation_id
 curl -sS -X POST http://localhost:8080/api/tickets/reserve \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $JWT" -d '{"seats_requested":1}'
+  -H "Content-Type: application/json" -H "Authorization: Bearer $JWT" \
+  -d '{"seats_requested":1}'
 # → {"reservation_id":"...","seats":1,"expires_in":600}
 
-# 5. (cleanup) make stop
+# Load test it (auto-resets state + mints JWTs + runs k6 in background)
+make loadtest-burst  # 1000 VUs, ~1s — pure correctness shock
+make loadtest-ramp   # 0→50→200→1000 VUs, ~90s — wave ramp (dashboard tracks VU curve)
+make status          # reserved=100, sold_out=1.8M, p(99)=62ms after the ramp
+
+# Stop everything
+make stop            # api/worker/watcher/dashboard
+make stop-loadtest   # any backgrounded k6 (burst or ramp)
 ```
 
 ### What you should see
@@ -206,33 +203,34 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **Phase 8 done.** All Phases 0–8 complete — see [Load testing](#load-testing-k6--live-dashboard) below for the proof of correctness under load.
+> **All Phases 0–9 complete.** Run `make loadtest-burst` or `make loadtest-ramp` (see [Quick Start](#quick-start) above) to prove the core invariant under load.
 
 ### Load testing (k6 + live dashboard)
 
-`/loadtest` ships two k6 scripts and a live web dashboard. Both prove the same core invariant — **with `initial_inventory=100` and 1000 unique users each requesting 1 seat, exactly 100 succeed and the rest get 409** — but under different load shapes.
+`/loadtest` ships two k6 scripts. Both prove the same invariant — **with `initial_inventory=100` and 1000 unique users, exactly 100 succeed and 900 get 409** — under different shapes:
 
-| Script | Shape | Best for | Duration |
+| Script | Shape | Duration | Make target |
 |---|---|---|---|
-| `loadtest/burst.js` | 1000 VUs, 1 iter each — pure shock | Correctness check (no oversell, no data loss) | <1 s |
-| `loadtest/ramp.js`  | 7 stages: 0 → 50 → 200 → 1000 VUs | Watching the system respond to *increasing* load (screencast-friendly) | ~90 s |
+| `loadtest/burst.js` | 1000 VUs, 1 iter each — pure shock | <1 s | `make loadtest-burst` |
+| `loadtest/ramp.js`  | 7 stages: 0 → 50 → 200 → 1000 VUs | ~90 s | `make loadtest-ramp` |
 
-The shared dashboard (`loadtest/dashboard.html` served by `cmd/dashboard-server`) auto-polls k6's REST API every 1s and shows: active VUs (the headline number during a ramp), request rate, latency p50/p90/p95/p99, status-code breakdown (200 vs 409), and a progress bar. Without `--linger`, k6 exits when the test finishes; with it, the REST API stays up so you can keep watching the numbers (Ctrl-C to quit).
+The shared live dashboard (`loadtest/dashboard.html` served by `cmd/dashboard-server`) polls k6's REST API every 1s — VU count, request rate, latency p50/p90/p95/p99, 200 vs 409 split, progress bar. Both tests run k6 in the background with `--linger` so the dashboard stays populated after the test finishes.
 
-#### Run the burst (1 second of shock)
+**How to run** (commands are also in [Quick Start](#quick-start) above):
 
 ```bash
-# Pre-reqs: services + dashboard running
-make all-services dashboard-bg    # api/worker/watcher + http://localhost:8082/
-open http://localhost:8082/        # open the live UI in your browser FIRST
-
-# Then the actual test (auto-resets state + mints JWTs + runs k6 in background)
-make loadtest-burst
-
-# To re-run: make stop-loadtest && make loadtest-burst
+make all-services dashboard-bg     # 1. start the system
+open http://localhost:8082/         # 2. open the live UI in your browser
+make loadtest-burst                # 3a. correctness shock — ~1s
+# or:
+make loadtest-ramp                 # 3b. wave ramp — ~90s, VU count climbs
+# 4. (optional) re-run:
+make stop-loadtest && make loadtest-burst
+# 5. (cleanup)
+make stop
 ```
 
-Expected output (also written to `logs/k6-burst.log`):
+**Expected output** (printed by k6 and written to `logs/k6-*.log`):
 
 ```
 ─────────────── LOAD TEST RESULTS ───────────────
@@ -244,36 +242,7 @@ Expected output (also written to `logs/k6-burst.log`):
 ──────────────────────────────────────────────────
 ```
 
-#### Run the ramp (90 seconds of waves — like the YouTube videos)
-
-```bash
-make all-services dashboard-bg
-open http://localhost:8082/
-make loadtest-ramp
-# k6 runs in the background for ~90s; the dashboard tracks the VU curve
-# in real time. To free the REST port: make stop-loadtest
-```
-
-Tune the VU count: `make loadtest-burst VUS=500`, `make loadtest-ramp VUS=2000`. To target a different event: `EVENT_ID=2 make loadtest-burst`.
-
-The dashboard will show VU count climbing 0 → 50 → 200 → 1000 in waves (the "█" bars in the terminal output below are the same number the dashboard graph is drawing). A real run looks like this — 1.8M requests over 90 s, exactly 100 winners, zero errors:
-
-```
-t=  5s  VUs=  49  ██            rate=18433/s  200=100  409= 190466
-t= 10s  VUs=  50  ██            rate=19292/s  200=100  409= 297711
-t= 25s  VUs= 122  ██████        rate=19906/s  200=100  409= 615953
-t= 30s  VUs= 200  ██████████    rate=19958/s  200=100  409= 718963
-t= 50s  VUs= 512  ████████...   rate=20005/s  200=100  409=1135223
-t= 60s  VUs=1000  ██████████... rate=19999/s  200=100  409=1340616
-t= 75s  VUs=1000  ██████████... rate=20084/s  200=100  409=1659254
-t= 85s  VUs=   0                rate=20129/s  200=100  409=1811531
-```
-
-`reserved_ok` stays pinned at 100 for the entire 90 seconds — because inv=100 is decided in the first few hundred milliseconds and the ramp can never change that. The interesting number to watch is `rate` (does throughput scale linearly with VU count?) and `p99` (does latency degrade as the system absorbs more concurrent load?). On an M5 we held 20,000 req/s for a full minute with p99=62 ms.
-
-The real correctness assertions (the four ✅ lines) live in `handleSummary()` at the bottom of each k6 script — k6's `http_req_failed` threshold is intentionally relaxed because we *expect* ~90% of the requests to be 409s; the `handleSummary` check distinguishes "expected 409" from "unexpected 5xx" via the dedicated `reserved_ok` / `sold_out` / `other_status` Counters.
-
-Tune the burst size with `VUS=N ./loadtest/mint-jwts.sh N && VUS=N k6 run ...`. To target a different event, pass `EVENT_ID=N` to `reset-state.sh` and `mint-jwts.sh`.
+Tune the load: `make loadtest-burst VUS=500`, `make loadtest-ramp VUS=2000`. Target a different event: `EVENT_ID=2 make loadtest-burst`. For the why behind the k6 script structure, the dashboard polling, and the 4 assertion categories → [`/docs/architecture.md`](docs/architecture.md) §13 (`loadtest/` section).
 
 ---
 
