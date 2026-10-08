@@ -22,6 +22,10 @@ coverage.out
 # the compiled binaries.
 /bin/
 
+# ─── Transient dev scripts (older smoke-test helpers) ────────
+# Use cmd/mintjwt, cmd/seed-inventory, etc. — not ad-hoc scripts.
+/scripts/
+
 # ─── Editors / OS ─────────────────────────────────────────────
 .vscode/
 .idea/

@@ -153,13 +153,40 @@ PGPASSWORD=tickets psql -h localhost -U tickets -d tickets -f migrations/003_add
 cp .env.example .env
 openssl rand -hex 32 | pbcopy     # paste the result into JWT_SECRET= in .env
 
-# 4. Verify
+# 4. Mirror the seeded event into Redis (the API reads inv from Redis, not Postgres)
+go run ./cmd/seed-inventory
+# → seed: inventory:event:1 = 100 (event 1: "Dev Test Event: Ticketmaster-style Drop")
+# → seed: done — 1 event(s) seeded into Redis
+
+# 5. Verify
 docker compose ps                 # all 3 services should be "healthy"
 pgcli -h localhost -U tickets -d tickets -c "SELECT id, name, initial_inventory FROM events;"
-redis-cli PING                    # expect PONG
+redis-cli GET inventory:event:1  # expect 100
 
-# 5. Run the Redis layer tests (proves 1k concurrent → exactly N reservations)
+# 6. Run the Redis layer tests (proves 1k concurrent → exactly N reservations)
 go test -race ./internal/redis/...
+```
+
+### Smoke test (full happy path)
+
+```bash
+# 1. Start all three processes
+go build -o bin/api ./cmd/api && ./bin/api &
+go build -o bin/worker ./cmd/worker && ./bin/worker &
+go build -o bin/expiration-watcher ./cmd/expiration-watcher &
+
+# 2. Mint a JWT (godotenv picks up .env)
+JWT=$(USER_ID=smoke-user EVENT_ID=1 go run ./cmd/mintjwt)
+
+# 3. POST /enter to be admitted (or hit the queue if event is full)
+curl -sS -X POST http://localhost:8080/api/tickets/enter \
+  -H "Content-Type: application/json" -d '{"user_id":"smoke-user","event_id":1}'
+
+# 4. POST /reserve with the token → 200 + reservation_id
+curl -sS -X POST http://localhost:8080/api/tickets/reserve \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $JWT" -d '{"seats_requested":1}'
+# → {"reservation_id":"...","seats":1,"expires_in":600}
 ```
 
 ### What you should see

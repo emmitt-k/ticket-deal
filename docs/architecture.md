@@ -788,7 +788,7 @@ Module `github.com/emmitt-k/ticket-deal`, Go 1.27.1. Direct deps:
 
 ---
 
-### `cmd/` — three binaries
+### `cmd/` — five binaries
 
 #### `cmd/api/main.go`
 
@@ -798,11 +798,19 @@ The whole HTTP server bootstrap. Loads config, builds Redis client, starts the d
 
 #### `cmd/worker/main.go`
 
-The SQS consumer + Phase 7 sweep goroutine. Loads worker env vars (DATABASE_URL, SQS_QUEUE_URL, REDIS_ADDR, SWEEP_INTERVAL_SECONDS), opens a Postgres pool, opens a Redis client, runs `expire.RunSweep` as a goroutine, then blocks on `queue.Poll` for SQS messages. The Poll handler unmarshals `queue.Reservation` and calls `db.InsertIfAbsent` (which now writes the `seats` column).
+The SQS consumer + Phase 7 sweep goroutine. Loads worker env vars (DATABASE_URL, SQS_QUEUE_URL, REDIS_ADDR, SWEEP_INTERVAL_SECONDS) — including a `_ = godotenv.Load()` at the top of `loadConfig()` so the binary runs from a `.env` in dev with no shell exports — opens a Postgres pool, opens a Redis client, runs `expire.RunSweep` as a goroutine, then blocks on `queue.Poll` for SQS messages. The Poll handler unmarshals `queue.Reservation` and calls `db.InsertIfAbsent` (which now writes the `seats` column).
 
 #### `cmd/expiration-watcher/main.go`
 
-Phase 7's event-driven path. Loads `DATABASE_URL` + `REDIS_ADDR`, opens both clients, then blocks on `expire.RunWatcher(ctx, rdb, pool)`. Logs `clean shutdown` on `SIGINT`/`SIGTERM`.
+Phase 7's event-driven path. Loads `DATABASE_URL` + `REDIS_ADDR` (also via `godotenv.Load()` for dev ergonomics — same shim as the worker), opens both clients, then blocks on `expire.RunWatcher(ctx, rdb, pool)`. Logs `clean shutdown` on `SIGINT`/`SIGTERM`.
+
+#### `cmd/seed-inventory/main.go`
+
+Dev-tool: copies `events.initial_inventory` from Postgres into the canonical Redis key (`redis.InventoryKey(id)` = `inventory:event:<id>`) so the `POST /reserve` Lua script can read it. Idempotent (hard `SET`, not `INCR`), safe to re-run between dev sessions. Pairs with the `002_seed.sql` migration: that creates the Postgres row, this mirrors it into Redis. Required because the API's reserve path expects Redis to already be populated; the seeder is the missing bootstrap step. Run via `go run ./cmd/seed-inventory` (or `./bin/seed-inventory` after `go build`). Refuses to run without `DATABASE_URL`.
+
+#### `cmd/mintjwt/main.go`
+
+Dev-tool: mints a short-lived HS256 JWT for smoke-testing `POST /api/tickets/reserve` (or anything else that goes through `auth.Middleware`). Reads `JWT_SECRET` from env (godotenv in dev) — **never embeds the secret in source** — refuses to run if the secret is missing or shorter than 32 bytes. Same default `USER_ID`/`EVENT_ID`/`TTL_SECONDS` env vars as the old `scripts/mintjwt.go`, plus a `TTL_SECONDS` override. Calls the same `auth.Issue` the API uses, so a test token can never drift from a real one.
 
 ---
 
@@ -1064,9 +1072,7 @@ Background reading on Redis primitives used (Lua atomicity, keyspace notificatio
 
 ### `scripts/`
 
-#### `scripts/mintjwt.go`
-
-**Untracked smoke-test artifact** (`//go:build ignore`). Was used during Phase 5/6 to mint a JWT for end-to-end smoke tests. Imports `internal/auth.Issue` with a hardcoded secret; reads `USER_ID` + `EVENT_ID` env vars; prints the token to stdout. Run via `go run scripts/mintjwt.go` to get a fresh token for curl. Currently untracked — delete manually if undesired.
+Empty (was a scratchpad for the old `mintjwt.go` smoke helper; the helper was promoted to `cmd/mintjwt/main.go` so the JWT secret could be env-driven and the binary could be committed). Anything that used to live here should either become a `cmd/<name>/main.go` or be deleted.
 
 ---
 
