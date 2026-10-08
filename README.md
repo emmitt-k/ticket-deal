@@ -61,7 +61,7 @@ The three phases, in one line each:
 | 3   | HTTP API + JWT              | ✅ Done      | `cmd/api/main.go` (chi, graceful shutdown); HS256 Issue/Verify/middleware; 14 tests; alg=none + replay rejected |
 | 4   | Waiting room + SSE          | ✅ Done      | IP bucket (`ip_bucket.lua`) → event bucket (`token_bucket.lua`) → JWT or ZSET queue; SSE position stream; drainer goroutine issues JWTs as tokens refill; 15 tests |
 | 5   | Reservation endpoint        | ✅ Done      | `internal/api/reserve_handler.go`: JWT claims → UUID reservation_id, Lua reserve → 200/409/404; `ReservationPublisher` interface + `LogPublisher` stub (Phase 6 swaps for SQS); 15 tests |
-| 6   | SQS & Worker                | Pending      | `cmd/worker` SQS consumer + `INSERT ... ON CONFLICT DO NOTHING` into Postgres; real `SQSPublisher` replaces the stub |
+| 6   | SQS & Worker                | ✅ Done      | `internal/queue` (publisher + consumer + Reservation wire type), `internal/db` (pgx pool + InsertIfAbsent), `cmd/worker` consumer binary; `SQSPublisher` wired into API; at-least-once + idempotent INSERT; 16 tests |
 | 7   | Expiration handling         | Pending      | Keyspace listener (`__keyevent@0__:expired`) returns inventory + marks status EXPIRED; 60-s DB sweep as safety net |
 | 8   | Load test + invariants      | Pending      | k6 burst, zero-oversell + zero-lose assertions (`scripts/verify.sh`)                                     |
 | 9   | Polish                      | Pending      | Makefile (`up/migrate/test/loadtest/verify`), README quick-start, clean fresh-clone experience            |
@@ -106,8 +106,8 @@ The three phases, in one line each:
 │   ├── iplimit/              # Per-IP token bucket (rate limit at /enter) [✅ Phase 4]
 │   ├── waitingroom/          # Per-event token bucket + ZSET queue + SSE handler + drainer [✅ Phase 4]
 │   ├── redis/                # Lua scripts + Go wrappers [✅ Phase 2]
-│   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2)
-│   └── postgres/             # DB connection + reservation queries
+│   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2) [✅ Phase 6]
+│   └── db/                   # pgx pool + InsertIfAbsent (idempotent) [✅ Phase 6]
 ├── migrations/
 │   ├── 001_init.sql          # events, reservations, idempotency PK, partial index
 │   └── 002_seed.sql          # Dev event id=1 with 100 inventory
@@ -180,7 +180,7 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **Next:** move on to Phase 6 (SQS & Worker) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
+> **Next:** move on to Phase 7 (Expiration handling) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
 
 ---
 
