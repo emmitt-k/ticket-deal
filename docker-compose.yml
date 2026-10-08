@@ -54,6 +54,11 @@ services:
     ports:
       - "9324:9324"   # SQS-compatible REST API
       - "9325:9325"   # Web UI (queues + messages)
+    volumes:
+      # Mount our config at the path the image's default CMD already reads:
+      #   java -Dconfig.file=/opt/elasticmq.conf -jar /opt/elasticmq/elasticmq-server.jar
+      # No `command:` override needed.
+      - ./docker/elasticmq.conf:/opt/elasticmq.conf:ro
     healthcheck:
       # Any HTTP response proves the port is listening; status code doesn't matter
       # (ElasticMQ returns 400 on bare GET /, but we only care about TCP being open)
