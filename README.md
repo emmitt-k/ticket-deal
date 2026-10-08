@@ -64,7 +64,7 @@ The three phases, in one line each:
 | 6   | SQS & Worker                | ✅ Done      | `internal/queue` (publisher + consumer + Reservation wire type), `internal/db` (pgx pool + InsertIfAbsent), `cmd/worker` consumer binary; `SQSPublisher` wired into API; at-least-once + idempotent INSERT; 16 tests |
 | 7   | Expiration handling         | ✅ Done      | `internal/expire` (Compensate + RunWatcher + RunSweep), `cmd/expiration-watcher` (PSUBSCRIBE `__keyevent@0__:expired`), sweep goroutine inside `cmd/worker`; watcher fires real-time, sweep is the safety net; both converge on a single CAS UPDATE so only one INCRBY happens per (user, event); 20 tests (incl. 50-goroutine race, multi-seat, idempotent) |
 | 8   | Load test + invariants      | ✅ Done      | `loadtest/burst.js` (1000 VUs, 1 iter — pure shock) + `loadtest/ramp.js` (7-stage 0→50→200→1000 VUs, ~90s); live dashboard on http://localhost:8082 (polls k6 REST); 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
-| 9   | Polish                      | Pending      | Makefile (`up/migrate/test/loadtest/verify`), README quick-start, clean fresh-clone experience            |
+| 9   | Polish                      | ✅ Done      | `Makefile` (30+ targets, `make help`), `scripts/start-bg.sh` + `stop-bg.sh` (idempotent PID-tracked bg), `make status` shows live container + service + DB/Redis state; all commands now one-liners |
 
 > Full phased plan with file layout, code snippets, verification steps, and the lite-auth design → [`/docs/implementation-plan.md`](docs/implementation-plan.md)
 
@@ -140,43 +140,37 @@ brew install --cask docker   # if you don't have Docker Desktop yet
 
 ### Run it
 
+The whole project is driven by `make`. Run `make help` for the full list; the common first-time flow:
+
 ```bash
-# 1. Spin up everything (Redis + Postgres + ElasticMQ; reservations queue auto-created)
-docker compose up -d
-
-# 2. Apply schema + seed an event
-PGPASSWORD=tickets psql -h localhost -U tickets -d tickets -f migrations/001_init.sql
-PGPASSWORD=tickets psql -h localhost -U tickets -d tickets -f migrations/002_seed.sql
-PGPASSWORD=tickets psql -h localhost -U tickets -d tickets -f migrations/003_add_seats.sql
-
-# 3. Copy the env template and set a JWT secret
-cp .env.example .env
-openssl rand -hex 32 | pbcopy     # paste the result into JWT_SECRET= in .env
-
-# 4. Mirror the seeded event into Redis (the API reads inv from Redis, not Postgres)
-go run ./cmd/seed-inventory
-# → seed: inventory:event:1 = 100 (event 1: "Dev Test Event: Ticketmaster-style Drop")
-# → seed: done — 1 event(s) seeded into Redis
-
-# 5. Verify
-docker compose ps                 # all 3 services should be "healthy"
-pgcli -h localhost -U tickets -d tickets -c "SELECT id, name, initial_inventory FROM events;"
-redis-cli GET inventory:event:1  # expect 100
-
-# 6. Run the Redis layer tests (proves 1k concurrent → exactly N reservations)
-go test -race ./internal/redis/...
+make doctor          # check prereqs (go, docker, k6, curl)
+make up              # start Redis + Postgres + ElasticMQ via docker compose
+make migrate         # apply all 3 SQL migrations in order
+make env             # copy .env.example → .env (edit JWT_SECRET if you want)
+make seed            # copy events.initial_inventory from Postgres → Redis
+make build           # build all 6 binaries into bin/
+make test-race       # prove 1k concurrent reservations → exactly N winners
 ```
+
+Then for the daily dev loop:
+
+```bash
+make all-services    # start api + worker + watcher in background (logs → logs/)
+make dashboard-bg    # start the k6 live dashboard on http://localhost:8082/
+make status          # see what is running + DB/Redis counts
+make logs            # tail all background logs
+```
+
+`make stop` cleans up `api/worker/watcher/dashboard`; `make stop-loadtest` cleans up any backgrounded k6 burst/ramp.
 
 ### Smoke test (full happy path)
 
 ```bash
-# 1. Start all three processes
-go build -o bin/api ./cmd/api && ./bin/api &
-go build -o bin/worker ./cmd/worker && ./bin/worker &
-go build -o bin/expiration-watcher ./cmd/expiration-watcher &
+# 1. Start the three processes in the background
+make all-services                # api + worker + watcher; logs → logs/
 
 # 2. Mint a JWT (godotenv picks up .env)
-JWT=$(USER_ID=smoke-user EVENT_ID=1 go run ./cmd/mintjwt)
+JWT=$(USER_ID=smoke-user EVENT_ID=1 make -s mintjwt)
 
 # 3. POST /enter to be admitted (or hit the queue if event is full)
 curl -sS -X POST http://localhost:8080/api/tickets/enter \
@@ -187,6 +181,8 @@ curl -sS -X POST http://localhost:8080/api/tickets/reserve \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $JWT" -d '{"seats_requested":1}'
 # → {"reservation_id":"...","seats":1,"expires_in":600}
+
+# 5. (cleanup) make stop
 ```
 
 ### What you should see
@@ -226,21 +222,17 @@ The shared dashboard (`loadtest/dashboard.html` served by `cmd/dashboard-server`
 #### Run the burst (1 second of shock)
 
 ```bash
-# 1. Reset state
-./loadtest/reset-state.sh
+# Pre-reqs: services + dashboard running
+make all-services dashboard-bg    # api/worker/watcher + http://localhost:8082/
+open http://localhost:8082/        # open the live UI in your browser FIRST
 
-# 2. Pre-mint 1000 unique JWTs (one per VU)
-./loadtest/mint-jwts.sh 1000
+# Then the actual test (auto-resets state + mints JWTs + runs k6 in background)
+make loadtest-burst
 
-# 3. Start the dashboard server
-./bin/dashboard-server &
-
-# 4. Refresh the dashboard in your browser FIRST, then run k6
-open http://localhost:8082/
-k6 run --address localhost:6565 --linger /Users/it000058/Documents/ticket-deal/loadtest/burst.js
+# To re-run: make stop-loadtest && make loadtest-burst
 ```
 
-Expected output:
+Expected output (also written to `logs/k6-burst.log`):
 
 ```
 ─────────────── LOAD TEST RESULTS ───────────────
@@ -255,12 +247,14 @@ Expected output:
 #### Run the ramp (90 seconds of waves — like the YouTube videos)
 
 ```bash
-./loadtest/reset-state.sh
-./loadtest/mint-jwts.sh 1000     # JWTs default to 600s TTL — long enough for the full ramp
-./bin/dashboard-server &
+make all-services dashboard-bg
 open http://localhost:8082/
-k6 run --address localhost:6565 --linger /Users/it000058/Documents/ticket-deal/loadtest/ramp.js
+make loadtest-ramp
+# k6 runs in the background for ~90s; the dashboard tracks the VU curve
+# in real time. To free the REST port: make stop-loadtest
 ```
+
+Tune the VU count: `make loadtest-burst VUS=500`, `make loadtest-ramp VUS=2000`. To target a different event: `EVENT_ID=2 make loadtest-burst`.
 
 The dashboard will show VU count climbing 0 → 50 → 200 → 1000 in waves (the "█" bars in the terminal output below are the same number the dashboard graph is drawing). A real run looks like this — 1.8M requests over 90 s, exactly 100 winners, zero errors:
 

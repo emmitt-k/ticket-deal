@@ -4,7 +4,7 @@
 
 This document complements the [README](../README.md). The README is the project landing page; this is the engineering manual. **§1–§12 explain the design**, **§13 is a per-file reference** for when you need to find or modify a specific file.
 
-**Code state reflected:** through Phase 8 (Load test + invariants). Phases 0–8 are landed; the headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) produces exactly 100 × 200 + 900 × 409 — see the [Load testing](../README.md#load-testing-k6--live-dashboard) section of the README. Phase 9 (polish) is next.
+**Code state reflected:** through Phase 9 (Makefile + polish). Phases 0–9 are landed; the whole project is driven by `make help`. The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) produces exactly 100 × 200 + 900 × 409 — see the [Load testing](../README.md#load-testing-k6--live-dashboard) section of the README.
 
 ---
 
@@ -1101,6 +1101,22 @@ Idempotent state reset for repeat runs. Truncates `reservations WHERE event_id=$
 Pre-mints N unique JWTs to a file (default `/tmp/k6_jwts.txt`, one JWT per line). Loops `USER_ID=k6user-$i` through `bin/mintjwt` with `2>/dev/null` and a trailing `echo` to produce a line-oriented file. Build `bin/mintjwt` if missing. Default TTL is 600 s (matches the reserve-hold TTL — long enough for the 90 s ramp test plus repeated runs without re-minting; override with `TTL_SECONDS=...`). ~5 sec for 1000 JWTs on an M5.
 
 ---
+
+### `Makefile` + `scripts/` — Phase 9 polish
+
+#### `Makefile`
+
+The single entry point for the whole project. `make help` lists 30+ targets (every line is grepped for `## comment` so descriptions stay in sync). Targets are grouped: setup (`up`, `migrate`, `seed`, `env`, `doctor`), build (`build`, `vet`, `test`, `test-race`), run-foreground (`api`, `worker`, `watcher`), run-background (`api-bg`, `worker-bg`, `watcher-bg`, `dashboard-bg`, `all-services`, `stop`), tools (`mintjwt`, `dashboard`), load-test (`loadtest-burst`, `loadtest-ramp`, `loadtest-state`, `loadtest-jwts`, `stop-loadtest`), cleanup (`clean`, `purge`), status (`status`, `logs`). Common overrides via `make <target> VUS=500 EVENT_ID=2 USER=alice`.
+
+The two load-test targets pre-flight a `curl -sf -m 2 http://localhost:8080/healthz` and fail fast with a clear "API not running on :8080" message if the API isn't up — prevents the silent-failure mode where k6 fires 1000 requests into a dead socket and the dashboard shows 1000 `connection refused` as "other_status". They run k6 in the background (via `scripts/start-bg.sh k6-burst k6 ... --linger`) so the Make target returns immediately and the dashboard stays populated with the final state.
+
+#### `scripts/start-bg.sh`
+
+Launch a binary in the background, save PID to `logs/<name>.pid`, log stdout+stderr to `logs/<name>.log`. Idempotent: if the PID file is alive, prints "already running" and exits 0; if the PID is stale, cleans up and starts fresh. Sleeps 0.3s after launch and checks the PID — if the process died during startup (bad import, port already bound, etc.), tails the log and exits 1. macOS doesn't ship `setsid`; the `nohup ... & disown` pattern is what we use.
+
+#### `scripts/stop-bg.sh`
+
+Reads `logs/<name>.pid`, sends SIGINT, waits 5s for graceful shutdown, escalates to SIGKILL only if still alive. Removes the PID file on success. No-op (with a friendly message) if the service isn't running. The 5-second grace matches the API's `http.Server` graceful-shutdown timeout.
 
 ## See also
 

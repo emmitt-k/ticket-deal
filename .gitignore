@@ -23,8 +23,12 @@ coverage.out
 /bin/
 
 # ─── Transient dev scripts (older smoke-test helpers) ────────
-# Use cmd/mintjwt, cmd/seed-inventory, etc. — not ad-hoc scripts.
-/scripts/
+# The old scripts/mintjwt.go had a hardcoded secret; it was promoted to
+# cmd/mintjwt/main.go so the secret could be env-driven. The .go file is
+# still on disk (user deletes manually per the no-rm safety rule) but
+# must never be committed. The .sh files in scripts/ ARE tracked
+# (start-bg.sh / stop-bg.sh are real dev tooling used by the Makefile).
+/scripts/*.go
 
 # ─── Editors / OS ─────────────────────────────────────────────
 .vscode/
