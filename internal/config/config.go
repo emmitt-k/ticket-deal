@@ -38,6 +38,20 @@ type Config struct {
 	// Redis before the seat auto-releases. Mirrors the 10-minute
 	// payment window in the README's flow diagram.
 	ReserveHoldTTL int
+
+	// SQS is the SQS client config. The API publishes reservation
+	// events here; the worker (cmd/worker) consumes them. EndpointURL
+	// points at local ElasticMQ in dev, "" for prod (real SQS).
+	SQS SQSConfig
+}
+
+// SQSConfig groups the AWS-side knobs both the API publisher and the
+// worker consumer need. Kept distinct from queue.AWSConfig because the
+// API only knows about SQS via config, not via the queue package's types.
+type SQSConfig struct {
+	Region      string // AWS region (e.g. "us-east-1")
+	EndpointURL string // empty in prod; "http://localhost:9324" locally
+	QueueURL    string // the reservations queue URL
 }
 
 // RedisConfig is the subset of go-redis Options needed by the API server.
@@ -108,6 +122,11 @@ func Load() (*Config, error) {
 			QueueTTLSeconds: atoiOr(getEnv("WAIT_ROOM_QUEUE_TTL", "300"), 300),
 		},
 		ReserveHoldTTL: atoiOr(getEnv("RESERVE_HOLD_TTL_SECONDS", "600"), 600),
+		SQS: SQSConfig{
+			Region:      getEnv("AWS_REGION", "us-east-1"),
+			EndpointURL: getEnv("SQS_ENDPOINT_URL", ""),
+			QueueURL:    getEnv("SQS_QUEUE_URL", ""),
+		},
 	}
 
 	return cfg, nil

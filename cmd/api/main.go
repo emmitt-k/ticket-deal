@@ -29,6 +29,7 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
+	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 	"github.com/emmitt-k/ticket-deal/internal/waitingroom"
 )
@@ -88,9 +89,9 @@ func run() error {
 	r.Route("/api/tickets", func(r chi.Router) {
 		r.Post("/enter", waitingroom.EnterHandler(*cfg, rdb))
 		r.Get("/queue", waitingroom.QueueSSEHandler(rdb))
-		// Phase 5: /reserve (JWT-protected) — Lua reserve → publisher
+		// Phase 5/6: /reserve (JWT-protected) — Lua reserve → SQS publish
 		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reserve",
-			api.ReserveHandler(rdb, api.LogPublisher{},
+			api.ReserveHandler(rdb, buildPublisher(*cfg),
 				time.Duration(cfg.ReserveHoldTTL)*time.Second))
 	})
 
@@ -172,4 +173,36 @@ func run() error {
 	}
 	log.Printf("api: clean shutdown complete")
 	return nil
+}
+
+// buildPublisher constructs the Phase 6 SQS publisher wired into the
+// /reserve handler. The same binary works against real AWS (EndpointURL
+// is empty) and local ElasticMQ (EndpointURL = http://localhost:9324).
+//
+// In dev environments where SQS_QUEUE_URL is unset (e.g. someone
+// running the API before ElasticMQ is up), we fall back to
+// api.LogPublisher, which logs the message body instead of sending
+// it to SQS. This keeps the API runnable for handler-level work
+// without requiring the worker side to be configured.
+func buildPublisher(cfg config.Config) api.ReservationPublisher {
+	if cfg.SQS.QueueURL == "" {
+		log.Printf("api: SQS_QUEUE_URL not set — using LogPublisher (messages will not reach worker)")
+		return api.LogPublisher{}
+	}
+
+	sqsClient, err := queue.NewSQSClient(context.Background(), queue.AWSConfig{
+		Region:      cfg.SQS.Region,
+		EndpointURL: cfg.SQS.EndpointURL,
+		QueueURL:    cfg.SQS.QueueURL,
+	})
+	if err != nil {
+		// Fail-fast: if we can't reach SQS at startup, the /reserve
+		// hot path is broken. Better to crash now than to discover
+		// it after the first batch of reservations.
+		log.Fatalf("api: build SQS client: %v", err)
+	}
+
+	log.Printf("api: SQS publisher wired (region=%s, endpoint=%q, queue=%s)",
+		cfg.SQS.Region, cfg.SQS.EndpointURL, cfg.SQS.QueueURL)
+	return queue.NewReservationAPIPublisher(queue.NewSQSPublisher(sqsClient, cfg.SQS.QueueURL))
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
+	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
 
@@ -124,19 +125,21 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		now := time.Now()
 		expiresAt := now.Add(holdTTL)
 
-		// Build the message body. Phase 6's worker will JSON-decode
-		// exactly this shape, so changing it is a contract change.
-		payload, err := json.Marshal(map[string]any{
-			"reservation_id": reservationID,
-			"user_id":        claims.Subject,
-			"event_id":       claims.EventID,
-			"seats":          seats,
-			"created_at":     now.UTC().Format(time.RFC3339),
-			"expires_at":     expiresAt.UTC().Format(time.RFC3339),
+		// Build the wire payload via queue.Reservation so the JSON
+		// shape is guaranteed to match what the worker parses.
+		// Drift between producer and consumer breaks the build, not
+		// production.
+		payload, err := json.Marshal(queue.Reservation{
+			ReservationID: reservationID,
+			UserID:        claims.Subject,
+			EventID:       claims.EventID,
+			Seats:         seats,
+			CreatedAt:     now.UTC().Format(time.RFC3339),
+			ExpiresAt:     expiresAt.UTC().Format(time.RFC3339),
 		})
 		if err != nil {
-			// json.Marshal of a simple map[string]any can only fail on
-			// unsupported types; treat as a programming error.
+			// json.Marshal on a primitive-only struct cannot fail at
+			// runtime; treat as a programming error.
 			log.Printf("api: marshal publish payload failed: %v", err)
 			apiutil.WriteError(w, http.StatusInternalServerError,
 				"internal_error", "failed to build event message")
@@ -145,8 +148,8 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 
 		// Publish failure is logged but does NOT roll back the
 		// reservation: Redis already created the hold, and the worker
-		// (in Phase 6) will be able to handle a redelivered message
-		// anyway because INSERT ... ON CONFLICT DO NOTHING is idempotent.
+		// will handle a redelivered message idempotently
+		// (INSERT ... ON CONFLICT DO NOTHING).
 		if err := publisher.Publish(r.Context(), payload); err != nil {
 			log.Printf("api: publish failed (reservation still valid) res=%s: %v",
 				reservationID, err)
