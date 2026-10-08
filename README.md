@@ -63,7 +63,7 @@ The three phases, in one line each:
 | 5   | Reservation endpoint        | ✅ Done      | `internal/api/reserve_handler.go`: JWT claims → UUID reservation_id, Lua reserve → 200/409/404; `ReservationPublisher` interface + `LogPublisher` stub (Phase 6 swaps for SQS); 15 tests |
 | 6   | SQS & Worker                | ✅ Done      | `internal/queue` (publisher + consumer + Reservation wire type), `internal/db` (pgx pool + InsertIfAbsent), `cmd/worker` consumer binary; `SQSPublisher` wired into API; at-least-once + idempotent INSERT; 16 tests |
 | 7   | Expiration handling         | ✅ Done      | `internal/expire` (Compensate + RunWatcher + RunSweep), `cmd/expiration-watcher` (PSUBSCRIBE `__keyevent@0__:expired`), sweep goroutine inside `cmd/worker`; watcher fires real-time, sweep is the safety net; both converge on a single CAS UPDATE so only one INCRBY happens per (user, event); 20 tests (incl. 50-goroutine race, multi-seat, idempotent) |
-| 8   | Load test + invariants      | Pending      | k6 burst, zero-oversell + zero-lose assertions (`scripts/verify.sh`)                                     |
+| 8   | Load test + invariants      | ✅ Done      | `loadtest/burst.js` (1000 VUs, 1 iter each); live dashboard on http://localhost:8082 (polls k6 REST); 100×200 + 900×409 verified, 0 oversell, 0 data loss, p(99)=24ms |
 | 9   | Polish                      | Pending      | Makefile (`up/migrate/test/loadtest/verify`), README quick-start, clean fresh-clone experience            |
 
 > Full phased plan with file layout, code snippets, verification steps, and the lite-auth design → [`/docs/implementation-plan.md`](docs/implementation-plan.md)
@@ -210,7 +210,46 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **Next:** move on to Phase 8 (Load test + invariants) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
+> **Phase 8 done.** All Phases 0–8 complete — see [Load testing](#load-testing-k6--live-dashboard) below for the proof of correctness under load.
+
+### Load testing (k6 + live dashboard)
+
+`/loadtest` ships a one-shot burst test that proves the core invariant: **with `initial_inventory=100` and 1000 concurrent VUs each requesting 1 seat, exactly 100 succeed and 900 get 409 — no oversell, no data loss.** The test rig also includes a live web dashboard that polls k6's REST API every second so you can watch the race in real time.
+
+```bash
+# 1. Reset to a known clean state (truncates DB rows, clears hold keys, re-seeds inv=100)
+./loadtest/reset-state.sh
+
+# 2. Pre-mint 1000 unique JWTs (one per VU, so each has a distinct user_id)
+./loadtest/mint-jwts.sh 1000    # writes to /tmp/k6_jwts.txt
+
+# 3. Start the live dashboard server (serves HTML + proxies k6 REST → same-origin)
+./bin/dashboard-server &        # open http://localhost:8082/ in your browser
+
+# 4. Launch the burst test (1000 VUs, 1 iter each — finishes in <1s locally)
+k6 run --address localhost:6565 --linger /Users/it000058/Documents/ticket-deal/loadtest/burst.js
+
+# 5. Open the dashboard in your browser BEFORE step 4 to see it populate live
+open http://localhost:8082/
+```
+
+The dashboard auto-polls every 1s and shows: active VUs, request rate, latency p50/p90/p95/p99, status-code breakdown (200 vs 409), and a progress bar. Without `--linger`, k6 exits when the test finishes; with it, the REST API stays up so you can keep watching the numbers (Ctrl-C to quit).
+
+**Expected output (last lines of the k6 run):**
+
+```
+─────────────── LOAD TEST RESULTS ───────────────
+  Total requests    : 1000
+  Reserved (200)    :  100  ✅
+  Sold out (409)    :  900  ✅
+  Other status      :    0  ✅
+  Oversell check    : ✅ no oversell
+──────────────────────────────────────────────────
+```
+
+The four ✅ lines are the actual correctness assertions (real values, not k6 thresholds — k6's `http_req_failed` threshold is intentionally relaxed because we *expect* 90% of the requests to be 409s; the real check is in `handleSummary()` in `loadtest/burst.js`).
+
+Tune the burst size with `VUS=N ./loadtest/mint-jwts.sh N && VUS=N k6 run ...`. To target a different event, pass `EVENT_ID=N` to `reset-state.sh` and `mint-jwts.sh`.
 
 ---
 

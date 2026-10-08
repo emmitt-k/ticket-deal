@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>k6 Live Load Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #c9d1d9;
+      font-family: 'SF Mono', Menlo, Monaco, Consolas, monospace;
+      padding: 24px;
+      min-height: 100vh;
+    }
+    h1 { color: #58a6ff; font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+    .subtitle { color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+    .dot.ok { background: #3fb950; box-shadow: 0 0 8px #3fb95080; }
+    .dot.bad { background: #f85149; box-shadow: 0 0 8px #f8514980; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 16px 20px;
+    }
+    .card h2 {
+      color: #8b949e;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+    .big { color: #f0f6fc; font-size: 28px; font-weight: 600; line-height: 1; }
+    .small { color: #8b949e; font-size: 13px; margin-top: 4px; }
+    .green { color: #3fb950; }
+    .red { color: #f85149; }
+    .yellow { color: #d29922; }
+    .blue { color: #58a6ff; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    td { padding: 4px 0; }
+    td:first-child { color: #8b949e; width: 80px; }
+    td:last-child { text-align: right; color: #f0f6fc; }
+    .progress {
+      width: 100%; height: 8px; background: #21262d; border-radius: 4px;
+      overflow: hidden; margin-top: 8px;
+    }
+    .progress-bar {
+      height: 100%; background: linear-gradient(90deg, #3fb950, #58a6ff);
+      transition: width 0.3s ease;
+    }
+    .sparkline { width: 100%; height: 60px; margin-top: 12px; }
+    .sparkline polyline { fill: none; stroke: #58a6ff; stroke-width: 2; }
+    .sparkline .grid line { stroke: #21262d; stroke-width: 1; }
+    .counters { display: flex; gap: 24px; margin-top: 8px; }
+    .counter { flex: 1; }
+    .counter .label { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .counter .value { color: #f0f6fc; font-size: 24px; font-weight: 600; margin-top: 2px; }
+    .counter.ok .value { color: #3fb950; }
+    .counter.bad .value { color: #f85149; }
+    .footer { margin-top: 24px; color: #6e7681; font-size: 12px; text-align: center; }
+  </style>
+</head>
+<body>
+  <h1>k6 Live Load Test <span class="dot bad" id="connDot" title="k6 connection status"></span><span id="connText" class="small">connecting…</span></h1>
+  <div class="subtitle" id="clock">--</div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Active VUs</h2>
+      <div class="big" id="vus">--</div>
+      <div class="small">virtual users in flight</div>
+    </div>
+
+    <div class="card">
+      <h2>Request Rate</h2>
+      <div class="big blue" id="rps">--</div>
+      <div class="small">req/s · <span id="total">--</span> total</div>
+      <svg class="sparkline" viewBox="0 0 300 60" preserveAspectRatio="none">
+        <g class="grid"><line x1="0" y1="30" x2="300" y2="30"/></g>
+        <polyline id="spark" points=""/>
+      </svg>
+    </div>
+
+    <div class="card">
+      <h2>Latency (ms)</h2>
+      <table>
+        <tr><td>p50</td><td id="p50">--</td></tr>
+        <tr><td>p90</td><td id="p90">--</td></tr>
+        <tr><td>p95</td><td id="p95">--</td></tr>
+        <tr><td>p99</td><td id="p99" class="red">--</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Outcomes</h2>
+      <div class="counters">
+        <div class="counter ok"><div class="label">reserved (200)</div><div class="value" id="reserved">0</div></div>
+        <div class="counter bad"><div class="label">sold out (409)</div><div class="value" id="sold">0</div></div>
+      </div>
+      <div class="small" style="margin-top: 12px">others (401, 500, …): <span id="other">0</span></div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>Progress</h2>
+      <div class="big" id="iterations">-- / --</div>
+      <div class="progress"><div class="progress-bar" id="progressBar" style="width: 0%"></div></div>
+      <div class="small" id="iterRate">-- iter/s</div>
+    </div>
+  </div>
+
+  <div class="footer">polls <code>http://localhost:6565/v1/metrics</code> every 1s · refresh-safe (just leave it open)</div>
+
+  <script>
+    // Expect to be served by dashboard-server which proxies /v1/metrics → k6
+    const API = '/v1/metrics';
+    const TOTAL_EXPECTED = parseInt(new URLSearchParams(location.search).get('total') || '1000', 10);
+
+    // ring buffer of last 60 RPS values for the sparkline
+    const spark = [];
+    const SPARK_LEN = 60;
+
+    const $ = (id) => document.getElementById(id);
+    const fmt = (n, decimals = 0) => (n == null || isNaN(n) ? '--' : Number(n).toFixed(decimals));
+    const pad = (n) => String(n).padStart(2, '0');
+
+    function drawSpark() {
+      if (spark.length < 2) return;
+      const max = Math.max(...spark, 1);
+      const pts = spark.map((v, i) => {
+        const x = (i / (SPARK_LEN - 1)) * 300;
+        const y = 60 - (v / max) * 56 - 2;
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      }).join(' ');
+      $('spark').setAttribute('points', pts);
+    }
+
+    function setConn(ok) {
+      $('connDot').className = 'dot ' + (ok ? 'ok' : 'bad');
+      $('connText').textContent = ok ? 'k6 connected' : 'k6 not reachable — is the test running?';
+    }
+
+    async function poll() {
+      const t0 = Date.now();
+      let ok = false;
+      try {
+        const res = await fetch(API, { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const json = await res.json();
+        ok = true;
+        const metrics = {};
+        for (const m of (json.data || [])) {
+          metrics[m.id] = m.attributes.sample;
+        }
+
+        // VUs
+        $('vus').textContent = metrics.vus?.value ?? 0;
+
+        // Throughput
+        const rps = metrics.http_reqs?.rate ?? 0;
+        $('rps').textContent = fmt(rps, 1);
+        $('total').textContent = metrics.http_reqs?.count ?? 0;
+        spark.push(rps);
+        if (spark.length > SPARK_LEN) spark.shift();
+        drawSpark();
+
+        // Latency
+        const dur = metrics.http_req_duration?.values || {};
+        $('p50').textContent = fmt(dur['p(50)'] ?? dur.med, 2);
+        $('p90').textContent = fmt(dur['p(90)'], 2);
+        $('p95').textContent = fmt(dur['p(95)'], 2);
+        $('p99').textContent = fmt(dur['p(99)'], 2);
+
+        // Outcomes
+        const r = metrics.reserved_ok?.count ?? 0;
+        const s = metrics.sold_out?.count ?? 0;
+        const t = metrics.http_reqs?.count ?? 0;
+        $('reserved').textContent = r;
+        $('sold').textContent = s;
+        $('other').textContent = Math.max(0, t - r - s);
+
+        // Progress
+        const iter = metrics.iterations?.count ?? 0;
+        $('iterations').textContent = `${iter} / ${TOTAL_EXPECTED}`;
+        const pct = Math.min(100, (iter / TOTAL_EXPECTED) * 100);
+        $('progressBar').style.width = pct.toFixed(1) + '%';
+        $('iterRate').textContent = fmt(metrics.iterations?.rate, 1) + ' iter/s';
+      } catch (e) {
+        // network failure — leave the numbers, mark as disconnected
+        console.error('poll failed:', e);
+      } finally {
+        setConn(ok);
+        $('clock').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · poll took ' + (Date.now() - t0) + 'ms';
+      }
+    }
+
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>

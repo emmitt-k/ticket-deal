@@ -4,7 +4,7 @@
 
 This document complements the [README](../README.md). The README is the project landing page; this is the engineering manual. **§1–§12 explain the design**, **§13 is a per-file reference** for when you need to find or modify a specific file.
 
-**Code state reflected:** through Phase 7 (Expiration handling). Phases 0–7 are landed; Phase 8 (load test) is next. If a file path here doesn't exist yet, it's Phase 8+ work in progress.
+**Code state reflected:** through Phase 8 (Load test + invariants). Phases 0–8 are landed; the headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) produces exactly 100 × 200 + 900 × 409 — see the [Load testing](../README.md#load-testing-k6--live-dashboard) section of the README. Phase 9 (polish) is next.
 
 ---
 
@@ -788,7 +788,7 @@ Module `github.com/emmitt-k/ticket-deal`, Go 1.27.1. Direct deps:
 
 ---
 
-### `cmd/` — five binaries
+### `cmd/` — six binaries
 
 #### `cmd/api/main.go`
 
@@ -811,6 +811,10 @@ Dev-tool: copies `events.initial_inventory` from Postgres into the canonical Red
 #### `cmd/mintjwt/main.go`
 
 Dev-tool: mints a short-lived HS256 JWT for smoke-testing `POST /api/tickets/reserve` (or anything else that goes through `auth.Middleware`). Reads `JWT_SECRET` from env (godotenv in dev) — **never embeds the secret in source** — refuses to run if the secret is missing or shorter than 32 bytes. Same default `USER_ID`/`EVENT_ID`/`TTL_SECONDS` env vars as the old `scripts/mintjwt.go`, plus a `TTL_SECONDS` override. Calls the same `auth.Issue` the API uses, so a test token can never drift from a real one.
+
+#### `cmd/dashboard-server/main.go`
+
+Phase 8 dev-tool: serves the live k6 load-test dashboard on `http://localhost:8082/` and reverse-proxies `/v1/*` to the k6 REST API on `http://localhost:6565`. Solves the CORS problem of opening `loadtest/dashboard.html` from `file://` against k6's REST API (k6 has no CORS layer, so we go through a same-origin proxy). Reads the HTML once at startup via `os.ReadFile` so the user can tweak the UI without rebuilding. Flags: `-addr` (default `:8082`), `-k6` (default `http://localhost:6565`), `-html` (default `loadtest/dashboard.html`); all overridable via env. ~85 lines, no external deps.
 
 ---
 
@@ -1073,6 +1077,24 @@ Background reading on Redis primitives used (Lua atomicity, keyspace notificatio
 ### `scripts/`
 
 Empty (was a scratchpad for the old `mintjwt.go` smoke helper; the helper was promoted to `cmd/mintjwt/main.go` so the JWT secret could be env-driven and the binary could be committed). Anything that used to live here should either become a `cmd/<name>/main.go` or be deleted.
+
+### `loadtest/` — Phase 8 k6 rig
+
+#### `loadtest/burst.js`
+
+The headline test. 1000 VUs, each runs exactly 1 iteration (so `__VU` is a unique 1-1000 index, used to pick a pre-minted JWT so every VU has a distinct user_id and therefore a distinct hold key in Redis). All 1000 VUs race the `POST /api/tickets/reserve` endpoint at once; with `initial_inventory=100` the Lua reserve path guarantees exactly 100 × 200 and 900 × 409 (Lua is atomic — no two reservations can both decrement past zero). Custom counters `reserved_ok` / `sold_out` / `other_status` track the split; the real assertions live in `handleSummary()` (the ✅/❌ block at the end of the k6 output) because k6's `http_req_failed` threshold can't distinguish "expected 409" from "unexpected 5xx". The `summaryTrendStats` option forces k6 to track p(50)/p(90)/p(95)/p(99) in the live REST API so the dashboard can graph them.
+
+#### `loadtest/dashboard.html`
+
+Single-file dark-themed dashboard. No build step, no external deps — vanilla HTML + inline CSS + ~70 lines of fetch/JSON polling. Auto-polls `/v1/metrics` every 1s; renders active VUs, request rate + 60-point sparkline, latency p50/p90/p95/p99 table, 200/409/other counters, iteration progress bar, and a connection-status dot. Opened via the `cmd/dashboard-server` proxy so it's same-origin with k6's REST API (no CORS extensions required).
+
+#### `loadtest/reset-state.sh`
+
+Idempotent state reset for repeat runs. Truncates `reservations WHERE event_id=$EVENT_ID`, deletes all `hold:event:$EVENT_ID:user:*` keys (via Lua `KEYS` + `DEL`), re-runs `go run ./cmd/seed-inventory` to repopulate `inventory:event:$EVENT_ID` from Postgres, then prints a one-line verification (reservations count, inventory value, hold-key count). Reads `EVENT_ID`/`EXPECTED_INV` from env. Avoids the macOS-bash-3 UTF-8 `…` quirk by using ASCII `...` everywhere.
+
+#### `loadtest/mint-jwts.sh`
+
+Pre-mints N unique JWTs to a file (default `/tmp/k6_jwts.txt`, one JWT per line). Loops `USER_ID=k6user-$i` through `bin/mintjwt` with `2>/dev/null` and a trailing `echo` to produce a line-oriented file. Build `bin/mintjwt` if missing. ~5 sec for 1000 JWTs on an M5.
 
 ---
 
