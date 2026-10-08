@@ -1,6 +1,6 @@
 // Command api starts the Mini-Ticketmaster HTTP server.
 //
-// Responsibilities (Phase 4 scope):
+// Responsibilities (Phase 5 scope):
 //   - Load and validate config (fail fast on missing/short JWT_SECRET)
 //   - Wire the chi router with logger + recoverer middleware
 //   - Mount the public /healthz endpoint
@@ -8,7 +8,7 @@
 //     /reserve from day 1
 //   - /enter (Phase 4) — IP bucket + event token bucket → JWT or queue
 //   - /queue (Phase 4) — SSE stream of queue position events
-//   - /reserve (Phase 5) — stub guarded by auth middleware
+//   - /reserve (Phase 5) — JWT → Lua reserve → publisher (SQS stub)
 //   - Handle SIGINT/SIGTERM with a clean shutdown (5 s grace)
 package main
 
@@ -25,6 +25,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/emmitt-k/ticket-deal/internal/api"
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
@@ -83,12 +84,14 @@ func run() error {
 		apiutil.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	// Phase 4 routes — the waiting room
+	// Phase 4 + 5 routes — the waiting room and reservation
 	r.Route("/api/tickets", func(r chi.Router) {
 		r.Post("/enter", waitingroom.EnterHandler(*cfg, rdb))
 		r.Get("/queue", waitingroom.QueueSSEHandler(rdb))
-		// Phase 5: /reserve (JWT-protected)
-		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reserve", reserveStub)
+		// Phase 5: /reserve (JWT-protected) — Lua reserve → publisher
+		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reserve",
+			api.ReserveHandler(rdb, api.LogPublisher{},
+				time.Duration(cfg.ReserveHoldTTL)*time.Second))
 	})
 
 	// ── HTTP server ────────────────────────────────────────────────
@@ -169,20 +172,4 @@ func run() error {
 	}
 	log.Printf("api: clean shutdown complete")
 	return nil
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// Stub (replaced by real handler in Phase 5)
-// ─────────────────────────────────────────────────────────────────────
-
-// reserveStub is the placeholder for the seat-locking handler. The
-// middleware already verified the JWT and put claims in context, so
-// downstream handlers can rely on auth.ClaimsFromContext(r.Context()).
-func reserveStub(w http.ResponseWriter, r *http.Request) {
-	if c := auth.ClaimsFromContext(r.Context()); c != nil {
-		log.Printf("api: reserve stub (Phase 5 pending) reached with sub=%s event_id=%d",
-			c.Subject, c.EventID)
-	}
-	apiutil.WriteError(w, http.StatusNotImplemented, "not_implemented",
-		"POST /api/tickets/reserve lands in Phase 5 (Lua reserve)")
 }

@@ -33,6 +33,11 @@ type Config struct {
 	// waiting room. Capacity = burst size; RefillRate = steady-state
 	// users admitted per second.
 	WaitRoom WaitRoomConfig
+
+	// ReserveHoldTTL is how long a successful /reserve hold lives in
+	// Redis before the seat auto-releases. Mirrors the 10-minute
+	// payment window in the README's flow diagram.
+	ReserveHoldTTL int
 }
 
 // RedisConfig is the subset of go-redis Options needed by the API server.
@@ -102,6 +107,7 @@ func Load() (*Config, error) {
 			RefillRate:      atofOr(getEnv("WAIT_ROOM_REFILL_RATE", "10"), 10.0),
 			QueueTTLSeconds: atoiOr(getEnv("WAIT_ROOM_QUEUE_TTL", "300"), 300),
 		},
+		ReserveHoldTTL: atoiOr(getEnv("RESERVE_HOLD_TTL_SECONDS", "600"), 600),
 	}
 
 	return cfg, nil
