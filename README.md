@@ -62,7 +62,7 @@ The three phases, in one line each:
 | 4   | Waiting room + SSE          | ✅ Done      | IP bucket (`ip_bucket.lua`) → event bucket (`token_bucket.lua`) → JWT or ZSET queue; SSE position stream; drainer goroutine issues JWTs as tokens refill; 15 tests |
 | 5   | Reservation endpoint        | ✅ Done      | `internal/api/reserve_handler.go`: JWT claims → UUID reservation_id, Lua reserve → 200/409/404; `ReservationPublisher` interface + `LogPublisher` stub (Phase 6 swaps for SQS); 15 tests |
 | 6   | SQS & Worker                | ✅ Done      | `internal/queue` (publisher + consumer + Reservation wire type), `internal/db` (pgx pool + InsertIfAbsent), `cmd/worker` consumer binary; `SQSPublisher` wired into API; at-least-once + idempotent INSERT; 16 tests |
-| 7   | Expiration handling         | Pending      | Keyspace listener (`__keyevent@0__:expired`) returns inventory + marks status EXPIRED; 60-s DB sweep as safety net |
+| 7   | Expiration handling         | ✅ Done      | `internal/expire` (Compensate + RunWatcher + RunSweep), `cmd/expiration-watcher` (PSUBSCRIBE `__keyevent@0__:expired`), sweep goroutine inside `cmd/worker`; watcher fires real-time, sweep is the safety net; both converge on a single CAS UPDATE so only one INCRBY happens per (user, event); 20 tests (incl. 50-goroutine race, multi-seat, idempotent) |
 | 8   | Load test + invariants      | Pending      | k6 burst, zero-oversell + zero-lose assertions (`scripts/verify.sh`)                                     |
 | 9   | Polish                      | Pending      | Makefile (`up/migrate/test/loadtest/verify`), README quick-start, clean fresh-clone experience            |
 
@@ -96,8 +96,8 @@ The three phases, in one line each:
 .
 ├── cmd/
 │   ├── api/                  # Go API server (chi router, SSE handler) [✅ Phase 3]
-│   ├── worker/               # Go SQS consumer → Postgres writer
-│   └── expiration-watcher/   # Redis keyspace listener → marks expirations in Postgres
+│   ├── worker/               # Go SQS consumer → Postgres writer + 60s expiry sweep goroutine [✅ Phase 6,7]
+│   └── expiration-watcher/   # Redis keyspace listener → marks expirations in Postgres [✅ Phase 7]
 ├── internal/
 │   ├── api/                  # chi router, handlers [✅ Phase 5]
 │   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret [✅ Phase 3]
@@ -107,10 +107,12 @@ The three phases, in one line each:
 │   ├── waitingroom/          # Per-event token bucket + ZSET queue + SSE handler + drainer [✅ Phase 4]
 │   ├── redis/                # Lua scripts + Go wrappers [✅ Phase 2]
 │   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2) [✅ Phase 6]
-│   └── db/                   # pgx pool + InsertIfAbsent (idempotent) [✅ Phase 6]
+│   ├── db/                   # pgx pool + InsertIfAbsent (idempotent) [✅ Phase 6]
+│   └── expire/               # Compensate (DB+INCRBY) shared by watcher + sweep [✅ Phase 7]
 ├── migrations/
 │   ├── 001_init.sql          # events, reservations, idempotency PK, partial index
-│   └── 002_seed.sql          # Dev event id=1 with 100 inventory
+│   ├── 002_seed.sql          # Dev event id=1 with 100 inventory
+│   └── 003_add_seats.sql     # seats column on reservations (Phase 7 INCRBY sizing)
 ├── docker/
 │   └── elasticmq.conf        # Pre-creates 'reservations' queue on boot (2-RTT cheaper than manual aws-cli)
 ├── loadtest/                 # k6 scripts (Phase 8)
@@ -145,6 +147,7 @@ docker compose up -d
 # 2. Apply schema + seed an event
 PGPASSWORD=tickets psql -h localhost -U tickets -d tickets -f migrations/001_init.sql
 PGPASSWORD=tickets psql -h localhost -U tickets -d tickets -f migrations/002_seed.sql
+PGPASSWORD=tickets psql -h localhost -U tickets -d tickets -f migrations/003_add_seats.sql
 
 # 3. Copy the env template and set a JWT secret
 cp .env.example .env
@@ -180,7 +183,7 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **Next:** move on to Phase 7 (Expiration handling) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
+> **Next:** move on to Phase 8 (Load test + invariants) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
 
 ---
 
