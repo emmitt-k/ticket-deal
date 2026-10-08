@@ -30,6 +30,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/joho/godotenv"
+
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
@@ -93,6 +95,14 @@ type config struct {
 }
 
 func loadConfig() (*config, error) {
+	// Dev ergonomics: load .env so `./bin/expiration-watcher` works
+	// without `set -a; source .env; set +a` in the shell. The error
+	// is ignored because production runs inject real env vars
+	// (Kubernetes, ECS, systemd) and don't have a .env file.
+	// Matches internal/config/config.go:95 for the API and the same
+	// pattern in cmd/worker/main.go.
+	_ = godotenv.Load()
+
 	c := &config{
 		RedisAddr:   getEnv("REDIS_ADDR", "localhost:6379"),
 		DatabaseURL: getEnv("DATABASE_URL", ""),

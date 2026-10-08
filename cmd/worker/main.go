@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/joho/godotenv"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
@@ -187,6 +188,13 @@ type config struct {
 }
 
 func loadConfig() (*config, error) {
+	// Dev ergonomics: load .env so `./bin/worker` works without
+	// `set -a; source .env; set +a` in the shell. The error is
+	// ignored because production runs inject real env vars
+	// (Kubernetes, ECS, systemd) and don't have a .env file.
+	// Matches internal/config/config.go:95 for the API.
+	_ = godotenv.Load()
+
 	c := &config{
 		DatabaseURL:             getEnv("DATABASE_URL", ""),
 		SQSQueueURL:             getEnv("SQS_QUEUE_URL", ""),

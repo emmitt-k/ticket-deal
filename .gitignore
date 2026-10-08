@@ -17,6 +17,11 @@ coverage.out
 # ─── Vendored deps (we don't vendor; module cache only) ───────
 /vendor/
 
+# ─── Build output directory ───────────────────────────────────
+# Created by `go build -o bin/<name> ./cmd/<name>`; never commit
+# the compiled binaries.
+/bin/
+
 # ─── Editors / OS ─────────────────────────────────────────────
 .vscode/
 .idea/
