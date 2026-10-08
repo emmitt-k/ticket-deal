@@ -57,7 +57,7 @@ The three phases, in one line each:
 | --- | --------------------------- | ----------- | -------------------------------------------------------------------------------------------------------- |
 | 0   | Bootstrap                   | ✅ Done      | `docker-compose.yml` (Redis 7, Postgres 16, ElasticMQ) + auto-created `reservations` queue + healthchecks |
 | 1   | Database schema             | ✅ Done      | `events`, `reservations`; `reservation_id UUID PK` for idempotency; partial index on `expires_at`        |
-| 2   | Redis Lua layer             | ⏳ Next up   | Per-event token bucket, `reserve.lua` for atomic hold                                                    |
+| 2   | Redis Lua layer             | ✅ Done      | `reserve.lua` (atomic seat lock) + `token_bucket.lua` (waiting-room admission); 9/9 tests, 1k-goroutine no-oversell |
 | 3   | HTTP API + JWT              | Pending      | `chi` router, `/enter`, `/reserve`; HS256 fail-fast secret                                               |
 | 4   | Per-IP rate limit           | Pending      | Second token-bucket layer in front of per-event bucket                                                   |
 | 5   | Worker                      | Pending      | SQS consumer, `INSERT ... ON CONFLICT DO NOTHING` into Postgres                                          |
@@ -102,7 +102,7 @@ The three phases, in one line each:
 │   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret
 │   ├── iplimit/              # Per-IP token bucket (rate limit at /enter)
 │   ├── waitingroom/          # Per-event token bucket + ZSET queue
-│   ├── redis/                # Lua scripts + Redis client wrappers
+│   ├── redis/                # Lua scripts + Go wrappers [✅ Phase 2]
 │   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2)
 │   └── postgres/             # DB connection + reservation queries
 ├── migrations/
@@ -151,6 +151,9 @@ openssl rand -hex 32 | pbcopy     # paste the result into JWT_SECRET= in .env
 docker compose ps                 # all 3 services should be "healthy"
 pgcli -h localhost -U tickets -d tickets -c "SELECT id, name, initial_inventory FROM events;"
 redis-cli PING                    # expect PONG
+
+# 5. Run the Redis layer tests (proves 1k concurrent → exactly N reservations)
+go test -race ./internal/redis/...
 ```
 
 ### What you should see
@@ -174,7 +177,7 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **Next:** move on to Phase 2 (Redis Lua layer) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
+> **Next:** move on to Phase 3 (API skeleton + JWT) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
 
 ---
 
