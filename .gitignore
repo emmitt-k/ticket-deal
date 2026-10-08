@@ -1,0 +1,34 @@
+# ─── Secrets (NEVER commit) ──────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Go build artifacts ───────────────────────────────────────
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.txt
+coverage.out
+*.cover
+
+# ─── Vendored deps (we don't vendor; module cache only) ───────
+/vendor/
+
+# ─── Editors / OS ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ─── k6 / load test artifacts ────────────────────────────────
+loadtest/results/
+*.json.gz
+summary.html
+
+# ─── Runtime logs ─────────────────────────────────────────────
+*.log
+logs/

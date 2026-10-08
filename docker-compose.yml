@@ -1,0 +1,70 @@
+name: ticket-deal
+
+# All three services for Phase 0.
+# Healthchecks are wired into `depends_on: condition: service_healthy`
+# so anything depending on them waits until they're actually ready.
+
+services:
+  # ─── Hot path: token buckets, hold keys, atomic Lua scripts ───
+  redis:
+    image: redis:7-alpine
+    container_name: ticket-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --notify-keyspace-events Ex
+        --appendonly yes
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  # ─── System of record: events, reservations, idempotency ─────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ticket-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tickets}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tickets}
+      POSTGRES_DB: ${POSTGRES_DB:-tickets}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tickets} -d ${POSTGRES_DB:-tickets}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # ─── Async fulfilment queue (SQS-compatible) ──────────────────
+  elasticmq:
+    image: softwaremill/elasticmq:latest
+    container_name: ticket-elasticmq
+    ports:
+      - "9324:9324"   # SQS-compatible REST API
+      - "9325:9325"   # Web UI (queues + messages)
+    healthcheck:
+      # Any HTTP response proves the port is listening; status code doesn't matter
+      # (ElasticMQ returns 400 on bare GET /, but we only care about TCP being open)
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:9324/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+# Named volumes so data survives `docker compose down`
+volumes:
+  redis-data:
+  postgres-data:
