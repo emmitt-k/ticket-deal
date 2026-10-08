@@ -59,7 +59,7 @@ The three phases, in one line each:
 | 1   | Database schema             | ✅ Done      | `events`, `reservations`; `reservation_id UUID PK` for idempotency; partial index on `expires_at`        |
 | 2   | Redis Lua layer             | ✅ Done      | `reserve.lua` (atomic seat lock) + `token_bucket.lua` (waiting-room admission); 9/9 tests, 1k-goroutine no-oversell |
 | 3   | HTTP API + JWT              | ✅ Done      | `cmd/api/main.go` (chi, graceful shutdown); HS256 Issue/Verify/middleware; 14 tests; alg=none + replay rejected |
-| 4   | Per-IP rate limit           | Pending      | Second token-bucket layer in front of per-event bucket                                                   |
+| 4   | Waiting room + SSE          | ✅ Done      | IP bucket (`ip_bucket.lua`) → event bucket (`token_bucket.lua`) → JWT or ZSET queue; SSE position stream; drainer goroutine issues JWTs as tokens refill; 15 tests |
 | 5   | Worker                      | Pending      | SQS consumer, `INSERT ... ON CONFLICT DO NOTHING` into Postgres                                          |
 | 6   | Hold keys                   | Pending      | 10-min Redis hold, release on payment confirm                                                            |
 | 7   | Expirations                 | Pending      | Keyspace listener (`__keyevent@0__:expired`) + 60-s DB sweep                                             |
@@ -102,8 +102,8 @@ The three phases, in one line each:
 │   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret [✅ Phase 3]
 │   ├── config/               # env loading (godotenv) + fail-fast validation
 │   ├── apiutil/              # JSON helpers + ErrorBody shape (uniform error envelope)
-│   ├── iplimit/              # Per-IP token bucket (rate limit at /enter)
-│   ├── waitingroom/          # Per-event token bucket + ZSET queue
+│   ├── iplimit/              # Per-IP token bucket (rate limit at /enter) [✅ Phase 4]
+│   ├── waitingroom/          # Per-event token bucket + ZSET queue + SSE handler + drainer [✅ Phase 4]
 │   ├── redis/                # Lua scripts + Go wrappers [✅ Phase 2]
 │   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2)
 │   └── postgres/             # DB connection + reservation queries
@@ -179,7 +179,7 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **Next:** move on to Phase 4 (Waiting Room & SSE) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
+> **Next:** move on to Phase 5 (Reservation Endpoint) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
 
 ---
 
