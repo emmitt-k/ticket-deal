@@ -15,7 +15,9 @@ N=${1:-1000}
 JWT_FILE=${JWT_FILE:-/tmp/k6_jwts.txt}
 USER_PREFIX=${USER_PREFIX:-k6user}
 EVENT_ID=${EVENT_ID:-1}
-TTL_SECONDS=${TTL_SECONDS:-120}
+# 600s matches the reserve-hold TTL — long enough for the 90s ramp test plus
+# repeated runs without re-minting. Override with TTL_SECONDS=...
+TTL_SECONDS=${TTL_SECONDS:-600}
 
 # Make sure the binary exists
 if [ ! -x bin/mintjwt ]; then

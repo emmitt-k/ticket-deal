@@ -63,7 +63,7 @@ The three phases, in one line each:
 | 5   | Reservation endpoint        | ✅ Done      | `internal/api/reserve_handler.go`: JWT claims → UUID reservation_id, Lua reserve → 200/409/404; `ReservationPublisher` interface + `LogPublisher` stub (Phase 6 swaps for SQS); 15 tests |
 | 6   | SQS & Worker                | ✅ Done      | `internal/queue` (publisher + consumer + Reservation wire type), `internal/db` (pgx pool + InsertIfAbsent), `cmd/worker` consumer binary; `SQSPublisher` wired into API; at-least-once + idempotent INSERT; 16 tests |
 | 7   | Expiration handling         | ✅ Done      | `internal/expire` (Compensate + RunWatcher + RunSweep), `cmd/expiration-watcher` (PSUBSCRIBE `__keyevent@0__:expired`), sweep goroutine inside `cmd/worker`; watcher fires real-time, sweep is the safety net; both converge on a single CAS UPDATE so only one INCRBY happens per (user, event); 20 tests (incl. 50-goroutine race, multi-seat, idempotent) |
-| 8   | Load test + invariants      | ✅ Done      | `loadtest/burst.js` (1000 VUs, 1 iter each); live dashboard on http://localhost:8082 (polls k6 REST); 100×200 + 900×409 verified, 0 oversell, 0 data loss, p(99)=24ms |
+| 8   | Load test + invariants      | ✅ Done      | `loadtest/burst.js` (1000 VUs, 1 iter — pure shock) + `loadtest/ramp.js` (7-stage 0→50→200→1000 VUs, ~90s); live dashboard on http://localhost:8082 (polls k6 REST); 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
 | 9   | Polish                      | Pending      | Makefile (`up/migrate/test/loadtest/verify`), README quick-start, clean fresh-clone experience            |
 
 > Full phased plan with file layout, code snippets, verification steps, and the lite-auth design → [`/docs/implementation-plan.md`](docs/implementation-plan.md)
@@ -214,28 +214,33 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 
 ### Load testing (k6 + live dashboard)
 
-`/loadtest` ships a one-shot burst test that proves the core invariant: **with `initial_inventory=100` and 1000 concurrent VUs each requesting 1 seat, exactly 100 succeed and 900 get 409 — no oversell, no data loss.** The test rig also includes a live web dashboard that polls k6's REST API every second so you can watch the race in real time.
+`/loadtest` ships two k6 scripts and a live web dashboard. Both prove the same core invariant — **with `initial_inventory=100` and 1000 unique users each requesting 1 seat, exactly 100 succeed and the rest get 409** — but under different load shapes.
+
+| Script | Shape | Best for | Duration |
+|---|---|---|---|
+| `loadtest/burst.js` | 1000 VUs, 1 iter each — pure shock | Correctness check (no oversell, no data loss) | <1 s |
+| `loadtest/ramp.js`  | 7 stages: 0 → 50 → 200 → 1000 VUs | Watching the system respond to *increasing* load (screencast-friendly) | ~90 s |
+
+The shared dashboard (`loadtest/dashboard.html` served by `cmd/dashboard-server`) auto-polls k6's REST API every 1s and shows: active VUs (the headline number during a ramp), request rate, latency p50/p90/p95/p99, status-code breakdown (200 vs 409), and a progress bar. Without `--linger`, k6 exits when the test finishes; with it, the REST API stays up so you can keep watching the numbers (Ctrl-C to quit).
+
+#### Run the burst (1 second of shock)
 
 ```bash
-# 1. Reset to a known clean state (truncates DB rows, clears hold keys, re-seeds inv=100)
+# 1. Reset state
 ./loadtest/reset-state.sh
 
-# 2. Pre-mint 1000 unique JWTs (one per VU, so each has a distinct user_id)
-./loadtest/mint-jwts.sh 1000    # writes to /tmp/k6_jwts.txt
+# 2. Pre-mint 1000 unique JWTs (one per VU)
+./loadtest/mint-jwts.sh 1000
 
-# 3. Start the live dashboard server (serves HTML + proxies k6 REST → same-origin)
-./bin/dashboard-server &        # open http://localhost:8082/ in your browser
+# 3. Start the dashboard server
+./bin/dashboard-server &
 
-# 4. Launch the burst test (1000 VUs, 1 iter each — finishes in <1s locally)
-k6 run --address localhost:6565 --linger /Users/it000058/Documents/ticket-deal/loadtest/burst.js
-
-# 5. Open the dashboard in your browser BEFORE step 4 to see it populate live
+# 4. Refresh the dashboard in your browser FIRST, then run k6
 open http://localhost:8082/
+k6 run --address localhost:6565 --linger /Users/it000058/Documents/ticket-deal/loadtest/burst.js
 ```
 
-The dashboard auto-polls every 1s and shows: active VUs, request rate, latency p50/p90/p95/p99, status-code breakdown (200 vs 409), and a progress bar. Without `--linger`, k6 exits when the test finishes; with it, the REST API stays up so you can keep watching the numbers (Ctrl-C to quit).
-
-**Expected output (last lines of the k6 run):**
+Expected output:
 
 ```
 ─────────────── LOAD TEST RESULTS ───────────────
@@ -247,7 +252,32 @@ The dashboard auto-polls every 1s and shows: active VUs, request rate, latency p
 ──────────────────────────────────────────────────
 ```
 
-The four ✅ lines are the actual correctness assertions (real values, not k6 thresholds — k6's `http_req_failed` threshold is intentionally relaxed because we *expect* 90% of the requests to be 409s; the real check is in `handleSummary()` in `loadtest/burst.js`).
+#### Run the ramp (90 seconds of waves — like the YouTube videos)
+
+```bash
+./loadtest/reset-state.sh
+./loadtest/mint-jwts.sh 1000     # JWTs default to 600s TTL — long enough for the full ramp
+./bin/dashboard-server &
+open http://localhost:8082/
+k6 run --address localhost:6565 --linger /Users/it000058/Documents/ticket-deal/loadtest/ramp.js
+```
+
+The dashboard will show VU count climbing 0 → 50 → 200 → 1000 in waves (the "█" bars in the terminal output below are the same number the dashboard graph is drawing). A real run looks like this — 1.8M requests over 90 s, exactly 100 winners, zero errors:
+
+```
+t=  5s  VUs=  49  ██            rate=18433/s  200=100  409= 190466
+t= 10s  VUs=  50  ██            rate=19292/s  200=100  409= 297711
+t= 25s  VUs= 122  ██████        rate=19906/s  200=100  409= 615953
+t= 30s  VUs= 200  ██████████    rate=19958/s  200=100  409= 718963
+t= 50s  VUs= 512  ████████...   rate=20005/s  200=100  409=1135223
+t= 60s  VUs=1000  ██████████... rate=19999/s  200=100  409=1340616
+t= 75s  VUs=1000  ██████████... rate=20084/s  200=100  409=1659254
+t= 85s  VUs=   0                rate=20129/s  200=100  409=1811531
+```
+
+`reserved_ok` stays pinned at 100 for the entire 90 seconds — because inv=100 is decided in the first few hundred milliseconds and the ramp can never change that. The interesting number to watch is `rate` (does throughput scale linearly with VU count?) and `p99` (does latency degrade as the system absorbs more concurrent load?). On an M5 we held 20,000 req/s for a full minute with p99=62 ms.
+
+The real correctness assertions (the four ✅ lines) live in `handleSummary()` at the bottom of each k6 script — k6's `http_req_failed` threshold is intentionally relaxed because we *expect* ~90% of the requests to be 409s; the `handleSummary` check distinguishes "expected 409" from "unexpected 5xx" via the dedicated `reserved_ok` / `sold_out` / `other_status` Counters.
 
 Tune the burst size with `VUS=N ./loadtest/mint-jwts.sh N && VUS=N k6 run ...`. To target a different event, pass `EVENT_ID=N` to `reset-state.sh` and `mint-jwts.sh`.
 
