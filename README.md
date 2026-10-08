@@ -58,7 +58,7 @@ The three phases, in one line each:
 | 0   | Bootstrap                   | ✅ Done      | `docker-compose.yml` (Redis 7, Postgres 16, ElasticMQ) + auto-created `reservations` queue + healthchecks |
 | 1   | Database schema             | ✅ Done      | `events`, `reservations`; `reservation_id UUID PK` for idempotency; partial index on `expires_at`        |
 | 2   | Redis Lua layer             | ✅ Done      | `reserve.lua` (atomic seat lock) + `token_bucket.lua` (waiting-room admission); 9/9 tests, 1k-goroutine no-oversell |
-| 3   | HTTP API + JWT              | Pending      | `chi` router, `/enter`, `/reserve`; HS256 fail-fast secret                                               |
+| 3   | HTTP API + JWT              | ✅ Done      | `cmd/api/main.go` (chi, graceful shutdown); HS256 Issue/Verify/middleware; 14 tests; alg=none + replay rejected |
 | 4   | Per-IP rate limit           | Pending      | Second token-bucket layer in front of per-event bucket                                                   |
 | 5   | Worker                      | Pending      | SQS consumer, `INSERT ... ON CONFLICT DO NOTHING` into Postgres                                          |
 | 6   | Hold keys                   | Pending      | 10-min Redis hold, release on payment confirm                                                            |
@@ -94,12 +94,14 @@ The three phases, in one line each:
 ```
 .
 ├── cmd/
-│   ├── api/                  # Go API server (chi router, SSE handler)
+│   ├── api/                  # Go API server (chi router, SSE handler) [✅ Phase 3]
 │   ├── worker/               # Go SQS consumer → Postgres writer
 │   └── expiration-watcher/   # Redis keyspace listener → marks expirations in Postgres
 ├── internal/
 │   ├── api/                  # chi router, handlers
-│   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret
+│   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret [✅ Phase 3]
+│   ├── config/               # env loading (godotenv) + fail-fast validation
+│   ├── apiutil/              # JSON helpers + ErrorBody shape (uniform error envelope)
 │   ├── iplimit/              # Per-IP token bucket (rate limit at /enter)
 │   ├── waitingroom/          # Per-event token bucket + ZSET queue
 │   ├── redis/                # Lua scripts + Go wrappers [✅ Phase 2]
@@ -177,7 +179,7 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **Next:** move on to Phase 3 (API skeleton + JWT) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
+> **Next:** move on to Phase 4 (Waiting Room & SSE) by following [`/docs/implementation-plan.md`](docs/implementation-plan.md).
 
 ---
 
