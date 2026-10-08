@@ -3,11 +3,15 @@ package redis
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"time"
 
 	redisclient "github.com/redis/go-redis/v9"
 )
+
+// ErrQueueEmpty is returned by ZPopMin when the queue has no members.
+var ErrQueueEmpty = errors.New("redis: queue is empty")
 
 //go:embed scripts/token_bucket.lua
 var tokenBucketScriptSrc string
@@ -158,4 +162,32 @@ func Enqueue(ctx context.Context, c *redisclient.Client,
 		return 0, fmt.Errorf("redis: ZRANK after enqueue failed: %w", err)
 	}
 	return int(rank) + 1, nil
+}
+
+// ZPopMin removes and returns the userID with the lowest score (earliest
+// enqueue time) from the event's queue. Used by the drainer to promote
+// the head of the queue when a token refills.
+//
+// Returns ErrQueueEmpty if the queue is empty.
+func ZPopMin(ctx context.Context, c *redisclient.Client, eventID int64) (string, error) {
+	result, err := c.ZPopMin(ctx, queueKey(eventID), 1).Result()
+	if err == redisclient.Nil {
+		return "", ErrQueueEmpty
+	}
+	if err != nil {
+		return "", fmt.Errorf("redis: ZPopMin failed: %w", err)
+	}
+	if len(result) == 0 {
+		return "", ErrQueueEmpty
+	}
+	return result[0].Member.(string), nil
+}
+
+// QueueSize returns the number of users currently waiting in the event's queue.
+func QueueSize(ctx context.Context, c *redisclient.Client, eventID int64) (int, error) {
+	n, err := c.ZCard(ctx, queueKey(eventID)).Result()
+	if err != nil {
+		return 0, fmt.Errorf("redis: ZCard failed: %w", err)
+	}
+	return int(n), nil
 }

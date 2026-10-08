@@ -19,6 +19,49 @@ type Config struct {
 	// JWTSecret is the HS256 signing key. Must be at least 32 bytes so
 	// the key space matches the algorithm's stated strength.
 	JWTSecret []byte
+
+	// Redis is the Redis connection used by the hot path (waiting room
+	// handlers and drainer). Postgres is NOT on the hot path — workers
+	// manage their own pool separately.
+	Redis RedisConfig
+
+	// IPLimit gates /enter before the event bucket. Hard reject (no queue)
+	// for IPs that exceed the per-IP rate.
+	IPLimit IPLimitConfig
+
+	// WaitRoom is the per-event token bucket that drives the virtual
+	// waiting room. Capacity = burst size; RefillRate = steady-state
+	// users admitted per second.
+	WaitRoom WaitRoomConfig
+}
+
+// RedisConfig is the subset of go-redis Options needed by the API server.
+type RedisConfig struct {
+	Addr string
+	DB   int
+}
+
+// WaitRoomConfig mirrors redis.WaitRoomConfig so config stays free of
+// importing internal/redis (avoids an import cycle since redis already
+// imports nothing from config — but keeping types local is cleaner here).
+type WaitRoomConfig struct {
+	// Capacity is the max tokens (burst size) per event.
+	// E.g. 100 means up to 100 users can be admitted "instantly."
+	Capacity int
+	// RefillRate is tokens per second per event.
+	// E.g. 10 means 10 users admitted per second once the burst is gone.
+	RefillRate float64
+	// QueueTTLSeconds is how long a queued user stays in the ZSET before
+	// being auto-removed (prevents abandoned sessions from growing the queue forever).
+	QueueTTLSeconds int
+}
+
+// IPLimitConfig mirrors iplimit.Config for the same reason as WaitRoomConfig.
+type IPLimitConfig struct {
+	// Capacity is the max tokens per IP (burst size).
+	Capacity int
+	// RefillRate is tokens per second per IP.
+	RefillRate float64
 }
 
 // Load reads configuration from the process environment (after
@@ -43,12 +86,52 @@ func Load() (*Config, error) {
 		return nil, errors.New("JWT_SECRET must be at least 32 bytes (use `openssl rand -hex 32`)")
 	}
 
-	return &Config{
+	cfg := &Config{
 		Addr:      ":" + strconv.Itoa(port),
 		JWTSecret: []byte(secret),
-	}, nil
+		Redis: RedisConfig{
+			Addr: getEnv("REDIS_ADDR", "localhost:6379"),
+			DB:   atoiOr(getEnv("REDIS_DB", "0"), 0),
+		},
+		IPLimit: IPLimitConfig{
+			Capacity:   atoiOr(getEnv("IP_LIMIT_CAPACITY", "10"), 10),
+			RefillRate: atofOr(getEnv("IP_LIMIT_REFILL_RATE", "2"), 2.0),
+		},
+		WaitRoom: WaitRoomConfig{
+			Capacity:        atoiOr(getEnv("WAIT_ROOM_CAPACITY", "100"), 100),
+			RefillRate:      atofOr(getEnv("WAIT_ROOM_REFILL_RATE", "10"), 10.0),
+			QueueTTLSeconds: atoiOr(getEnv("WAIT_ROOM_QUEUE_TTL", "300"), 300),
+		},
+	}
+
+	return cfg, nil
 }
 
+// atoiOr parses s as int, returns def on error or empty string.
+func atoiOr(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// atofOr parses s as float64, returns def on error or empty string.
+func atofOr(s string, def float64) float64 {
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+// getEnv is defined at the bottom so all helpers are grouped together.
 func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

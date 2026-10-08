@@ -14,6 +14,14 @@ import (
 	redisclient "github.com/redis/go-redis/v9"
 )
 
+// Client is an alias for the stdlib-minimal go-redis client used
+// throughout this package. Call NewClient to construct one.
+type Client = redisclient.Client
+
+// Z is exported so package-level test helpers (in *_test.go files in
+// packages that import this package) can construct Z members for ZADD.
+type Z = redisclient.Z
+
 // Config holds the connection parameters.
 type Config struct {
 	Addr string // "localhost:6379"

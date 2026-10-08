@@ -1,13 +1,14 @@
 // Command api starts the Mini-Ticketmaster HTTP server.
 //
-// Responsibilities (Phase 3 scope):
+// Responsibilities (Phase 4 scope):
 //   - Load and validate config (fail fast on missing/short JWT_SECRET)
 //   - Wire the chi router with logger + recoverer middleware
 //   - Mount the public /healthz endpoint
 //   - Mount the /api/tickets/* routes, with auth.Middleware() guarding
 //     /reserve from day 1
-//   - /enter and /reserve are stubs returning 501; their real handlers
-//     land in Phase 4 and Phase 5
+//   - /enter (Phase 4) — IP bucket + event token bucket → JWT or queue
+//   - /queue (Phase 4) — SSE stream of queue position events
+//   - /reserve (Phase 5) — stub guarded by auth middleware
 //   - Handle SIGINT/SIGTERM with a clean shutdown (5 s grace)
 package main
 
@@ -27,6 +28,8 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
+	"github.com/emmitt-k/ticket-deal/internal/redis"
+	"github.com/emmitt-k/ticket-deal/internal/waitingroom"
 )
 
 func main() {
@@ -41,49 +44,124 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("api: config loaded (addr=%s, jwt_secret=%d bytes)",
-		cfg.Addr, len(cfg.JWTSecret))
+	log.Printf("api: config loaded (addr=%s, jwt_secret=%d bytes, redis=%s)",
+		cfg.Addr, len(cfg.JWTSecret), cfg.Redis.Addr)
 
+	// ── Redis client (shared by handlers and drainer) ──────────────
+	rdb := redis.NewClient(redis.Config{
+		Addr: cfg.Redis.Addr,
+		DB:   cfg.Redis.DB,
+	})
+	defer rdb.Close()
+	if err := redis.Ping(context.Background(), rdb); err != nil {
+		return err // fail fast if Redis is unreachable
+	}
+
+	// ── Background drainer (promotes queued users as tokens refill) ─
+	drainerCfg := waitingroom.DrainerConfig{
+		RDB: rdb,
+		WaitRoom: redis.WaitRoomConfig{
+			Capacity:        cfg.WaitRoom.Capacity,
+			RefillRate:      cfg.WaitRoom.RefillRate,
+			QueueTTLSeconds: cfg.WaitRoom.QueueTTLSeconds,
+		},
+		JWTSecret:   cfg.JWTSecret,
+		TickInterval: 100 * time.Millisecond,
+	}
+	// drainerCtx is derived from the server ctx so shutting down the
+	// server cancels the drainer automatically.
+	drainerCtx, drainerCancel := context.WithCancel(context.Background())
+	defer drainerCancel()
+	waitingroom.StartDrainer(drainerCtx, drainerCfg)
+
+	// ── HTTP router ────────────────────────────────────────────────
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)   // formatted request log to stdout
-	r.Use(middleware.Recoverer) // converts panics in handlers to 500
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		apiutil.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	// /api/tickets/enter — public, implemented in Phase 4
-	// /api/tickets/reserve — auth-protected, implemented in Phase 5
+	// Phase 4 routes — the waiting room
 	r.Route("/api/tickets", func(r chi.Router) {
-		r.Post("/enter", enterStub)
+		r.Post("/enter", waitingroom.EnterHandler(*cfg, rdb))
+		r.Get("/queue", waitingroom.QueueSSEHandler(rdb))
+		// Phase 5: /reserve (JWT-protected)
 		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reserve", reserveStub)
 	})
 
+	// ── HTTP server ────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second, // slow-loris protection
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// ─── Shutdown plumbing ────────────────────────────────────────
+	// Hook our "please stop" signals (Ctrl+C, `docker stop`'s
+	// SIGTERM) into a context. When one of those signals arrives,
+	// Go marks this context as "cancelled" — anything waiting on
+	// it (the select{} below) will wake up.
+	//
+	// The `defer stop()` is the tidy-up move: when main() returns,
+	// we tell the OS "we're done listening for signals now" so we
+	// don't leave a zombie handler.
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// A `chan error` is a one-way inbox that goroutines can drop
+	// messages into. The `1` is the *buffer size* — how many
+	// messages it can hold before the sender has to wait. We only
+	// ever send at most one (the first fatal error from the
+	// server), so 1 is plenty.
 	errCh := make(chan error, 1)
+
+	// Run the HTTP server in the *background* (a goroutine).
+	// Why? Because ListenAndServe is what Go calls "blocking" —
+	// once you call it, the function doesn't return until the
+	// server stops. If we called it in the foreground, we'd be
+	// stuck there forever and never get to the select{} below.
+	// Pushing it into a goroutine lets the main function keep
+	// going and watch for shutdown signals at the same time.
 	go func() {
 		log.Printf("api: listening on %s", cfg.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			// ErrServerClosed is what Shutdown() returns from inside
+			// ListenAndServe when WE asked it to stop — that one
+			// we ignore (it's expected). Anything else is a real
+			// problem (e.g. port in use), so we mail it back to
+			// main() via errCh.
 			errCh <- err
 		}
 	}()
 
+	// Now we wait. `select` is Go's "wait on multiple things at
+	// once" statement. Imagine you're sitting with two phones:
+	//   - Phone A rings  → user asked us to stop (ctx.Done())
+	//   - Phone B rings  → the server crashed (errCh)
+	// Whichever rings first, we handle that case. The other
+	// branch is just dropped. Until one rings, we're idle here.
 	select {
 	case <-ctx.Done():
+		// User pressed Ctrl+C or `docker stop` was sent.
 		log.Printf("api: shutdown signal received, draining...")
 	case err := <-errCh:
+		// Server failed to start (or crashed). Propagate so
+		// main() can return non-zero.
 		return err
 	}
 
+	// Politely ask the server to stop. Shutdown does two things:
+	//   1. Stop accepting new connections immediately
+	//   2. Wait for in-flight requests to finish naturally
+	// We give it 5 seconds (shutCtx's timeout). Anything still
+	// running after that gets cut off — that's the tradeoff for
+	// not hanging forever. 5s is the sweet spot: long enough for
+	// most requests to finish, short enough that orchestrators
+	// (k8s, ECS) don't kill us first.
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutCtx); err != nil {
@@ -94,16 +172,8 @@ func run() error {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Stubs (replaced by real handlers in Phase 4 / Phase 5)
+// Stub (replaced by real handler in Phase 5)
 // ─────────────────────────────────────────────────────────────────────
-
-// enterStub is the placeholder for the waiting-room admission handler.
-// Phase 4 will: rate-limit by IP, check the per-event token bucket,
-// enqueue or admit, then issue a JWT.
-func enterStub(w http.ResponseWriter, _ *http.Request) {
-	apiutil.WriteError(w, http.StatusNotImplemented, "not_implemented",
-		"POST /api/tickets/enter lands in Phase 4 (waiting room)")
-}
 
 // reserveStub is the placeholder for the seat-locking handler. The
 // middleware already verified the JWT and put claims in context, so

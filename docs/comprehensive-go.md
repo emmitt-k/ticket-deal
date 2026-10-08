@@ -33,6 +33,7 @@
 ## Table of contents
 
 - **Part 1 - The Basics**
+
   1. Hello, World
   2. Packages and modules
   3. Variables, types, constants
@@ -47,7 +48,6 @@
   12. Strings, bytes, runes
   13. Printing and logging
   14. Comments and godoc
-
 - **Part 2 - Building Blocks**
   15. Interfaces (small ones)
   16. Composition via embedding
@@ -56,7 +56,6 @@
   19. JSON encoding
   20. Testing basics
   21. testify and table-driven tests
-
 - **Part 3 - Concurrency**
   22. Goroutines
   23. Channels
@@ -65,7 +64,6 @@
   26. `sync.WaitGroup`, `sync.Mutex`, `sync.Once`
   27. `errgroup`
   28. Worker pools, pipelines, fan-out/fan-in
-
 - **Part 4 - Intermediate Tools**
   29. Generics (Go 1.18+)
   30. `iter` package (Go 1.23+)
@@ -73,7 +71,6 @@
   32. Reflection (use sparingly)
   33. Build tags and OS/arch handling
   34. Modules, workspaces, dependency hygiene
-
 - **Part 5 - Advanced & Practical Wisdom**
   35. The Go memory model
   36. Detecting data races with `-race`
@@ -81,7 +78,6 @@
   38. Profiling with pprof
   39. Graceful shutdown (this repo's pattern)
   40. Common pitfalls
-
 - **Appendix**
   A. Reading order for a quickstart
   B. Where to learn more
@@ -155,8 +151,7 @@ convention: packages under `internal/` cannot be imported from outside
 the module, so you can refactor them freely without breaking callers.
 
 [Gotcha] Don't use a Go vanity URL like `tickets-project/x` unless you
-own `tickets-project`. If you do, use the rule `import path = URL
-where the code actually lives`. For private code, a module path like
+own `tickets-project`. If you do, use the rule `import path = URL where the code actually lives`. For private code, a module path like
 `mycompany.local/tickets` is perfectly acceptable.
 
 [Gotcha] `internal/` is a magic directory name. Anything you put under
@@ -200,17 +195,18 @@ var (
 
 Zero values matter - they are the safe defaults.
 
-| Type                       | Zero value      |
-| -------------------------- | --------------- |
-| `int`, `float64`           | `0`             |
-| `string`                   | `""`            |
-| `bool`                     | `false`         |
-| `*T` (pointer)             | `nil`           |
-| `[]T` (slice)              | `nil`           |
-| `map[K]V`                  | `nil`           |
-| `chan T`                   | `nil`           |
-| `func(...)...`             | `nil`           |
-| struct                     | all fields zero |
+
+| Type             | Zero value      |
+| ------------------ | ----------------- |
+| `int`, `float64` | `0`             |
+| `string`         | `""`            |
+| `bool`           | `false`         |
+| `*T` (pointer)   | `nil`           |
+| `[]T` (slice)    | `nil`           |
+| `map[K]V`        | `nil`           |
+| `chan T`         | `nil`           |
+| `func(...)...`   | `nil`           |
+| struct           | all fields zero |
 
 This is why Go doesn't need constructors - you can declare a variable
 and immediately use it, and `if err != nil` covers the rest.
@@ -408,12 +404,13 @@ func main() {
 }
 ```
 
-| Construct         | When                                                        |
-| ----------------- | ----------------------------------------------------------- |
-| `errors.New(...)` | Simple sentinel error                                       |
-| `fmt.Errorf("...%w", err)` | Wrap while keeping the chain (`%w` is the key)   |
-| `errors.Is(err, target)` | Match against a specific error in the chain         |
-| `errors.As(err, &t)`      | Pull the most specific matching error into `t`      |
+
+| Construct                  | When                                           |
+| ---------------------------- | ------------------------------------------------ |
+| `errors.New(...)`          | Simple sentinel error                          |
+| `fmt.Errorf("...%w", err)` | Wrap while keeping the chain (`%w` is the key) |
+| `errors.Is(err, target)`   | Match against a specific error in the chain    |
+| `errors.As(err, &t)`       | Pull the most specific matching error into`t`  |
 
 [In this repo] `internal/auth/jwt.go` defines sentinel errors
 `ErrTokenExpired`, `ErrTokenSignature`, etc. and uses `errors.Is` in
@@ -762,11 +759,12 @@ types out of the conversion math.
 
 Two packages for output:
 
-| Need                                    | Use                  |
-| --------------------------------------- | -------------------- |
-| Quick debug, formatted output           | `fmt`                |
-| Production logs                         | `log` (stdlib)       |
-| Structured (key=value or JSON)          | `log/slog` (1.21+)   |
+
+| Need                           | Use                |
+| -------------------------------- | -------------------- |
+| Quick debug, formatted output  | `fmt`              |
+| Production logs                | `log` (stdlib)     |
+| Structured (key=value or JSON) | `log/slog` (1.21+) |
 
 ### `fmt`
 
@@ -797,8 +795,7 @@ logger.Info("listening", "addr", addr, "pid", os.Getpid())
 // -> {"time":"...","level":"INFO","msg":"listening","addr":":8080","pid":12345}
 ```
 
-[In this repo] `cmd/api/main.go` uses `log.SetFlags(log.LstdFlags |
-log.Lmicroseconds)` and `log.Printf` everywhere. For the high-volume
+[In this repo] `cmd/api/main.go` uses `log.SetFlags(log.LstdFlags | log.Lmicroseconds)` and `log.Printf` everywhere. For the high-volume
 production version we'd switch to `slog` so log lines could be parsed
 structurally.
 
@@ -936,11 +933,12 @@ type Server struct {
 
 Three patterns at the language level:
 
-| Pattern                | What it gives you                                   |
-| ---------------------- | --------------------------------------------------- |
-| Struct embeds struct   | Field access + promoted methods                      |
-| Struct embeds interface | Caller plugs in any implementation                  |
-| Interface embeds interface | Wider, narrower contract                       |
+
+| Pattern                    | What it gives you                  |
+| ---------------------------- | ------------------------------------ |
+| Struct embeds struct       | Field access + promoted methods    |
+| Struct embeds interface    | Caller plugs in any implementation |
+| Interface embeds interface | Wider, narrower contract           |
 
 [In this repo] No embedded interfaces yet; the redis package uses
 direct `*redis.Client` because we never need to substitute.
@@ -1131,15 +1129,16 @@ func TestDouble(t *testing.T) {
 
 Common `t` methods:
 
-| Method                | Effect                                              |
-| --------------------- | --------------------------------------------------- |
-| `t.Error(args...)`    | Mark failed; continue                               |
-| `t.Fatalf(args...)`   | Mark failed; stop the test                          |
-| `t.Skip("reason")`    | Skip - useful when an external dep is missing       |
-| `t.Helper()`          | Mark this function as a helper; stack traces stop here |
-| `t.Cleanup(func)`     | Schedule teardown after this test                   |
-| `t.Run("name", sub)`  | Run a sub-test                                      |
-| `t.Parallel()`        | Run alongside other parallel tests                  |
+
+| Method               | Effect                                                 |
+| ---------------------- | -------------------------------------------------------- |
+| `t.Error(args...)`   | Mark failed; continue                                  |
+| `t.Fatalf(args...)`  | Mark failed; stop the test                             |
+| `t.Skip("reason")`   | Skip - useful when an external dep is missing          |
+| `t.Helper()`         | Mark this function as a helper; stack traces stop here |
+| `t.Cleanup(func)`    | Schedule teardown after this test                      |
+| `t.Run("name", sub)` | Run a sub-test                                         |
+| `t.Parallel()`       | Run alongside other parallel tests                     |
 
 [In this repo] Both files in `internal/auth/` use `package auth_test`
 (external) - the entire auth surface is exported, so there's no
@@ -1322,11 +1321,12 @@ for v := range ch { ... }       // iterate until close
 select { ... }                  // wait on multiple channels (Section 24)
 ```
 
-| Property              | Unbuffered (`make(chan T)`)         | Buffered (`make(chan T, n)`)         |
-| --------------------- | ----------------------------------- | ------------------------------------- |
-| Send blocks until...  | receiver is ready                   | buffer has space                     |
-| Receive blocks until.. | sender sends                       | buffer has data OR channel closed     |
-| Use                   | Synchronization, one-shot signals   | Producer/consumer with backpressure   |
+
+| Property               | Unbuffered (`make(chan T)`)       | Buffered (`make(chan T, n)`)        |
+| ------------------------ | ----------------------------------- | ------------------------------------- |
+| Send blocks until...   | receiver is ready                 | buffer has space                    |
+| Receive blocks until.. | sender sends                      | buffer has data OR channel closed   |
+| Use                    | Synchronization, one-shot signals | Producer/consumer with backpressure |
 
 ```go
 // Producer/consumer
@@ -1397,6 +1397,7 @@ case <-ctx.Done():
 ### The "two phones" mental model
 
 Imagine sitting at a desk with two phones:
+
 - Phone A connected to "user pressed Ctrl+C" (`ctx.Done()`)
 - Phone B connected to "server crashed" (`errCh`)
 
@@ -1433,6 +1434,7 @@ there's no explicit goroutine dance there.
 ## 25. `context.Context`
 
 `context.Context` carries across an API boundary:
+
 - cancellation (someone wants us to stop)
 - deadlines (we must stop by this time)
 - request-scoped values (e.g. user ID, trace ID)
@@ -1753,6 +1755,7 @@ Constraints in Go are designed to be **lightweight**. The standard
 `cmp.Ordered` (Go 1.21+) and `cmp.Compare` cover most ordering needs.
 
 [In this repo] Not currently used. Would be a natural fit for:
+
 - A generic helper around `ReserveSeat` if we wanted to support
   multiple inventory backends.
 - Type-safe wrappers around `map[string]any` if we ever drop those.
@@ -2039,12 +2042,13 @@ What guarantees exist between goroutines? Mostly, very few.
 
 In practice:
 
-| Mechanism                                | Safe ordering                                |
-| ---------------------------------------- | -------------------------------------------- |
-| Goroutine creation                       | All writes before `go f()` are visible to `f` |
-| Channel send/receive                     | Send before matching receive                 |
-| `sync.Mutex` Lock/Unlock                 | Unlock before subsequent Lock                |
-| `atomic` operations                      | Memory-order annotations on the op           |
+
+| Mechanism                | Safe ordering                                |
+| -------------------------- | ---------------------------------------------- |
+| Goroutine creation       | All writes before`go f()` are visible to `f` |
+| Channel send/receive     | Send before matching receive                 |
+| `sync.Mutex` Lock/Unlock | Unlock before subsequent Lock                |
+| `atomic` operations      | Memory-order annotations on the op           |
 
 Everything else: you can't assume.
 
@@ -2432,6 +2436,7 @@ if elapsed > 100*time.Millisecond {
 
 [In this repo] the auth tests use `mintExpiredHS256Token` to forge
 "already-expired" tokens. Without it, you'd need to wait real time
+
 - which would be both slow and flaky.
 
 [Go deeper] https://go.dev/wiki/CommonMistakes

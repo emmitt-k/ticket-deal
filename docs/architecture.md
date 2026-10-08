@@ -542,10 +542,11 @@ graph TB
 
 The image's shell is **alpine `sh` (busybox)**, and a bare `GET /` against ElasticMQ returns **HTTP 400**. That breaks two seemingly-obvious healthchecks:
 
-| Approach | Why it fails |
-|---|---|
-| `wget -q --spider http://localhost:9324/` | Exits with code **8** on the 400 response → false negative |
-| `exec 3<>/dev/tcp/127.0.0.1/9324` | `/dev/tcp` is **bash-only**; alpine `sh` says *"cannot create: Directory nonexistent"* |
+
+| Approach                                  | Why it fails                                                                           |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `wget -q --spider http://localhost:9324/` | Exits with code**8** on the 400 response → false negative                             |
+| `exec 3<>/dev/tcp/127.0.0.1/9324`         | `/dev/tcp` is **bash-only**; alpine `sh` says *"cannot create: Directory nonexistent"* |
 
 **The fix** — `curl` exits 0 on any HTTP response, so we succeed whenever TCP is up:
 

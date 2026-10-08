@@ -106,11 +106,12 @@ Three things Redis is particularly good at:
 
 The three-tier design of this project maps directly to those strengths:
 
-| Tier      | Store         | Why here                                              |
-| --------- | ------------- | ----------------------------------------------------- |
-| Hot       | Redis         | Sub-50ms latency, atomic Lua, per-key TTL            |
-| Async     | AWS SQS       | Durable queue, at-least-once delivery, decoupled      |
-| Cold      | PostgreSQL    | ACID, durable, complex queries                       |
+
+| Tier  | Store      | Why here                                         |
+| ------- | ------------ | -------------------------------------------------- |
+| Hot   | Redis      | Sub-50ms latency, atomic Lua, per-key TTL        |
+| Async | AWS SQS    | Durable queue, at-least-once delivery, decoupled |
+| Cold  | PostgreSQL | ACID, durable, complex queries                   |
 
 [In this repo] `internal/redis/client.go` is the connection entry point.
 `docs/architecture.md §1` has the full system diagram showing where Redis
@@ -201,12 +202,13 @@ Rules:
 
 This project's key families:
 
-| Pattern                     | Type   | TTL        | Purpose                              |
-| --------------------------- | ------ | ---------- | ------------------------------------ |
-| `inventory:event:{id}`      | STRING | none       | Available seat counter               |
-| `hold:event:{id}:user:{uid}`| STRING | 600 s      | Per-user seat lock (anti-double-book)|
-| `bucket:event:{id}`          | HASH   | 86400 s    | Token bucket state (tokens + refill) |
-| `queue:event:{id}`           | ZSET   | configurable| Waiting room queue (FIFO by score)   |
+
+| Pattern                      | Type   | TTL          | Purpose                               |
+| ------------------------------ | -------- | -------------- | --------------------------------------- |
+| `inventory:event:{id}`       | STRING | none         | Available seat counter                |
+| `hold:event:{id}:user:{uid}` | STRING | 600 s        | Per-user seat lock (anti-double-book) |
+| `bucket:event:{id}`          | HASH   | 86400 s      | Token bucket state (tokens + refill)  |
+| `queue:event:{id}`           | ZSET   | configurable | Waiting room queue (FIFO by score)    |
 
 [In this repo] `internal/redis/reserve.go` defines `InventoryKey()` and
 `HoldKey()`. `internal/redis/waitingroom.go` defines `bucketKey()` and
@@ -283,17 +285,18 @@ used key across *all* keys (not just keys with a TTL).
 
 All available policies:
 
-| Policy              | Which keys considered           | Notes                              |
-| ------------------- | ------------------------------ | ---------------------------------- |
-| `noeviction`        | none — writes rejected         | Default. Kills your app.           |
-| `allkeys-lru`       | all keys                       | What we use.                       |
-| `volatile-lru`      | keys with a TTL only           | Same as allkeys-lru if everything |
-|                     |                                | has a TTL.                         |
-| `allkeys-lfu`       | all keys                       | LFU = least frequently used.       |
-| `volatile-lfu`       | keys with a TTL only           | Good for cache with TTL.           |
-| `allkeys-random`    | all keys                       | Deterministic-ish.                 |
-| `volatile-random`   | keys with a TTL only           |                                    |
-| `volatile-ttl`       | keys with a TTL only          | Evict shortest TTL first.          |
+
+| Policy            | Which keys considered   | Notes                             |
+| ------------------- | ------------------------- | ----------------------------------- |
+| `noeviction`      | none — writes rejected | Default. Kills your app.          |
+| `allkeys-lru`     | all keys                | What we use.                      |
+| `volatile-lru`    | keys with a TTL only    | Same as allkeys-lru if everything |
+|                   |                         | has a TTL.                        |
+| `allkeys-lfu`     | all keys                | LFU = least frequently used.      |
+| `volatile-lfu`    | keys with a TTL only    | Good for cache with TTL.          |
+| `allkeys-random`  | all keys                | Deterministic-ish.                |
+| `volatile-random` | keys with a TTL only    |                                   |
+| `volatile-ttl`    | keys with a TTL only    | Evict shortest TTL first.         |
 
 **LRU is approximated, not exact.** Redis samples 5 random keys (config:
 `maxmemory-samples`) and evicts the one with the oldest last-access time.
@@ -369,17 +372,18 @@ mid-traffic rewrites.
 
 ## 7. Redis vs Postgres vs Memcached
 
-| Concern                  | Redis              | Postgres           | Memcached          |
-| ------------------------ | ------------------ | ----------------- | ----------------- |
-| Latency                 | ~50 µs             | ~1-10 ms          | ~50 µs            |
-| Data model              | Key-value + types  | Relational SQL     | Key-value (strings)|
-| Atomicity               | Lua scripts        | ACID transactions  | CAS only           |
-| Persistence             | RDB + AOF          | WAL + tables      | None              |
-| Complex queries         | No                 | Yes (SQL, JOINs)  | No                |
-| Memory efficiency        | Lower (data types) | Higher (compact)  | Higher (simple)    |
-| Scaling                  | Cluster (sharding) | Read replicas     | Consistent hash   |
-| TTL                     | Native, all keys   | Manual (WHERE)    | Native            |
-| Pub/Sub built-in         | Yes                | No (LISTEN/NOTIFY)| No                |
+
+| Concern           | Redis              | Postgres           | Memcached           |
+| ------------------- | -------------------- | -------------------- | --------------------- |
+| Latency           | ~50 µs            | ~1-10 ms           | ~50 µs             |
+| Data model        | Key-value + types  | Relational SQL     | Key-value (strings) |
+| Atomicity         | Lua scripts        | ACID transactions  | CAS only            |
+| Persistence       | RDB + AOF          | WAL + tables       | None                |
+| Complex queries   | No                 | Yes (SQL, JOINs)   | No                  |
+| Memory efficiency | Lower (data types) | Higher (compact)   | Higher (simple)     |
+| Scaling           | Cluster (sharding) | Read replicas      | Consistent hash     |
+| TTL               | Native, all keys   | Manual (WHERE)     | Native              |
+| Pub/Sub built-in  | Yes                | No (LISTEN/NOTIFY) | No                  |
 
 **Why Redis over Memcached for this project:**
 
@@ -831,14 +835,16 @@ EXEC
 `EXEC` returns an array of replies, one per command.
 
 **What they do:**
+
 - Queue commands and execute them sequentially with no interleaving from
   other clients.
 - Atomic — all-or-nothing (DISCARD clears the queue).
 
 **What they DON'T do:**
+
 - There is no isolation between queued commands. `GET` inside a
   transaction returns the value at `EXEC` time, not at `MULTI` time.
-  The queued `GET` has not "seen" prior queued commands' writes yet.
+  The queued `GET` has not "seen" prior queued commands' writes yet. 
 
 ```redis
 MULTI
@@ -892,6 +898,7 @@ The client must retry the whole loop if EXEC returns nil.
 - Lua gives us the conditional logic AND the atomicity in one round-trip.
 
 WATCH is appropriate when:
+
 - Contention is rare (most requests succeed on first try).
 - You cannot use Lua (e.g., you're using a client that doesn't support it).
 
@@ -1023,8 +1030,7 @@ raw, err := reserveScript.Run(ctx, client, keys, args...).Result()
 The script source is embedded at compile time via `//go:embed`, so the
 SHA1 is stable across process restarts. See §31.
 
-[In this repo] `internal/redis/reserve.go` line 12-17. `internal/redis/
-waitingroom.go` line 12-15.
+[In this repo] `internal/redis/reserve.go` line 12-17. `internal/redis/ waitingroom.go` line 12-15.
 
 ---
 
@@ -1083,8 +1089,7 @@ return {0, tostring(rank + 1)}
 The queue + position in a single atomic step: no interleaving client can
 insert between the "check" and the "enqueue."
 
-[In this repo] `scripts/reserve.lua` lines 15-35. `scripts/
-token_bucket.lua` lines 30-63.
+[In this repo] `scripts/reserve.lua` lines 15-35. `scripts/ token_bucket.lua` lines 30-63.
 
 ---
 
@@ -1196,14 +1201,15 @@ the current polling approach.
 
 ## 25. Streams vs Pub/Sub vs Lists — when to use which
 
-| Property         | Pub/Sub          | Lists           | Streams              |
-| ---------------- | ---------------- | --------------- | -------------------- |
-| Persistence      | None             | Until consumed  | Until trimmed        |
-| Replay           | No               | No              | Yes (XRANGE)        |
-| Consumer groups  | No               | Manual          | Yes (XREADGROUP)    |
-| Per-entry TTL    | No               | No              | Yes (MAXLEN)         |
-| At-most-once     | Yes              | Yes             | At-least-once (XACK)|
-| Fan-out          | Yes (native)     | Limited         | Limited              |
+
+| Property        | Pub/Sub      | Lists          | Streams              |
+| ----------------- | -------------- | ---------------- | ---------------------- |
+| Persistence     | None         | Until consumed | Until trimmed        |
+| Replay          | No           | No             | Yes (XRANGE)         |
+| Consumer groups | No           | Manual         | Yes (XREADGROUP)     |
+| Per-entry TTL   | No           | No             | Yes (MAXLEN)         |
+| At-most-once    | Yes          | Yes            | At-least-once (XACK) |
+| Fan-out         | Yes (native) | Limited        | Limited              |
 
 **Our choices:**
 
@@ -1318,13 +1324,14 @@ use it to "find all keys matching a pattern" in a hot path.
 
 ## 28. Transactions vs Pipelines vs Lua — when to use which
 
-| Need                                    | Use        | Reason                                       |
-| --------------------------------------- | ---------- | -------------------------------------------- |
-| N independent commands, minimum latency | Pipeline   | One round-trip, not atomic across commands   |
-| N commands atomic, no conditional logic | MULTI/EXEC | All-or-nothing, but no read isolation       |
-| Conditional reads + writes              | Lua        | The only tool with real atomicity + logic   |
-| Simple counter                          | INCR/DECR  | O(1) atomic per-command primitive           |
-| Lock acquisition                         | SET NX EX  | Atomic set-if-not-exists with TTL           |
+
+| Need                                    | Use        | Reason                                     |
+| ----------------------------------------- | ------------ | -------------------------------------------- |
+| N independent commands, minimum latency | Pipeline   | One round-trip, not atomic across commands |
+| N commands atomic, no conditional logic | MULTI/EXEC | All-or-nothing, but no read isolation      |
+| Conditional reads + writes              | Lua        | The only tool with real atomicity + logic  |
+| Simple counter                          | INCR/DECR  | O(1) atomic per-command primitive          |
+| Lock acquisition                        | SET NX EX  | Atomic set-if-not-exists with TTL          |
 
 **Our project:**
 
@@ -1441,8 +1448,7 @@ _, err := pipe.Exec(ctx)
 **Return value handling:**
 
 go-redis returns `*redisclient.StringCmd`, `*redisclient.IntCmd`,
-`*redisclient.StatusCmd`, etc. Use `.Result()` which returns `(value,
-error)`. `.Val()` returns the value only (panics on error).
+`*redisclient.StatusCmd`, etc. Use `.Result()` which returns `(value, error)`. `.Val()` returns the value only (panics on error).
 
 ```go
 // Recommended:
@@ -1515,8 +1521,7 @@ Why embed vs read at runtime:
   start. The server caches by SHA1.
 - **No file I/O at startup** — `//go:embed` is a compile-time constant.
 
-[In this repo] `internal/redis/reserve.go` lines 12-17. `internal/redis/
-waitingroom.go` lines 12-15.
+[In this repo] `internal/redis/reserve.go` lines 12-17. `internal/redis/ waitingroom.go` lines 12-15.
 
 ---
 
@@ -1546,12 +1551,13 @@ redis:
 
 Flags in order of importance:
 
-| Flag                      | Why it matters                                      |
-| ------------------------- | --------------------------------------------------- |
-| `--maxmemory 512mb`       | Caps memory. Prevents runaway growth.               |
-| `--maxmemory-policy allkeys-lru` | With 512mb cap, what gets evicted when full? |
-| `--notify-keyspace-events Ex` | Publish expired-key events on keyspace 0. Phase 7  |
-| `--appendonly yes`        | AOF for crash recovery (we don't rely on it).        |
+
+| Flag                             | Why it matters                                    |
+| ---------------------------------- | --------------------------------------------------- |
+| `--maxmemory 512mb`              | Caps memory. Prevents runaway growth.             |
+| `--maxmemory-policy allkeys-lru` | With 512mb cap, what gets evicted when full?      |
+| `--notify-keyspace-events Ex`    | Publish expired-key events on keyspace 0. Phase 7 |
+| `--appendonly yes`               | AOF for crash recovery (we don't rely on it).     |
 
 The `Ex` notification flag: `E` = expired events, `x` = set/expired
 events (capital X = all events). Lowercase `x` is sufficient for our
@@ -1566,10 +1572,11 @@ use — we subscribe to `__keyevent@0__:expired`.
 This project uses two Lua scripts, not one giant script. The split is
 intentional:
 
-| Script           | When it runs        | What it does                              |
-| ---------------- | ------------------- | ----------------------------------------- |
-| `reserve.lua`    | Every `/reserve` call | Check + lock + decrement inventory       |
-| `token_bucket.lua` | Every `/enter` call | Rate-limit admission or enqueue to ZSET  |
+
+| Script             | When it runs         | What it does                            |
+| -------------------- | ---------------------- | ----------------------------------------- |
+| `reserve.lua`      | Every`/reserve` call | Check + lock + decrement inventory      |
+| `token_bucket.lua` | Every`/enter` call   | Rate-limit admission or enqueue to ZSET |
 
 **Why separate scripts:**
 
@@ -2062,6 +2069,7 @@ the GET-heavy path.
 **Pitfall 4 — Dual-write between Redis and SQS.**
 
 The reserve flow:
+
 1. `reserve.lua` → Redis hold key + inventory decrement
 2. SQS SendMessage → durable record
 
@@ -2089,15 +2097,16 @@ reservation, they're not re-admitted to the queue.
 
 **Future Redis usage (Phases 4-7):**
 
-| Phase | Feature                    | Redis usage                                      |
-| ----- | -------------------------- | ------------------------------------------------ |
-| 4     | Per-IP rate limit          | `bucket:ip:{ip}` HASH (separate from event bucket)|
-| 4     | SSE drainer                | Periodic ZRANK per SSE client; Pub/Sub at scale   |
-| 6     | Idempotency key            | `idem:{user_id}:{event_id}` STRING with TTL      |
-| 7     | Expiration: Approach A     | Keyspace notifications (`PSUBSCRIBE __keyevent@0__:expired`) |
-| 7     | Expiration: Approach B     | Postgres sweep → Redis INCR (belt-and-suspenders) |
-| 7     | Audit log                  | `XADD reservations * ...` Stream for replay     |
-| Stretch | Redis Cluster           | Shard by `event_id` hash tag                     |
+
+| Phase   | Feature                | Redis usage                                                  |
+| --------- | ------------------------ | -------------------------------------------------------------- |
+| 4       | Per-IP rate limit      | `bucket:ip:{ip}` HASH (separate from event bucket)           |
+| 4       | SSE drainer            | Periodic ZRANK per SSE client; Pub/Sub at scale              |
+| 6       | Idempotency key        | `idem:{user_id}:{event_id}` STRING with TTL                  |
+| 7       | Expiration: Approach A | Keyspace notifications (`PSUBSCRIBE __keyevent@0__:expired`) |
+| 7       | Expiration: Approach B | Postgres sweep → Redis INCR (belt-and-suspenders)           |
+| 7       | Audit log              | `XADD reservations * ...` Stream for replay                  |
+| Stretch | Redis Cluster          | Shard by`event_id` hash tag                                  |
 
 [In this repo] `docs/implementation-plan.md` lines 425-481 (Phase 4)
 and lines 595-640 (Phase 7).
