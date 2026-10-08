@@ -45,8 +45,8 @@ func InsertIfAbsent(ctx context.Context, pool *Pool, r queue.Reservation) error 
 	}
 
 	const q = `
-		INSERT INTO reservations (reservation_id, user_id, event_id, status, expires_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO reservations (reservation_id, user_id, event_id, status, expires_at, seats)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (reservation_id) DO NOTHING
 	`
 	tag, err := pool.Exec(ctx, q,
@@ -55,6 +55,7 @@ func InsertIfAbsent(ctx context.Context, pool *Pool, r queue.Reservation) error 
 		parsed.EventID,
 		StatusPendingPayment,
 		parsed.ExpiresAtT,
+		parsed.Seats,
 	)
 	if err != nil {
 		return fmt.Errorf("db: insert reservation: %w", err)

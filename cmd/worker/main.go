@@ -7,7 +7,15 @@
 //   - Workers can scale horizontally (multiple replicas of cmd/worker
 //     share the SQS queue)
 //
-// The hot path:
+// Phase 7 added a second responsibility: a goroutine that runs the
+// expiry sweep every 60 s, transitioning PENDING_PAYMENT rows whose
+// expires_at has passed to EXPIRED and INCRBYing the inventory counter.
+// This is the "belt-and-suspenders" safety net — the watcher (cmd/expiration-watcher)
+// handles 99% of expiries via Redis keyspace notifications, but keyspace
+// notifications have no delivery guarantee, so we re-derive the truth
+// from Postgres every minute.
+//
+// Hot path:
 //
 //   POST /reserve (API)
 //     → Redis Lua reserve (hold key, decrement inventory)
@@ -18,6 +26,10 @@
 //     ↳ queue.Poll receives via long-poll
 //     ↳ db.InsertIfAbsent writes Postgres row (ON CONFLICT DO NOTHING)
 //     ↳ DeleteMessage on success
+//
+//   hold:event:<id>:user:<user>  TTL expires (Phase 7)
+//     ↳ SIDE: RunSweep goroutine picks up the row on a ticker
+//     ↳ expire.Compensate: row flipped + inventory incremented
 //
 // At-least-once delivery + idempotent INSERT = effectively-once
 // durable state.
@@ -39,7 +51,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
+	"github.com/emmitt-k/ticket-deal/internal/expire"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
+	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
 
 func main() {
@@ -54,9 +68,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("worker: starting (queue=%s, db=%s, poll=%ds, visibility=%ds)",
+	log.Printf("worker: starting (queue=%s, db=%s, poll=%ds, visibility=%ds, sweep=%s)",
 		cfg.SQSQueueURL, redactDSN(cfg.DatabaseURL),
-		cfg.WorkerLongPollSeconds, cfg.VisibilityTimeoutSeconds)
+		cfg.WorkerLongPollSeconds, cfg.VisibilityTimeoutSeconds,
+		cfg.SweepInterval)
 
 	// ── DB pool (fail fast if Postgres unreachable) ────────────
 	ctx, stop := signal.NotifyContext(context.Background(),
@@ -74,6 +89,14 @@ func run() error {
 	defer pool.Close()
 	log.Printf("worker: DB pool open (max=5, min=1)")
 
+	// ── Redis client (Phase 7: needed by the sweep goroutine) ──
+	rdb := redis.NewClient(redis.Config{Addr: cfg.RedisAddr})
+	defer rdb.Close()
+	if err := redis.Ping(ctx, rdb); err != nil {
+		return fmt.Errorf("ping Redis: %w", err)
+	}
+	log.Printf("worker: Redis ping OK (addr=%s)", cfg.RedisAddr)
+
 	// ── SQS client (pointed at ElasticMQ locally, AWS in prod) ──
 	sqsClient, err := queue.NewSQSClient(ctx, queue.AWSConfig{
 		Region:      cfg.SQSRegion,
@@ -83,6 +106,19 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("build SQS client: %w", err)
 	}
+
+	// ── Expiry sweep (Phase 7 safety net) ─────────────────────
+	//
+	// Runs as a goroutine inside the worker process. Returns ctx.Err()
+	// on graceful shutdown. We log non-canceled errors but don't
+	// propagate — losing the sweep doesn't kill SQS consumption,
+	// and the watcher (separate binary) covers the 99% case.
+	go func() {
+		if err := expire.RunSweep(ctx, pool, rdb, cfg.SweepInterval); err != nil &&
+			!errors.Is(err, context.Canceled) {
+			log.Printf("worker: sweep exited with error: %v", err)
+		}
+	}()
 
 	// ── Worker loop ─────────────────────────────────────────────
 	handler := queue.MessageHandlerFunc(func(ctx context.Context, body []byte) error {
@@ -146,6 +182,8 @@ type config struct {
 	SQSEndpointURL         string // local path
 	VisibilityTimeoutSeconds int
 	WorkerLongPollSeconds  int
+	RedisAddr              string        // Phase 7: needed by the sweep goroutine
+	SweepInterval          time.Duration // Phase 7: how often to scan for expired rows
 }
 
 func loadConfig() (*config, error) {
@@ -156,6 +194,8 @@ func loadConfig() (*config, error) {
 		SQSEndpointURL:          getEnv("SQS_ENDPOINT_URL", ""),
 		VisibilityTimeoutSeconds: atoiOr(getEnv("SQS_VISIBILITY_TIMEOUT_SECONDS", "30"), 30),
 		WorkerLongPollSeconds:   atoiOr(getEnv("WORKER_LONG_POLL_SECONDS", "20"), 20),
+		RedisAddr:               getEnv("REDIS_ADDR", "localhost:6379"),
+		SweepInterval:           sweepIntervalOr(getEnv("SWEEP_INTERVAL_SECONDS", "60"), 60*time.Second),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("DATABASE_URL is required")
@@ -164,6 +204,17 @@ func loadConfig() (*config, error) {
 		return nil, errors.New("SQS_QUEUE_URL is required")
 	}
 	return c, nil
+}
+
+// sweepIntervalOr parses a seconds-string into time.Duration. Falls back
+// to def on error. Kept separate from atoiOr so callers don't have to
+// remember the seconds→Duration conversion.
+func sweepIntervalOr(s string, def time.Duration) time.Duration {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return time.Duration(n) * time.Second
 }
 
 // ── Tiny env helpers (worker-local; not shared with internal/config) ───────
