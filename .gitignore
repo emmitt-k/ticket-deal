@@ -13,6 +13,15 @@
 coverage.txt
 coverage.out
 *.cover
+# Stray binaries from `go build ./cmd/<name>` (without -o) — same
+# names as the cmd dirs. /bin/ catches `make build`, these catch
+# ad-hoc builds.
+/api
+/worker
+/expiration-watcher
+/dashboard-server
+/mintjwt
+/seed-inventory
 
 # ─── Vendored deps (we don't vendor; module cache only) ───────
 /vendor/
