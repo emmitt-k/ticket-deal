@@ -1,0 +1,267 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "title": "Request Rate (by path)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (path) (rate(http_requests_total{service=\"api\"}[10s]))",
+          "legendFormat": "{{path}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        }
+      },
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "table", "placement": "right"}
+      }
+    },
+    {
+      "title": "Error Rate (5xx)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{status=~\"Internal Server Error|.*5..\"}[10s]))",
+          "legendFormat": "5xx errors",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "fixed", "fixedColor": "red"},
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20}
+        }
+      }
+    },
+    {
+      "title": "p99 Latency (by path)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (path, le) (rate(http_request_duration_seconds_bucket{service=\"api\"}[10s])))",
+          "legendFormat": "{{path}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "title": "Reservation Outcomes (per second)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "rate(reservations_held_total[10s])",
+          "legendFormat": "held",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(reservations_completed_total[10s])",
+          "legendFormat": "completed (published)",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(reservations_sold_out_total[10s])",
+          "legendFormat": "sold_out",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(reservations_oversold_total[10s])",
+          "legendFormat": "⚠ OVERSOLD",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "stacking": {"mode": "normal"}}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "⚠ OVERSOLD"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Worker Throughput (per second)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(worker_messages_processed_total[10s]))",
+          "legendFormat": "messages {{status}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (status) (rate(worker_db_writes_total[10s]))",
+          "legendFormat": "db writes {{status}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20}
+        }
+      }
+    },
+    {
+      "title": "Worker DB Write Latency (p50, p99)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(worker_db_write_duration_seconds_bucket[10s]))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(worker_db_write_duration_seconds_bucket[10s]))",
+          "legendFormat": "p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "title": "Expiration Activity (per second)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(expiration_sweep_cycles_total[10s]))",
+          "legendFormat": "sweep cycles ({{service}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (service) (rate(expiration_seats_expired_total[10s]))",
+          "legendFormat": "seats expired ({{service}})",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "title": "Seats Available",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 24},
+      "targets": [
+        {
+          "expr": "redis_seats_available",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 50},
+              {"color": "green", "value": 100}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    },
+    {
+      "title": "Waiting Room Queue",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 24},
+      "targets": [
+        {
+          "expr": "waiting_room_queue_length",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 100},
+              {"color": "red", "value": 500}
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"]}
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["ticket-deal"],
+  "templating": {"list": []},
+  "time": {"from": "now-5m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Ticket Deal — Overview",
+  "uid": "ticket-deal-overview",
+  "version": 1,
+  "weekStart": ""
+}

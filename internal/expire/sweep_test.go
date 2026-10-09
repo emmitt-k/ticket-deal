@@ -162,7 +162,7 @@ func TestRunSweep_ContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before starting
 
-	err := RunSweep(ctx, pool, rdb, time.Minute)
+	err := RunSweep(ctx, pool, rdb, "test", time.Minute)
 	require.Error(t, err)
 	require.ErrorIs(t, err, context.Canceled)
 }
@@ -193,7 +193,7 @@ func TestRunSweep_Integration(t *testing.T) {
 	// Short interval so the test runs fast.
 	done := make(chan error, 1)
 	go func() {
-		done <- RunSweep(ctx, pool, rdb, 50*time.Millisecond)
+		done <- RunSweep(ctx, pool, rdb, "test", 50*time.Millisecond)
 	}()
 
 	// Poll inventory for up to 2s; expect 7 (5 + 2 seats).

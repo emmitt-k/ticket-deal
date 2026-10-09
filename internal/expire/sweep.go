@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
+	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
 
@@ -59,6 +60,10 @@ func FindAndExpireSweptRows(ctx context.Context, pool *db.Pool) ([]SweptRow, err
 
 // RunSweep runs the expiry sweep every interval until ctx is canceled.
 //
+// service: label added to expiration_sweep_cycles_total and
+//          expiration_seats_expired_total metrics. Pass "worker" or
+//          "watcher" to disambiguate when both run sweeps.
+//
 // interval: typically 60 s. Lower = faster catch-up but more DB load;
 // higher = seats stuck "held" for longer if the watcher is down.
 //
@@ -73,14 +78,14 @@ func FindAndExpireSweptRows(ctx context.Context, pool *db.Pool) ([]SweptRow, err
 // INCRBY failures are logged but do not block subsequent rows: each
 // row is independent, and the next sweep won't re-process it (status
 // already EXPIRED in DB). Operator alerting should fire on INCRBY errors.
-func RunSweep(ctx context.Context, pool *db.Pool, rdb *redis.Client, interval time.Duration) error {
-	log.Printf("expire: sweep starting (interval=%s)", interval)
+func RunSweep(ctx context.Context, pool *db.Pool, rdb *redis.Client, service string, interval time.Duration) error {
+	log.Printf("expire: sweep starting (service=%s, interval=%s)", service, interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Run once immediately so we don't wait `interval` before the first
 	// pass — useful for tests and for fast startup.
-	sweepOnce(ctx, pool, rdb)
+	sweepOnce(ctx, pool, rdb, service)
 
 	for {
 		select {
@@ -88,14 +93,15 @@ func RunSweep(ctx context.Context, pool *db.Pool, rdb *redis.Client, interval ti
 			log.Printf("expire: sweep clean shutdown")
 			return ctx.Err()
 		case <-ticker.C:
-			sweepOnce(ctx, pool, rdb)
+			sweepOnce(ctx, pool, rdb, service)
 		}
 	}
 }
 
 // sweepOnce runs one pass of the sweep: UPDATE expired rows, then
 // INCRBY inventory for each. Logs counts + per-row failures.
-func sweepOnce(ctx context.Context, pool *db.Pool, rdb *redis.Client) {
+func sweepOnce(ctx context.Context, pool *db.Pool, rdb *redis.Client, service string) {
+	metrics.ExpirationSweepCycles.WithLabelValues(service).Inc()
 	rows, err := FindAndExpireSweptRows(ctx, pool)
 	if err != nil {
 		log.Printf("expire: sweep query failed: %v", err)
@@ -104,6 +110,7 @@ func sweepOnce(ctx context.Context, pool *db.Pool, rdb *redis.Client) {
 	if len(rows) == 0 {
 		return
 	}
+	metrics.ExpirationSeatsExpired.WithLabelValues(service).Add(float64(len(rows)))
 	log.Printf("expire: sweep transitioned %d row(s) to EXPIRED", len(rows))
 	for _, r := range rows {
 		if err := rdb.IncrBy(ctx, redis.InventoryKey(r.EventID), int64(r.Seats)).Err(); err != nil {

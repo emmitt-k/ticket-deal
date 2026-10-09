@@ -29,6 +29,7 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
+	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 	"github.com/emmitt-k/ticket-deal/internal/waitingroom"
@@ -81,9 +82,19 @@ func run() error {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
+	// Wrap every route in a middleware that records HTTP request
+	// counts and latency for Prometheus. Must be added before any
+	// routes are registered.
+	r.Use(metricsMiddleware("api"))
+
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		apiutil.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+
+	// Prometheus scrape endpoint. Standard /metrics path, no auth
+	// (Prometheus runs on the same Docker network; in production,
+	// this would be network-firewalled or behind a sidecar).
+	r.Method(http.MethodGet, "/metrics", metrics.Handler())
 
 	// Phase 4 + 5 routes — the waiting room and reservation
 	r.Route("/api/tickets", func(r chi.Router) {
@@ -205,4 +216,43 @@ func buildPublisher(cfg config.Config) api.ReservationPublisher {
 	log.Printf("api: SQS publisher wired (region=%s, endpoint=%q, queue=%s)",
 		cfg.SQS.Region, cfg.SQS.EndpointURL, cfg.SQS.QueueURL)
 	return queue.NewReservationAPIPublisher(queue.NewSQSPublisher(sqsClient, cfg.SQS.QueueURL))
+}
+
+// metricsMiddleware returns a chi-compatible middleware that records
+// HTTP request counts and latency to the shared Prometheus metrics.
+// `service` is a label so the same metric can be aggregated across
+// services in PromQL.
+func metricsMiddleware(service string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			// Wrap the ResponseWriter so we can capture the status code.
+			ww := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(ww, r)
+
+			// Don't record /metrics itself — would cause a feedback
+			// loop where each scrape increments its own counter.
+			if r.URL.Path == "/metrics" {
+				return
+			}
+
+			path := r.URL.Path
+			status := http.StatusText(ww.status)
+			metrics.HTTPRequestsTotal.WithLabelValues(service, path, r.Method, status).Inc()
+			metrics.HTTPRequestDurationSeconds.WithLabelValues(service, path).Observe(time.Since(start).Seconds())
+		})
+	}
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code
+// written by downstream handlers, since the stdlib doesn't expose it
+// by default. Default is 200 (the stdlib's default).
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
+	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
@@ -97,9 +98,11 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		case redis.StatusRejected:
 			switch result.Reason {
 			case redis.ReasonSoldOut:
+				metrics.ReservationsSoldOut.Inc()
 				apiutil.WriteError(w, http.StatusConflict,
 					"sold_out", "this event is sold out")
 			case redis.ReasonAlreadyHolding:
+				metrics.ReservationsAlreadyHolding.Inc()
 				apiutil.WriteError(w, http.StatusConflict,
 					"already_holding",
 					"you already have an active hold for this event")
@@ -119,6 +122,11 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 				"internal_error", "unexpected reservation outcome")
 			return
 		}
+
+		// Seat successfully held in Redis. Count it as a hold
+		// (regardless of whether the publish to SQS succeeds — the
+		// hold is the source of truth for "did we get the seat").
+		metrics.ReservationsHeld.Inc()
 
 		// ── 5. Success: mint reservation_id, publish, respond ──────
 		reservationID := uuid.NewString()
@@ -153,6 +161,8 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		if err := publisher.Publish(r.Context(), payload); err != nil {
 			log.Printf("api: publish failed (reservation still valid) res=%s: %v",
 				reservationID, err)
+		} else {
+			metrics.ReservationsCompleted.Inc()
 		}
 
 		apiutil.WriteJSON(w, http.StatusOK, map[string]any{

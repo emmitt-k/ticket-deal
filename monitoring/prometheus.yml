@@ -1,0 +1,50 @@
+# Prometheus scrape config for ticket-deal.
+#
+# The Go services (api, worker, expiration-watcher) run on the host
+# machine via `make all-services`, NOT in Docker. Prometheus runs in
+# Docker and reaches them via host.docker.internal (set up in
+# docker-compose.yml via `extra_hosts: host.docker.internal:host-gateway`).
+#
+# Scrape interval: 5s — fine enough to see load-test bursts as smooth
+# graphs without overwhelming the metrics endpoints.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    cluster: ticket-deal-local
+    env: dev
+
+scrape_configs:
+  # API server — request rate, latency, reservation outcomes.
+  - job_name: api
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - host.docker.internal:8080
+        labels:
+          service: api
+
+  # Worker — SQS throughput, DB write latency, expiry sweep.
+  - job_name: worker
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - host.docker.internal:8081
+        labels:
+          service: worker
+
+  # Expiration-watcher — event-driven compensation rate.
+  - job_name: expiration-watcher
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - host.docker.internal:8083
+        labels:
+          service: expiration-watcher
+
+  # Prometheus itself — useful for debugging scrape health.
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

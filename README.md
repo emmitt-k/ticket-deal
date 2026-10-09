@@ -86,6 +86,7 @@ The three phases, in one line each:
 | Queue UI       | **Server-Sent Events**                                                                              | One-way position push over `text/event-stream` — way simpler than WebSockets for this use case                            |
 | Load testing   | **k6**                                                                                              | Scriptable VUs, threshold-based assertions, great reporting                                                                |
 | DB explorer    | **pgcli**                                                                                           | `psql` with autocomplete + syntax highlighting + pretty tables                                                            |
+| Metrics        | **Prometheus** + **Grafana**                                                                        | `/metrics` on every service, scraped by Prometheus, visualized in a 9-panel "Ticket Deal — Overview" dashboard             |
 | Containers     | **Docker Compose**                                                                                  | Whole stack with one command                                                                                              |
 
 > Why these choices (and which we explicitly rejected) → [`/docs/architecture.md`](docs/architecture.md)
@@ -248,13 +249,36 @@ Tune the load: `make loadtest-burst VUS=500`, `make loadtest-ramp VUS=2000`. Tar
 
 ---
 
+## Observability (Prometheus + Grafana)
+
+Live metrics for every service, scrape-and-dashboard ready:
+
+```bash
+# Bring up the stack (one-time)
+docker compose up -d prometheus grafana
+
+# Run your services (as usual)
+make all-services
+
+# Open dashboards
+#   Prometheus:  http://localhost:9090
+#   Grafana:     http://localhost:3000   (admin / admin123)
+#   Dashboard:   "Ticket Deal" folder → "Ticket Deal — Overview"
+```
+
+The dashboard shows request rate, p99 latency, reservation outcomes (held vs sold_out vs oversold), worker throughput, DB write latency, and expiration activity. The headline metric is **`reservations_oversold_total`** — should always be `0`. Alert if it ticks.
+
+For the full metrics inventory and how to add a new one → [`/docs/observability-plan.md`](docs/observability-plan.md).
+
+---
+
 ## Project Roadmap
 
 Done items are crossed off; remaining items are aspirational roadmap (not phase progression).
 
 - [x] **Idempotent worker writes** — `INSERT ... ON CONFLICT DO NOTHING` *(schema ready since Phase 1; writer logic lands in Phase 5)*
 - [ ] **Redis Cluster** — shard seats across nodes for >100k concurrent users
-- [ ] **Observability** — Prometheus + Grafana (Lua script duration, SQS depth, hold-TTL distribution)
+- [x] **Observability** — Prometheus + Grafana (request rate, latency, reservation outcomes, worker throughput, expiration activity; `reservations_oversold_total` is the headline alert)
 - [ ] **Distributed tracing** — OpenTelemetry across API → SQS → worker
 - [ ] **Payment gateway** — Stripe webhook handler that confirms reservations and releases the hold
 - [ ] **Seat-level granularity** — Redis Hash per event instead of a single counter

@@ -46,6 +46,9 @@ Client → API (:8080) → Redis (rate-limit + waiting-room queue)
                    → ElasticMQ (async reservation publishing)
                             → Worker (:8081) consumes SQS → writes to Postgres
                             → Expiration-Watcher (keyspace notifications) → auto-expires holds
+
+Observability:
+  All services expose /metrics → Prometheus (:9090) → Grafana (:3000)
 ```
 
 **Key correctness invariants:**
@@ -87,6 +90,24 @@ make stop-loadtest         # Kill any running k6 process (burst or ramp)
 **Load test logs** (never overwritten, timestamped):
 - `logs/burst/TS-burst.log`
 - `logs/ramp/TS-ramp.log`
+
+### Observability
+
+```bash
+# After `make all-services` + `docker compose up -d prometheus grafana`:
+#   Prometheus: http://localhost:9090
+#   Grafana:    http://localhost:3000  (admin / admin123, anonymous Viewer enabled)
+#   Dashboard:  "Ticket Deal" folder → "Ticket Deal — Overview"
+```
+
+All Go services expose `/metrics` (Prometheus format) on their own ports:
+- API: `:8080/metrics` (chi router)
+- Worker: `:8081/metrics` (dedicated tiny HTTP server, set `METRICS_ADDR` to change)
+- Expiration-watcher: `:8083/metrics` (set `METRICS_ADDR` to change)
+
+Prometheus scrapes via `host.docker.internal` — the Go services run on the host, not in Docker.
+
+**Most important metric:** `reservations_oversold_total` — should ALWAYS be 0. Alert if > 0.
 
 ### Code Quality
 
@@ -144,6 +165,14 @@ make purge        # clean + docker compose down (keeps volumes)
 │   ├── worker.log
 │   ├── burst/                 # Timestamped burst logs
 │   └── ramp/                  # Timestamped ramp logs
+├── monitoring/                # Prometheus + Grafana configs (mounted into Docker)
+│   ├── prometheus.yml         # scrape config (api, worker, watcher targets)
+│   └── grafana/
+│       ├── provisioning/      # auto-provisioned datasource + dashboard config
+│       │   ├── datasources/datasource.yml
+│       │   └── dashboards/dashboards.yml
+│       └── dashboards/
+│           └── ticket-deal-overview.json    # "Ticket Deal — Overview" dashboard
 ├── migrations/
 │   ├── 001_init.sql           # Reservations + seats schema
 │   ├── 002_seed.sql           # Seed data
