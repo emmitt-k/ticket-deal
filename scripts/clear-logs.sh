@@ -1,30 +1,41 @@
 #!/usr/bin/env bash
-# Clear (truncate or delete) service log files in logs/*.log.
+# Delete (or truncate) log files in logs/.
 #
-# Default behaviour: TRUNCATE — set each log file's size to 0 bytes
-# without removing the file itself. This preserves the inode and any
-# open file descriptors, so services that are still writing to the
-# file keep doing so without missing a beat. POSIX-portable; works
-# the same on macOS and Linux.
+# Default behaviour: DELETE — actually `rm` each log file. Use this when
+# you want a true clean slate (e.g. before a fresh load test, after a
+# debugging session). The next time a service starts, start-bg.sh
+# recreates the .log file; the .pid file is left alone (lives in the
+# same dir but is a different file).
 #
-# Pass --delete to actually `rm` the files (next time the service
-# starts, start-bg.sh will recreate them).
+# Pass --truncate to set each file's size to 0 bytes instead, keeping
+# the inode and any open file descriptors intact. Useful if you want
+# to keep the file but reset its content while services are mid-flight
+# (services keep writing to the same FD without missing a beat).
+#
+# What this targets by default (no args):
+#   - logs/*.log            (api, worker, expiration-watcher, etc.)
+#   - logs/burst/*          (k6 burst test result files)
+#   - logs/ramp/*           (k6 ramp test result files)
 #
 # What this does NOT touch:
-#   - logs/burst/   (k6 burst test results, by timestamp)
-#   - logs/ramp/    (k6 ramp test results, by timestamp)
-#   - logs/*.pid    (PID files for liveness checks; managed by
-#                    start-bg.sh / stop-bg.sh)
+#   - logs/*.pid            (PID files for liveness checks; managed
+#                            by start-bg.sh / stop-bg.sh)
+#   - the burst/ and ramp/  DIRECTORIES themselves (only their
+#     contents)
 #
 # Usage:
-#   scripts/clear-logs.sh                # truncate all logs/*.log
-#   scripts/clear-logs.sh api worker     # only those two
-#   scripts/clear-logs.sh --delete       # rm instead of truncate
-#   scripts/clear-logs.sh --delete api   # rm only api.log
+#   scripts/clear-logs.sh                  # delete all log files
+#                                          #   (api.log + worker.log + ... + burst/* + ramp/*)
+#   scripts/clear-logs.sh --truncate      # truncate instead of delete
+#   scripts/clear-logs.sh api worker      # only those two service logs
+#   scripts/clear-logs.sh burst           # only k6 burst results
+#   scripts/clear-logs.sh api burst       # api log + all k6 burst results
 #
 # If services are still running, the script prints a warning but
-# proceeds — truncation is safe in-flight. Stop services first with
-# `make stop` if you want a clean snapshot.
+# proceeds — both delete and truncate are safe in-flight (services
+# keep their open FD on the deleted-then-recreated log, or on the
+# truncated-to-zero log). Stop services with `make stop` first if
+# you want a clean snapshot.
 #
 # Companion Makefile target: `make clean-logs`.
 
@@ -34,7 +45,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="$REPO_ROOT/logs"
 
 # ── Argument parsing ────────────────────────────────────────────
-MODE="truncate"   # or "delete"
+MODE="delete"   # default per Master: actually delete, not just truncate
 TARGETS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,7 +58,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --help|-h)
-      sed -n '2,30p' "$0"   # print the comment header
+      sed -n '2,38p' "$0"   # print the comment header
       exit 0
       ;;
     -*)
@@ -68,52 +79,79 @@ if [ ! -d "$LOG_DIR" ]; then
   exit 0
 fi
 
-# Resolve targets. If none given, grab every logs/*.log
-# (NOT the burst/ and ramp/ subdirs, NOT the *.pid files).
-if [ ${#TARGETS[@]} -eq 0 ]; then
-  shopt -s nullglob
-  for f in "$LOG_DIR"/*.log; do
-    TARGETS+=("$(basename "$f" .log)")
-  done
-  shopt -u nullglob
-fi
-
-# Build the absolute paths and filter out non-existent ones.
+# Resolve targets → absolute paths.
+# Each arg is either:
+#   - a service name (e.g. "api")        → logs/api.log
+#   - a directory under logs/ (e.g. "burst") → all files inside logs/burst/
 PATHS=()
 MISSING=()
-for name in "${TARGETS[@]}"; do
-  path="$LOG_DIR/$name.log"
-  if [ -f "$path" ]; then
-    PATHS+=("$path")
-  else
-    MISSING+=("$path")
-  fi
-done
 
+if [ ${#TARGETS[@]} -eq 0 ]; then
+  # No args: grab everything we manage.
+  # - all logs/*.log (skip .pid files)
+  shopt -s nullglob
+  for f in "$LOG_DIR"/*.log; do
+    PATHS+=("$f")
+  done
+  for d in "$LOG_DIR/burst" "$LOG_DIR/ramp"; do
+    if [ -d "$d" ]; then
+      for f in "$d"/*; do
+        [ -f "$f" ] && PATHS+=("$f")
+      done
+    fi
+  done
+  shopt -u nullglob
+else
+  for name in "${TARGETS[@]}"; do
+    # First try: it's a service log
+    if [ -f "$LOG_DIR/$name.log" ]; then
+      PATHS+=("$LOG_DIR/$name.log")
+      continue
+    fi
+    # Second try: it's a directory under logs/
+    if [ -d "$LOG_DIR/$name" ]; then
+      found_any=0
+      for f in "$LOG_DIR/$name"/*; do
+        if [ -f "$f" ]; then
+          PATHS+=("$f")
+          found_any=1
+        fi
+      done
+      if [ $found_any -eq 0 ]; then
+        MISSING+=("$LOG_DIR/$name/ (exists but is empty)")
+      fi
+      continue
+    fi
+    # Neither
+    MISSING+=("$name (no logs/$name.log or logs/$name/ directory found)")
+  done
+fi
+
+# ── Plan + warn ────────────────────────────────────────────────
+echo "mode: $MODE"
 if [ ${#PATHS[@]} -eq 0 ]; then
   if [ ${#MISSING[@]} -gt 0 ]; then
     echo "no log files matched; missing:" >&2
     for m in "${MISSING[@]}"; do echo "  $m" >&2; done
   else
-    echo "no logs/*.log files found"
+    echo "no log files found in $LOG_DIR/"
   fi
   exit 0
 fi
 
-# ── Plan + warn ────────────────────────────────────────────────
-echo "mode: $MODE"
 echo "about to $MODE:"
 total_bytes=0
 for f in "${PATHS[@]}"; do
   size=$(wc -c < "$f" 2>/dev/null | tr -d ' ' || echo 0)
   total_bytes=$((total_bytes + size))
-  printf "  %-50s %10d bytes\n" "$f" "$size"
+  printf "  %-70s %10d bytes\n" "$f" "$size"
 done
 echo "total: $total_bytes bytes across ${#PATHS[@]} file(s)"
 
 # Warn if any of the services behind these logs are still running.
-# (Truncation is safe in-flight, but the user may want a clean
-# snapshot — let them ctrl-c and run `make stop` first.)
+# (Both delete and truncate are safe in-flight — services keep their
+# FD on the recreated / truncated file — but the user may want a
+# clean snapshot. Let them ctrl-c and run `make stop` first.)
 warned=0
 shopt -s nullglob
 for pidf in "$LOG_DIR"/*.pid; do
@@ -130,12 +168,12 @@ for pidf in "$LOG_DIR"/*.pid; do
 done
 shopt -u nullglob
 if [ $warned -eq 1 ]; then
-  echo "   (truncation in-flight is safe; pass --delete to remove instead)"
+  echo "   (in-flight delete/truncate is safe; services keep their FD)"
 fi
 
 if [ ${#MISSING[@]} -gt 0 ]; then
   echo ""
-  echo "skipped (not found):"
+  echo "skipped:"
   for m in "${MISSING[@]}"; do echo "  $m"; done
 fi
 
@@ -149,6 +187,10 @@ for f in "${PATHS[@]}"; do
       : > "$f"
       ;;
     delete)
+      # rm -f so non-existent files (race with another process)
+      # don't cause a non-zero exit. The `--` is a safety net: any
+      # path starting with `-` would otherwise be interpreted as a
+      # flag, not a file. (Unlikely in our case but cheap insurance.)
       rm -f -- "$f"
       ;;
   esac
