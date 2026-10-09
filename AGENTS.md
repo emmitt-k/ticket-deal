@@ -30,6 +30,8 @@
 | Cache / Rate-limit | Redis 7 (Lua scripts) |
 | Primary DB | Postgres 16 |
 | Queue | ElasticMQ (SQS-compatible, local) |
+| Metrics | Prometheus 2.55 + Grafana 11.3 |
+| Tracing | OpenTelemetry SDK 1.47 → Jaeger 1.76 (all-in-one) |
 | Load testing | k6 (Go + JavaScript) |
 | Service scripts | Bash + curl |
 | Container runtime | Docker Compose |
@@ -95,6 +97,8 @@ make stop-loadtest         # Kill any running k6 process (burst or ramp)
 
 ### Observability
 
+#### Metrics (Prometheus + Grafana)
+
 ```bash
 # After `make all-services` + `docker compose up -d prometheus grafana`:
 #   Prometheus: http://localhost:9090
@@ -110,6 +114,54 @@ All Go services expose `/metrics` (Prometheus format) on their own ports:
 Prometheus scrapes via `host.docker.internal` — the Go services run on the host, not in Docker.
 
 **Most important metric:** `reservations_oversold_total` — should ALWAYS be 0. Alert if > 0.
+
+#### Tracing (OpenTelemetry + Jaeger)
+
+```bash
+# After `docker compose up -d jaeger` + `make all-services`:
+#   Jaeger UI:  http://localhost:16686
+#   Search by service (api / worker / expiration-watcher) or trace_id
+#   OTLP/gRPC:  localhost:4317 (services export to this)
+#   OTLP/HTTP:  localhost:4318 (alternative)
+```
+
+Every Go service runs `tracing.Init(serviceName)` at startup. This sets up the
+global OTel TracerProvider + W3C TraceContext propagator + OTLP/gRPC exporter
+(default endpoint `http://localhost:4317`).
+
+Auto-instrumentation:
+- `otelhttp.NewHandler(router, "api")` — every HTTP route becomes a span
+- `redisotel.InstrumentTracing(rdb)` — every Redis call (SET, GET, EVALSHA) becomes a span
+- `otelpgx.NewTracer()` on `pgxpool.ConnConfig` — every pgx query becomes a span
+
+Manual spans in the reservation flow:
+- `api.reserve.handle` — parent of all reservation work (event_id, user_id, seats_requested, reservation.id attributes)
+- `api.redis.acquire-hold` — wraps the Lua reserve script
+- `api.sqs.publish` — wraps the SQS SendMessage (messaging.* semconv)
+- `worker.worker.handleMessage` (kind=Consumer) — wraps the SQS handler
+- `expiration-watcher.expire.compensate` — wraps the hold-key expiry compensation (root span, no upstream)
+
+SQS context propagation:
+- Publisher writes `traceparent` into `MessageAttributes` AND into the JSON body as `_traceparent`
+- Consumer tries attributes first, falls back to body
+- The body fallback exists because **ElasticMQ in local dev strips MessageAttributes**; real AWS SQS preserves them
+- Both paths are tested in `internal/queue/trace_test.go`
+
+Sample waterfall (one reservation):
+```
+POST (api)                         [35ms]
+└─ reserve.handle (api)            [35ms]  parent=POST
+   ├─ redis.acquire-hold (api)     [3ms]   parent=reserve.handle
+   │  └─ evalsha (api)             [1ms]   parent=redis.acquire-hold
+   └─ sqs.publish (api)            [22ms]  parent=reserve.handle
+      └─ worker.handleMessage      [1ms]   parent=sqs.publish ← context jumps SQS
+         └─ pool.acquire (worker)  [0ms]   parent=worker.handleMessage
+         └─ INSERT (worker)        [1ms]   parent=worker.handleMessage
+```
+
+Env vars:
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`)
+- `OTEL_TRACES_SAMPLER_ARG` (default `1.0` = trace everything; lower in prod)
 
 ### Code Quality
 
