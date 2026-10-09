@@ -15,7 +15,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,6 +32,7 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
+	"github.com/emmitt-k/ticket-deal/internal/logging"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
@@ -40,9 +41,22 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	// Init logging first so all subsequent slog.* calls in this binary
+	// (including those emitted by tracing.Init on failure) use the
+	// configured handler with OTel trace correlation.
+	logging.Init(logging.Config{
+		Level:   logging.LevelFromEnv(),
+		Format:  logging.FormatFromEnv(),
+		Service: "api",
+		Version: os.Getenv("SERVICE_VERSION"),
+	})
 	if err := run(); err != nil {
-		log.Fatalf("api: %v", err)
+		// run() may return a startup error before any span is active,
+		// so we use the bare Error variant (no context). The
+		// ContextHandler skips trace_id injection when there's no
+		// span in ctx, so this line still serialises cleanly.
+		slog.Error("api startup failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -51,8 +65,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("api: config loaded (addr=%s, jwt_secret=%d bytes, redis=%s)",
-		cfg.Addr, len(cfg.JWTSecret), cfg.Redis.Addr)
+	slog.Info("config loaded",
+		"addr", cfg.Addr,
+		"jwt_secret_bytes", len(cfg.JWTSecret),
+		"redis", cfg.Redis.Addr,
+	)
 
 	// ── OpenTelemetry tracing ─────────────────────────────────────
 	//
@@ -62,7 +79,7 @@ func run() error {
 	// so the last few spans don't get lost on Ctrl+C.
 	tracingShutdown, err := tracing.Init(context.Background(), "api")
 	if err != nil {
-		log.Printf("api: tracing init failed (continuing without traces): %v", err)
+		slog.Warn("tracing init failed (continuing without traces)", "error", err)
 	}
 
 	// ── Redis client (shared by handlers and drainer) ──────────────
@@ -78,7 +95,7 @@ func run() error {
 	// Without this, redis.ReserveSeat would be a black box — you see the
 	// outer HTTP span but not the 3ms Lua call inside.
 	if err := redisotel.InstrumentTracing(rdb); err != nil {
-		log.Printf("api: redisotel instrument tracing failed: %v", err)
+		slog.Warn("redisotel instrument tracing failed", "error", err)
 	}
 
 	// ── Background drainer (promotes queued users as tokens refill) ─
@@ -185,7 +202,7 @@ func run() error {
 	// Pushing it into a goroutine lets the main function keep
 	// going and watch for shutdown signals at the same time.
 	go func() {
-		log.Printf("api: listening on %s", cfg.Addr)
+		slog.Info("listening", "addr", cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
 			// ErrServerClosed is what Shutdown() returns from inside
@@ -206,7 +223,7 @@ func run() error {
 	select {
 	case <-ctx.Done():
 		// User pressed Ctrl+C or `docker stop` was sent.
-		log.Printf("api: shutdown signal received, draining...")
+		slog.Info("shutdown signal received, draining")
 	case err := <-errCh:
 		// Server failed to start (or crashed). Propagate so
 		// main() can return non-zero.
@@ -236,7 +253,7 @@ func run() error {
 		traceCancel()
 	}
 
-	log.Printf("api: clean shutdown complete")
+	slog.Info("clean shutdown complete")
 	return nil
 }
 
@@ -251,7 +268,7 @@ func run() error {
 // without requiring the worker side to be configured.
 func buildPublisher(cfg config.Config) api.ReservationPublisher {
 	if cfg.SQS.QueueURL == "" {
-		log.Printf("api: SQS_QUEUE_URL not set — using LogPublisher (messages will not reach worker)")
+		slog.Warn("SQS_QUEUE_URL not set, using LogPublisher (messages will not reach worker)")
 		return api.LogPublisher{}
 	}
 
@@ -264,11 +281,15 @@ func buildPublisher(cfg config.Config) api.ReservationPublisher {
 		// Fail-fast: if we can't reach SQS at startup, the /reserve
 		// hot path is broken. Better to crash now than to discover
 		// it after the first batch of reservations.
-		log.Fatalf("api: build SQS client: %v", err)
+		slog.Error("build SQS client", "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("api: SQS publisher wired (region=%s, endpoint=%q, queue=%s)",
-		cfg.SQS.Region, cfg.SQS.EndpointURL, cfg.SQS.QueueURL)
+	slog.Info("SQS publisher wired",
+		"region", cfg.SQS.Region,
+		"endpoint", cfg.SQS.EndpointURL,
+		"queue", cfg.SQS.QueueURL,
+	)
 	return queue.NewReservationAPIPublisher(queue.NewSQSPublisher(sqsClient, cfg.SQS.QueueURL))
 }
 

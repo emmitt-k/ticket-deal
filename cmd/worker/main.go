@@ -40,7 +40,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,7 +49,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/exaring/otelpgx"
 	"github.com/joho/godotenv"
 	"go.opentelemetry.io/otel"
@@ -59,6 +58,7 @@ import (
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
+	"github.com/emmitt-k/ticket-deal/internal/logging"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
@@ -70,9 +70,15 @@ const workerTracerName = "github.com/emmitt-k/ticket-deal/cmd/worker"
 var workerTracer = otel.Tracer(workerTracerName)
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	logging.Init(logging.Config{
+		Level:   logging.LevelFromEnv(),
+		Format:  logging.FormatFromEnv(),
+		Service: "worker",
+		Version: os.Getenv("SERVICE_VERSION"),
+	})
 	if err := run(); err != nil {
-		log.Fatalf("worker: %v", err)
+		slog.Error("worker startup failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -81,10 +87,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("worker: starting (queue=%s, db=%s, poll=%ds, visibility=%ds, sweep=%s)",
-		cfg.SQSQueueURL, redactDSN(cfg.DatabaseURL),
-		cfg.WorkerLongPollSeconds, cfg.VisibilityTimeoutSeconds,
-		cfg.SweepInterval)
+	slog.Info("worker starting",
+		"queue", cfg.SQSQueueURL,
+		"db", redactDSN(cfg.DatabaseURL),
+		"poll_seconds", cfg.WorkerLongPollSeconds,
+		"visibility_seconds", cfg.VisibilityTimeoutSeconds,
+		"sweep", cfg.SweepInterval,
+	)
 
 	// ── OpenTelemetry tracing ─────────────────────────────────
 	//
@@ -94,7 +103,7 @@ func run() error {
 	// won't see the spans in the UI.
 	tracingShutdown, err := tracing.Init(context.Background(), "worker")
 	if err != nil {
-		log.Printf("worker: tracing init failed (continuing without traces): %v", err)
+		slog.Warn("tracing init failed (continuing without traces)", "error", err)
 	}
 	defer func() {
 		if tracingShutdown != nil {
@@ -124,7 +133,7 @@ func run() error {
 		return fmt.Errorf("open DB pool: %w", err)
 	}
 	defer pool.Close()
-	log.Printf("worker: DB pool open (max=5, min=1)")
+	slog.Info("DB pool open", "max", 5, "min", 1)
 
 	// ── Redis client (Phase 7: needed by the sweep goroutine) ──
 	rdb := redis.NewClient(redis.Config{Addr: cfg.RedisAddr})
@@ -132,7 +141,7 @@ func run() error {
 	if err := redis.Ping(ctx, rdb); err != nil {
 		return fmt.Errorf("ping Redis: %w", err)
 	}
-	log.Printf("worker: Redis ping OK (addr=%s)", cfg.RedisAddr)
+	slog.Info("Redis ping OK", "addr", cfg.RedisAddr)
 
 	// ── SQS client (pointed at ElasticMQ locally, AWS in prod) ──
 	sqsClient, err := queue.NewSQSClient(ctx, queue.AWSConfig{
@@ -153,7 +162,7 @@ func run() error {
 	go func() {
 		if err := expire.RunSweep(ctx, pool, rdb, "worker", cfg.SweepInterval); err != nil &&
 			!errors.Is(err, context.Canceled) {
-			log.Printf("worker: sweep exited with error: %v", err)
+			slog.Error("sweep exited with error", "error", err)
 		}
 	}()
 
@@ -175,10 +184,10 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Printf("worker: metrics server listening on %s", metricsAddr)
+		slog.Info("metrics server listening", "addr", metricsAddr)
 		if err := metricsSrv.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
-			log.Printf("worker: metrics server error: %v", err)
+			slog.Error("metrics server error", "error", err)
 		}
 	}()
 	defer func() {
@@ -204,7 +213,7 @@ func run() error {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	log.Printf("worker: clean shutdown")
+	slog.Info("clean shutdown")
 	return nil
 }
 
@@ -238,7 +247,7 @@ func handleMessage(ctx context.Context, pool *db.Pool, raw []byte) error {
 		span.SetStatus(codes.Error, "malformed JSON")
 		span.RecordError(err)
 		metrics.WorkerMessagesProcessed.WithLabelValues("malformed").Inc()
-		log.Printf("worker: malformed message (deleting) body=%q: %v", truncate(raw, 256), err)
+		slog.WarnContext(ctx, "malformed message (deleting)", "body", truncate(raw, 256), "error", err)
 		return nil
 	}
 	span.SetAttributes(
@@ -261,8 +270,12 @@ func handleMessage(ctx context.Context, pool *db.Pool, raw []byte) error {
 	metrics.WorkerDBWrites.WithLabelValues("ok").Inc()
 	metrics.WorkerMessagesProcessed.WithLabelValues("ok").Inc()
 
-	log.Printf("worker: inserted reservation_id=%s user=%s event=%d seats=%d",
-		r.ReservationID, r.UserID, r.EventID, r.Seats)
+	slog.InfoContext(ctx, "reservation inserted",
+		"reservation_id", r.ReservationID,
+		"user", r.UserID,
+		"event", r.EventID,
+		"seats", r.Seats,
+	)
 	return nil
 }
 
@@ -364,7 +377,5 @@ func truncate(b []byte, max int) string {
 
 // silence unused-import warnings for symbols kept for future use.
 var (
-	_ = log.Printf
 	_ = time.Now
-	_ = aws.Config{}
 )
