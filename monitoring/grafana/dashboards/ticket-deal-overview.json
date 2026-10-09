@@ -3,7 +3,7 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": "-- Grafana --",
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -12,18 +12,318 @@
       }
     ]
   },
+  "description": "Live control-room view of the Mini-Ticketmaster system. KPI bar at the top, then request flow, reservation engine, and background workers.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
   "links": [],
   "liveNow": true,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["ticket-deal", "control-room"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Ticket Deal — Control Room",
+  "uid": "ticket-deal-overview",
+  "version": 1,
+  "weekStart": "",
   "panels": [
     {
-      "title": "Request Rate (by path)",
+      "id": 1,
+      "title": "● LIVE",
+      "type": "text",
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 0},
+      "options": {
+        "mode": "markdown",
+        "content": "<div style=\"display:flex; align-items:center; gap:32px; font-family:ui-monospace,Menlo,monospace; font-size:14px; color:#9ca3af; letter-spacing:0.05em;\">\n  <span><span style=\"color:#ef4444; font-size:18px;\">●</span> <span style=\"color:#fff; font-weight:600;\">LIVE</span></span>\n  <span>EVENT <span style=\"color:#fff;\">1</span></span>\n  <span>INVENTORY <span style=\"color:#fff;\">100</span></span>\n  <span>REFRESH <span style=\"color:#fff;\">5s</span></span>\n  <span style=\"margin-left:auto; color:#6b7280;\">Mini-Ticketmaster • ${__dashboard.title}</span>\n</div>",
+        "code": {"language": "plaintext", "showLineNumbers": false}
+      }
+    },
+    {
+      "id": 2,
+      "title": "Hold Rate",
+      "subtitle": "seats reserved / sec",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 2},
+      "targets": [
+        {
+          "expr": "sum(rate(reservations_held_total{service=\"api\"}[1m]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#1f2937", "value": null},
+              {"color": "#10b981", "value": 1}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true,
+            "gradientMode": "opacity"
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "id": 3,
+      "title": "Sold Out Rate",
+      "subtitle": "rejected / sec",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 2},
+      "targets": [
+        {
+          "expr": "sum(rate(reservations_sold_out_total{service=\"api\"}[1m]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#1f2937", "value": null},
+              {"color": "#f59e0b", "value": 1}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true,
+            "gradientMode": "opacity"
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "id": 4,
+      "title": "Error Rate",
+      "subtitle": "5xx / sec",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 2},
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[1m]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#1f2937", "value": null},
+              {"color": "#ef4444", "value": 0.01}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true,
+            "gradientMode": "opacity"
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "id": 5,
+      "title": "p99 Latency",
+      "subtitle": "across all paths",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 2},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"api\"}[1m])))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#10b981", "value": null},
+              {"color": "#f59e0b", "value": 0.1},
+              {"color": "#ef4444", "value": 0.5}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true,
+            "gradientMode": "opacity"
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "id": 6,
+      "title": "Seats Left",
+      "subtitle": "of 100 seeded",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 2},
+      "targets": [
+        {
+          "expr": "redis_seats_available{service=\"api\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#ef4444", "value": null},
+              {"color": "#f59e0b", "value": 25},
+              {"color": "#eab308", "value": 50},
+              {"color": "#10b981", "value": 75}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true,
+            "gradientMode": "opacity"
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "id": 7,
+      "title": "In Queue",
+      "subtitle": "waiting room",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 2},
+      "targets": [
+        {
+          "expr": "waiting_room_queue_length{service=\"api\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#10b981", "value": null},
+              {"color": "#eab308", "value": 50},
+              {"color": "#ef4444", "value": 80}
+            ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true,
+            "gradientMode": "opacity"
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "id": 10,
+      "title": "── REQUEST FLOW ──",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "panels": []
+    },
+    {
+      "id": 11,
+      "title": "Request Rate",
+      "subtitle": "requests per second, by path",
       "type": "timeseries",
       "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
       "targets": [
         {
           "expr": "sum by (path) (rate(http_requests_total{service=\"api\"}[10s]))",
@@ -34,38 +334,29 @@
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {"mode": "normal", "group": "A"}
+          },
+          "color": {"mode": "palette-classic"}
         }
       },
       "options": {
-        "legend": {"showLegend": true, "displayMode": "table", "placement": "right"}
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       }
     },
     {
-      "title": "Error Rate (5xx)",
+      "id": 12,
+      "title": "p99 Latency by Path",
+      "subtitle": "tail latency, ms",
       "type": "timeseries",
       "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-      "targets": [
-        {
-          "expr": "sum(rate(http_requests_total{status=~\"Internal Server Error|.*5..\"}[10s]))",
-          "legendFormat": "5xx errors",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "color": {"mode": "fixed", "fixedColor": "red"},
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20}
-        }
-      }
-    },
-    {
-      "title": "p99 Latency (by path)",
-      "type": "timeseries",
-      "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
       "targets": [
         {
           "expr": "histogram_quantile(0.99, sum by (path, le) (rate(http_request_duration_seconds_bucket{service=\"api\"}[10s])))",
@@ -76,15 +367,44 @@
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#10b981", "value": null},
+              {"color": "#f59e0b", "value": 0.1},
+              {"color": "#ef4444", "value": 0.5}
+            ]
+          }
         }
+      },
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       }
     },
     {
-      "title": "Reservation Outcomes (per second)",
+      "id": 20,
+      "title": "── RESERVATION ENGINE ──",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 15},
+      "panels": []
+    },
+    {
+      "id": 21,
+      "title": "Reservation Outcomes",
+      "subtitle": "held vs completed vs sold_out vs ⚠ oversold",
       "type": "timeseries",
       "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
       "targets": [
         {
           "expr": "rate(reservations_held_total{service=\"api\"}[10s])",
@@ -93,7 +413,7 @@
         },
         {
           "expr": "rate(reservations_completed_total{service=\"api\"}[10s])",
-          "legendFormat": "completed (published)",
+          "legendFormat": "completed",
           "refId": "B"
         },
         {
@@ -103,125 +423,204 @@
         },
         {
           "expr": "rate(reservations_oversold_total{service=\"api\"}[10s])",
-          "legendFormat": "⚠ OVERSOLD",
+          "legendFormat": "⚠ oversold",
           "refId": "D"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "stacking": {"mode": "normal"}}
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {"mode": "normal"}
+          }
         },
         "overrides": [
           {
-            "matcher": {"id": "byName", "options": "⚠ OVERSOLD"},
-            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]
+            "matcher": {"id": "byName", "options": "held"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#10b981"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "completed"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#3b82f6"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "sold_out"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#f59e0b"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "⚠ oversold"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#ef4444"}}, {"id": "custom.lineWidth", "value": 3}]
           }
         ]
+      },
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       }
     },
     {
-      "title": "Worker Throughput (per second)",
-      "type": "timeseries",
-      "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
-      "targets": [
-        {
-          "expr": "sum by (status) (rate(worker_messages_processed_total[10s]))",
-          "legendFormat": "messages {{status}}",
-          "refId": "A"
-        },
-        {
-          "expr": "sum by (status) (rate(worker_db_writes_total[10s]))",
-          "legendFormat": "db writes {{status}}",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20}
-        }
-      }
-    },
-    {
-      "title": "Worker DB Write Latency (p50, p99)",
+      "id": 22,
+      "title": "Worker Throughput + DB Latency",
+      "subtitle": "messages/sec + p50/p99 write latency",
       "type": "timeseries",
       "datasource": "Prometheus",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(worker_db_write_duration_seconds_bucket[10s]))",
-          "legendFormat": "p50",
+          "expr": "sum by (status) (rate(worker_messages_processed_total[10s]))",
+          "legendFormat": "msg {{status}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(worker_db_write_duration_seconds_bucket[10s]))",
-          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.50, rate(worker_db_write_duration_seconds_bucket[10s]))",
+          "legendFormat": "p50 write",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(worker_db_write_duration_seconds_bucket[10s]))",
+          "legendFormat": "p99 write",
+          "refId": "C"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
-        }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byRegexp", "options": "p50 write|p99 write"},
+            "properties": [
+              {"id": "unit", "value": "s"},
+              {"id": "custom.axisPlacement", "value": "right"},
+              {"id": "custom.fillOpacity", "value": 0}
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "msg ok"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#10b981"}}, {"id": "unit", "value": "reqps"}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "msg error"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#ef4444"}}, {"id": "unit", "value": "reqps"}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "p50 write"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#06b6d4"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "p99 write"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#a855f7"}}]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       }
     },
     {
-      "title": "Expiration Activity (per second)",
+      "id": 30,
+      "title": "── BACKGROUND ──",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 24},
+      "panels": []
+    },
+    {
+      "id": 31,
+      "title": "Expiration Activity",
+      "subtitle": "sweep cycles + seats expired (worker + watcher)",
       "type": "timeseries",
       "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 25},
       "targets": [
         {
           "expr": "sum by (service) (rate(expiration_sweep_cycles_total[10s]))",
-          "legendFormat": "sweep cycles ({{service}})",
+          "legendFormat": "sweep ({{service}})",
           "refId": "A"
         },
         {
           "expr": "sum by (service) (rate(expiration_seats_expired_total[10s]))",
-          "legendFormat": "seats expired ({{service}})",
+          "legendFormat": "expired ({{service}})",
           "refId": "B"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
-        }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byRegexp", "options": ".*\\(worker\\)"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#06b6d4"}}]
+          },
+          {
+            "matcher": {"id": "byRegexp", "options": ".*\\(expiration-watcher\\)"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#a855f7"}}]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       }
     },
     {
-      "title": "Seats Available",
-      "type": "timeseries",
+      "id": 32,
+      "title": "Service Health",
+      "subtitle": "Prometheus scrape health per service",
+      "type": "stat",
       "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 25},
       "targets": [
         {
-          "expr": "redis_seats_available{service=\"api\"}",
-          "legendFormat": "seats",
+          "expr": "up{job=~\"api|worker|expiration-watcher\"}",
+          "legendFormat": "{{job}}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "min": 0,
-          "max": 100,
+          "unit": "none",
+          "decimals": 0,
           "color": {"mode": "thresholds"},
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "red", "value": null},
-              {"color": "orange", "value": 25},
-              {"color": "yellow", "value": 50},
-              {"color": "green", "value": 75}
+              {"color": "#ef4444", "value": null},
+              {"color": "#10b981", "value": 1}
             ]
           },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {"text": "DOWN", "color": "#ef4444"},
+                "1": {"text": "UP", "color": "#10b981"}
+              }
+            }
+          ],
           "custom": {
             "drawStyle": "line",
-            "lineWidth": 3,
+            "lineWidth": 2,
             "fillOpacity": 30,
             "showPoints": "never",
             "spanNulls": true
@@ -229,60 +628,13 @@
         }
       },
       "options": {
-        "legend": {"showLegend": false},
-        "tooltip": {"mode": "single"}
-      }
-    },
-    {
-      "title": "Waiting Room Queue (capacity 100)",
-      "type": "timeseries",
-      "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
-      "targets": [
-        {
-          "expr": "waiting_room_queue_length{service=\"api\"}",
-          "legendFormat": "queued",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0,
-          "max": 100,
-          "color": {"mode": "thresholds"},
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 50},
-              {"color": "red", "value": 80}
-            ]
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 3,
-            "fillOpacity": 30,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        }
-      },
-      "options": {
-        "legend": {"showLegend": false},
-        "tooltip": {"mode": "single"}
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value_and_name",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "orientation": "auto"
       }
     }
-  ],
-  "refresh": "5s",
-  "schemaVersion": 39,
-  "tags": ["ticket-deal"],
-  "templating": {"list": []},
-  "time": {"from": "now-5m", "to": "now"},
-  "timepicker": {},
-  "timezone": "",
-  "title": "Ticket Deal — Overview",
-  "uid": "ticket-deal-overview",
-  "version": 1,
-  "weekStart": ""
+  ]
 }
