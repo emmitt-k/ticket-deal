@@ -1,5 +1,7 @@
 # Mini-Ticketmaster: A High-Concurrency Ticket Booking System
 
+[![CI](https://github.com/emmitt-k/ticket-deal/actions/workflows/ci.yml/badge.svg)](https://github.com/emmitt-k/ticket-deal/actions/workflows/ci.yml)
+
 > An end-to-end showcase of how real-world ticketing platforms (Ticketmaster, AXS, See Tickets) survive the "1,000 users clicking **Buy** at the exact same millisecond" problem — built to learn, not to ship.
 
 ---
