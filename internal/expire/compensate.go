@@ -22,10 +22,19 @@ import (
 	"fmt"
 	"log"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
+
+const tracerName = "github.com/emmitt-k/ticket-deal/internal/expire"
+
+var tracer = otel.Tracer(tracerName)
 
 // Compensate handles a hold-key expiration: transitions the matching
 // PENDING_PAYMENT row to EXPIRED and INCRBYs the inventory counter so
@@ -52,19 +61,37 @@ import (
 func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
 	eventID int64, userID string,
 ) error {
+	// Manual span around the watcher-driven compensation path. This
+	// is a ROOT span (no upstream trace context) because the trigger
+	// is a Redis keyspace notification, not an HTTP or SQS request —
+	// there's nothing upstream to attach to. The auto-spans for the
+	// pg.UPDATE and redis.INCRBY show up inside this one.
+	ctx, span := tracer.Start(ctx, "expire.compensate",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.Int64("expire.event_id", eventID),
+			attribute.Int64("expire.user_id_hash", hashUserID(userID)),
+		),
+	)
+	defer span.End()
+
 	seats, err := expireRowIfPending(ctx, pool, userID, eventID)
 	// Each call to Compensate is a "cycle" in event-driven terms —
 	// one Redis keyspace notification triggered one DB+INCRBY pair.
 	metrics.ExpirationSweepCycles.WithLabelValues("watcher").Inc()
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "expire row failed")
 		return fmt.Errorf("expire: transition row: %w", err)
 	}
 	if seats == 0 {
 		// Either no row matched (orphan hold key) or the row was
 		// already non-PENDING (sweep got there first, or it was
 		// confirmed/cancelled before expiry). Either way, no work.
+		span.SetAttributes(attribute.Int("expire.seats_released", 0))
 		return nil
 	}
+	span.SetAttributes(attribute.Int("expire.seats_released", seats))
 
 	if err := rdb.IncrBy(ctx, redis.InventoryKey(eventID), int64(seats)).Err(); err != nil {
 		// Dangerous race: DB row is EXPIRED but inventory wasn't
@@ -75,6 +102,8 @@ func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
 		// but the CAS UPDATE returns 0 rows on retry so we'd just
 		// log the same error repeatedly. Log loud and let ops
 		// alerting handle it.
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "INCRBY inventory failed")
 		log.Printf("expire: WARN marked DB EXPIRED but INCRBY failed event=%d user=%s seats=%d err=%v",
 			eventID, userID, seats, err)
 		return nil
@@ -85,6 +114,21 @@ func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
 
 	log.Printf("expire: compensated event=%d user=%s seats=%d", eventID, userID, seats)
 	return nil
+}
+
+// hashUserID is duplicated from internal/api/reserve_handler.go to
+// avoid a circular import (internal/api already imports internal/redis,
+// and adding internal/api to internal/expire would be wrong). Same
+// algorithm: tiny, deterministic, PII-safe.
+func hashUserID(s string) int64 {
+	var h int64
+	for _, b := range []byte(s) {
+		h = h*31 + int64(b)
+	}
+	if h < 0 {
+		h = -h
+	}
+	return h
 }
 
 // expireRowIfPending transitions the matching PENDING_PAYMENT row to

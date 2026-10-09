@@ -50,14 +50,24 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/exaring/otelpgx"
 	"github.com/joho/godotenv"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
+	"github.com/emmitt-k/ticket-deal/internal/tracing"
 )
+
+const workerTracerName = "github.com/emmitt-k/ticket-deal/cmd/worker"
+
+var workerTracer = otel.Tracer(workerTracerName)
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -76,15 +86,39 @@ func run() error {
 		cfg.WorkerLongPollSeconds, cfg.VisibilityTimeoutSeconds,
 		cfg.SweepInterval)
 
+	// ── OpenTelemetry tracing ─────────────────────────────────
+	//
+	// Same pattern as the API: init the global TracerProvider, then
+	// defer the flush. If this fails (e.g. Jaeger isn't up), log and
+	// keep going — the worker can still process SQS messages, we just
+	// won't see the spans in the UI.
+	tracingShutdown, err := tracing.Init(context.Background(), "worker")
+	if err != nil {
+		log.Printf("worker: tracing init failed (continuing without traces): %v", err)
+	}
+	defer func() {
+		if tracingShutdown != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = tracingShutdown(ctx)
+			cancel()
+		}
+	}()
+
 	// ── DB pool (fail fast if Postgres unreachable) ────────────
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// otelpgx.Tracer adds a span for every pgx query (auto-instrumentation).
+	// Using the default tracer (no args) means it picks up our
+	// global TracerProvider from tracing.Init above, so spans
+	// show up in Jaeger automatically. Each INSERT ... ON CONFLICT
+	// becomes a child span of the worker's handler span.
 	pool, err := db.NewPool(ctx, db.Config{
-		DSN:     cfg.DatabaseURL,
+		DSN:      cfg.DatabaseURL,
 		MaxConns: 5,
 		MinConns: 1,
+		Tracer:   otelpgx.NewTracer(),
 	})
 	if err != nil {
 		return fmt.Errorf("open DB pool: %w", err)
@@ -182,20 +216,43 @@ func run() error {
 // complex business logic (status transitions, retries, etc.) belongs
 // in a dedicated method on a service type — not here.
 func handleMessage(ctx context.Context, pool *db.Pool, raw []byte) error {
+	// Manual span around the whole handler. The ctx arriving here
+	// already carries the API's trace_id (the consumer extracted it
+	// from the SQS message attributes), so this span is a child of
+	// the API's reserve.handle — not a new root. That's what makes
+	// the end-to-end waterfall possible.
+	ctx, span := workerTracer.Start(ctx, "worker.handleMessage",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "aws.sqs"),
+			attribute.Int("messaging.message.body.size", len(raw)),
+		),
+	)
+	defer span.End()
+
 	var r queue.Reservation
 	if err := json.Unmarshal(raw, &r); err != nil {
 		// Bad JSON can't be fixed by retrying. Log loud and bail
 		// (returning nil so the message gets deleted — otherwise we
 		// loop forever on the same broken message).
+		span.SetStatus(codes.Error, "malformed JSON")
+		span.RecordError(err)
 		metrics.WorkerMessagesProcessed.WithLabelValues("malformed").Inc()
 		log.Printf("worker: malformed message (deleting) body=%q: %v", truncate(raw, 256), err)
 		return nil
 	}
+	span.SetAttributes(
+		attribute.String("reservation.id", r.ReservationID),
+		attribute.Int64("reservation.event_id", int64(r.EventID)),
+		attribute.Int("reservation.seats", r.Seats),
+	)
 
 	dbStart := time.Now()
 	if err := db.InsertIfAbsent(ctx, pool, r); err != nil {
 		// Transient DB errors (connection lost, deadlock, etc.) are
 		// retried via SQS redelivery. We just log and return the error.
+		span.SetStatus(codes.Error, "insert failed")
+		span.RecordError(err)
 		metrics.WorkerMessagesProcessed.WithLabelValues("error").Inc()
 		metrics.WorkerDBWrites.WithLabelValues("error").Inc()
 		return fmt.Errorf("insert reservation %s: %w", r.ReservationID, err)
