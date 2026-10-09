@@ -87,22 +87,22 @@
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
       "targets": [
         {
-          "expr": "rate(reservations_held_total[10s])",
+          "expr": "rate(reservations_held_total{service=\"api\"}[10s])",
           "legendFormat": "held",
           "refId": "A"
         },
         {
-          "expr": "rate(reservations_completed_total[10s])",
+          "expr": "rate(reservations_completed_total{service=\"api\"}[10s])",
           "legendFormat": "completed (published)",
           "refId": "B"
         },
         {
-          "expr": "rate(reservations_sold_out_total[10s])",
+          "expr": "rate(reservations_sold_out_total{service=\"api\"}[10s])",
           "legendFormat": "sold_out",
           "refId": "C"
         },
         {
-          "expr": "rate(reservations_oversold_total[10s])",
+          "expr": "rate(reservations_oversold_total{service=\"api\"}[10s])",
           "legendFormat": "⚠ OVERSOLD",
           "refId": "D"
         }
