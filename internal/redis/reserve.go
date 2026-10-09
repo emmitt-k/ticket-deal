@@ -51,6 +51,21 @@ func InventoryKey(eventID int64) string {
 	return fmt.Sprintf("inventory:event:%d", eventID)
 }
 
+// AvailableSeats returns the current available-seat count for an event
+// by reading the inventory key. Returns 0 if the key is missing (no
+// inventory seeded yet). Used by the metrics state updater — the hot
+// path uses the Lua reserve script which is atomic.
+func AvailableSeats(ctx context.Context, c *redisclient.Client, eventID int64) (int, error) {
+	v, err := c.Get(ctx, InventoryKey(eventID)).Int()
+	if err == redisclient.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("redis: get inventory failed: %w", err)
+	}
+	return v, nil
+}
+
 // HoldKey is the canonical Redis key for a per-user hold lock.
 //
 //   "hold:event:42:user:u1"

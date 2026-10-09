@@ -20,7 +20,9 @@
 package metrics
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -154,4 +156,72 @@ var (
 // Mount it at /metrics in your service's router.
 func Handler() http.Handler {
 	return promhttp.Handler()
+}
+
+// SeatsAvailableGetter and QueueSizeGetter are minimal interfaces so
+// the metrics package doesn't depend on the redis package (which would
+// be a circular import for the api service). The api service wires
+// these up to the concrete Redis-backed implementations.
+type (
+	SeatsAvailableGetter interface {
+		GetAvailableSeats(ctx context.Context, eventID int64) (int, error)
+	}
+	QueueSizeGetter interface {
+		GetQueueSize(ctx context.Context, eventID int64) (int, error)
+	}
+)
+
+// StartStateUpdater runs in a goroutine and refreshes the state gauges
+// (redis_seats_available, waiting_room_queue_length) every interval
+// until ctx is cancelled. Errors are logged but don't stop the loop —
+// a transient Redis blip shouldn't kill the metrics.
+//
+// Typical call from cmd/api/main.go:
+//
+//	seatsGetter := &redisAdapter{rdb: rdb}
+//	queueGetter := &redisAdapter{rdb: rdb}
+//	metrics.StartStateUpdater(ctx, seatsGetter, queueGetter, eventID, 5*time.Second)
+func StartStateUpdater(
+	ctx context.Context,
+	seats SeatsAvailableGetter,
+	queue QueueSizeGetter,
+	eventID int64,
+	interval time.Duration,
+) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		// Run once immediately so the first scrape has data.
+		updateOnce(ctx, seats, queue, eventID)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				updateOnce(ctx, seats, queue, eventID)
+			}
+		}
+	}()
+}
+
+func updateOnce(
+	ctx context.Context,
+	seats SeatsAvailableGetter,
+	queue QueueSizeGetter,
+	eventID int64,
+) {
+	// Use a short timeout per scrape so a slow Redis doesn't pile up
+	// goroutines if the ticker fires faster than Redis responds.
+	scrapeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if n, err := seats.GetAvailableSeats(scrapeCtx, eventID); err == nil {
+		RedisSeatsAvailable.Set(float64(n))
+	}
+
+	if n, err := queue.GetQueueSize(scrapeCtx, eventID); err == nil {
+		WaitingRoomQueueLength.Set(float64(n))
+	}
 }

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -76,6 +77,25 @@ func run() error {
 	drainerCtx, drainerCancel := context.WithCancel(context.Background())
 	defer drainerCancel()
 	waitingroom.StartDrainer(drainerCtx, drainerCfg)
+
+	// ── Metrics state updater ────────────────────────────────────
+	//
+	// Refreshes the redis_seats_available and waiting_room_queue_length
+	// gauges every 5s by polling Redis. The hot path uses the Lua
+	// script (atomic), but those gauges need someone to actually
+	// read Redis to populate them — Prometheus can only expose what
+	// is Set() in code.
+	//
+	// Event ID is configurable via METRICS_EVENT_ID so the dashboard
+	// can be pointed at a different event without rebuilding.
+	metricsEventID := parseInt64Or(os.Getenv("METRICS_EVENT_ID"), 1)
+	metrics.StartStateUpdater(
+		drainerCtx,
+		&redisSeatsAdapter{rdb: rdb},
+		&redisQueueAdapter{rdb: rdb},
+		metricsEventID,
+		5*time.Second,
+	)
 
 	// ── HTTP router ────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -255,4 +275,40 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// ── Metrics state adapters ─────────────────────────────────────────
+//
+// These wrap the redis.Client to satisfy the
+// metrics.SeatsAvailableGetter / metrics.QueueSizeGetter interfaces
+// without putting a hard dependency on internal/redis in the metrics
+// package (which would be circular for the api binary).
+
+type redisSeatsAdapter struct {
+	rdb *redis.Client
+}
+
+func (a *redisSeatsAdapter) GetAvailableSeats(ctx context.Context, eventID int64) (int, error) {
+	return redis.AvailableSeats(ctx, a.rdb, eventID)
+}
+
+type redisQueueAdapter struct {
+	rdb *redis.Client
+}
+
+func (a *redisQueueAdapter) GetQueueSize(ctx context.Context, eventID int64) (int, error) {
+	return redis.QueueSize(ctx, a.rdb, eventID)
+}
+
+// parseInt64Or parses a string as int64, falling back to def on
+// missing or unparseable input. Used for env-var config.
+func parseInt64Or(s string, def int64) int64 {
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return def
+	}
+	return v
 }
