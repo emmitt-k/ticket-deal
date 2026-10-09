@@ -5,8 +5,8 @@
 > every log line carries its `trace_id` and `span_id`. Bridges the missing
 > third pillar so that metrics, traces, and logs all share the same identity.
 
-> **Status:** 🚧 Plan only. Implementation will land on a new
-> `feature/logging` branch (off `feature/tracing`).
+> **Status:** ✅ Implemented on `feature/logging`. 5 atomic commits pushed;
+> 19 tests pass without docker.
 
 ---
 
