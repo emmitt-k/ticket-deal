@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"go.opentelemetry.io/otel"
 )
 
 // Publisher is the worker-facing interface for sending messages to SQS.
@@ -55,15 +56,55 @@ func (p *SQSPublisher) SendReservation(ctx context.Context, r Reservation) error
 		return fmt.Errorf("queue: marshal reservation: %w", err)
 	}
 
-	_, err = p.client.SendMessage(ctx, &sqs.SendMessageInput{
+	// Embed the trace context into the message body as `_traceparent`.
+	// This is a belt-and-suspenders fallback: some SQS-compatible
+	// brokers (notably ElasticMQ in dev) don't always preserve
+	// MessageAttributes through the SendMessage→ReceiveMessage
+	// roundtrip. Real AWS SQS does, so this fallback is harmless
+	// in production. The extract path tries attributes first, then
+	// falls back to this field.
+	if traceparent := traceparentFromCtx(ctx); traceparent != "" {
+		// Cheap JSON re-shape: replace the trailing "}" with the new
+		// field + "}". Avoids an unmarshal+marshal round-trip.
+		bodyStr := string(body)
+		bodyStr = bodyStr[:len(bodyStr)-1] + `,"_traceparent":"` + traceparent + `"}`
+		body = []byte(bodyStr)
+	}
+
+	input := &sqs.SendMessageInput{
 		QueueUrl:    aws.String(p.queueURL),
 		MessageBody: aws.String(string(body)),
-	})
+	}
+	// Inject the current trace context into the SQS message attributes
+	// so the worker's span (when it picks this up) becomes a child
+	// of the API's reservation span — not a disconnected root.
+	InjectTraceContext(ctx, input)
+
+	_, err = p.client.SendMessage(ctx, input)
 	if err != nil {
 		return fmt.Errorf("queue: SQS SendMessage: %w", err)
 	}
 	return nil
 }
+
+// traceparentFromCtx returns the W3C traceparent string for the
+// current ctx, or "" if no valid span context is set. Uses a tiny
+// TextMapCarrier so we can read back the value the propagator wrote.
+func traceparentFromCtx(ctx context.Context) string {
+	carrier := injectOnlyCarrier{attrs: map[string]string{}}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	return carrier.attrs["traceparent"]
+}
+
+// injectOnlyCarrier is a TextMapCarrier that only implements Inject.
+// Used to read back the traceparent string from the propagator.
+type injectOnlyCarrier struct {
+	attrs map[string]string
+}
+
+func (c injectOnlyCarrier) Get(key string) string         { return c.attrs[key] }
+func (c injectOnlyCarrier) Set(key, value string)         { c.attrs[key] = value }
+func (c injectOnlyCarrier) Keys() []string                { return nil }
 
 // ReservationAPIPublisher adapts an SQSPublisher to the smaller
 // api.ReservationPublisher interface (which takes a raw []byte).

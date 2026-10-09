@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -35,6 +36,12 @@ type Config struct {
 	// HealthCheckPeriod is how often the pool pings idle conns.
 	// Default 1 min.
 	HealthCheckPeriod time.Duration
+	// Tracer installs the otelpgx tracer on the pgxpool. If nil, a
+	// tracer using the global OTel TracerProvider is installed (which
+	// is a no-op if InitTracing was never called). Pass your own
+	// `*otelpgx.Tracer` if you want to customize span attributes
+	// (e.g. omit query text for PII reasons).
+	Tracer *otelpgx.Tracer
 }
 
 // NewPool builds a pgxpool.Config, applies defaults, and opens a pool.
@@ -62,6 +69,16 @@ func NewPool(ctx context.Context, cfg Config) (*Pool, error) {
 	} else {
 		pgxCfg.HealthCheckPeriod = time.Minute
 	}
+
+	// Install pgx tracer so every query gets a span. The default
+	// tracer (when cfg.Tracer is nil) uses otel.GetTracerProvider(),
+	// which returns a no-op until the OTel SDK is Init()'d. That makes
+	// the pool safe to use in tests that don't bring up a collector.
+	tracer := cfg.Tracer
+	if tracer == nil {
+		tracer = otelpgx.NewTracer()
+	}
+	pgxCfg.ConnConfig.Tracer = tracer
 
 	pool, err := pgxpool.NewWithConfig(ctx, pgxCfg)
 	if err != nil {

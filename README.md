@@ -87,6 +87,7 @@ The three phases, in one line each:
 | Load testing   | **k6**                                                                                              | Scriptable VUs, threshold-based assertions, great reporting                                                                |
 | DB explorer    | **pgcli**                                                                                           | `psql` with autocomplete + syntax highlighting + pretty tables                                                            |
 | Metrics        | **Prometheus** + **Grafana**                                                                        | `/metrics` on every service, scraped by Prometheus, visualized in a 9-panel "Ticket Deal — Overview" dashboard             |
+| Tracing        | **OpenTelemetry** → **Jaeger**                                                                      | OTLP/gRPC export, end-to-end waterfall from `api → Redis → SQS → worker → Postgres` with rich attributes                |
 | Containers     | **Docker Compose**                                                                                  | Whole stack with one command                                                                                              |
 
 > Why these choices (and which we explicitly rejected) → [`/docs/architecture.md`](docs/architecture.md)
@@ -249,7 +250,9 @@ Tune the load: `make loadtest-burst VUS=500`, `make loadtest-ramp VUS=2000`. Tar
 
 ---
 
-## Observability (Prometheus + Grafana)
+## Observability
+
+### Metrics (Prometheus + Grafana)
 
 Live metrics for every service, scrape-and-dashboard ready:
 
@@ -270,6 +273,36 @@ The dashboard shows request rate, p99 latency, reservation outcomes (held vs sol
 
 For the full metrics inventory and how to add a new one → [`/docs/observability-plan.md`](docs/observability-plan.md).
 
+### Tracing (OpenTelemetry + Jaeger)
+
+End-to-end distributed traces, OTLP/gRPC → Jaeger:
+
+```bash
+docker compose up -d jaeger
+make all-services
+
+# Open Jaeger UI
+#   http://localhost:16686
+#   - Pick service: api / worker / expiration-watcher
+#   - Click a trace to see the waterfall
+```
+
+A single reservation's trace covers the whole pipeline (auto + manual spans):
+
+```
+POST  (otelhttp)                      [35ms]
+└─ reserve.handle (manual)            [35ms]
+   ├─ redis.acquire-hold (manual)     [ 3ms]
+   │  └─ evalsha (redisotel)          [ 1ms]
+   └─ sqs.publish (manual)            [22ms]      ← context jumps via SQS
+      └─ worker.handleMessage (worker) [ 1ms]
+         └─ pool.acquire (otelpgx)    [ 0ms]
+         └─ INSERT (otelpgx)          [ 1ms]
+```
+
+For the propagator details, manual span inventory, and SQS body-fallback
+rationale → [`/docs/tracing-plan.md`](docs/tracing-plan.md).
+
 ---
 
 ## Project Roadmap
@@ -279,7 +312,7 @@ Done items are crossed off; remaining items are aspirational roadmap (not phase 
 - [x] **Idempotent worker writes** — `INSERT ... ON CONFLICT DO NOTHING` *(schema ready since Phase 1; writer logic lands in Phase 5)*
 - [ ] **Redis Cluster** — shard seats across nodes for >100k concurrent users
 - [x] **Observability** — Prometheus + Grafana (request rate, latency, reservation outcomes, worker throughput, expiration activity; `reservations_oversold_total` is the headline alert)
-- [ ] **Distributed tracing** — OpenTelemetry across API → SQS → worker
+- [x] **Distributed tracing** — OpenTelemetry → Jaeger, end-to-end waterfall across API → SQS → worker (with body-fallback for ElasticMQ in dev)
 - [ ] **Payment gateway** — Stripe webhook handler that confirms reservations and releases the hold
 - [ ] **Seat-level granularity** — Redis Hash per event instead of a single counter
 - [ ] **Anti-bot** *(intentionally skipped in lite-auth; revisit if slash-traction emerges)* — CAPTCHA + device fingerprinting before JWT issuance

@@ -116,7 +116,12 @@ func Poll(ctx context.Context, cfg ConsumerConfig, handler MessageHandler) error
 			body := aws.ToString(msg.Body)
 			receipt := aws.ToString(msg.ReceiptHandle)
 
-			herr := handler.HandleMessage(ctx, []byte(body))
+			// Extract the trace context the publisher injected into the
+			// message attributes. From here on, any span the handler
+			// creates will be a child of the original API span.
+			msgCtx := ExtractTraceContext(ctx, msg)
+
+			herr := handler.HandleMessage(msgCtx, []byte(body))
 			if herr != nil {
 				// Don't delete. SQS will redeliver after visibility
 				// timeout. Log so an operator can see which message

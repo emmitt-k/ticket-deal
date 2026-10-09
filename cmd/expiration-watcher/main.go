@@ -32,12 +32,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/extra/redisotel/v9"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
+	"github.com/emmitt-k/ticket-deal/internal/tracing"
 )
 
 func main() {
@@ -59,11 +62,25 @@ func run() error {
 	log.Printf("expiration-watcher: starting (redis=%s, db=%s)",
 		cfg.RedisAddr, redactDSN(cfg.DatabaseURL))
 
+	// ── OpenTelemetry tracing ─────────────────────────────────
+	tracingShutdown, err := tracing.Init(context.Background(), "expiration-watcher")
+	if err != nil {
+		log.Printf("expiration-watcher: tracing init failed (continuing without traces): %v", err)
+	}
+	defer func() {
+		if tracingShutdown != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = tracingShutdown(ctx)
+			cancel()
+		}
+	}()
+
 	// ── DB pool (fail fast if Postgres unreachable) ────────────
 	pool, err := db.NewPool(ctx, db.Config{
 		DSN:      cfg.DatabaseURL,
 		MaxConns: 3,
 		MinConns: 1,
+		Tracer:   otelpgx.NewTracer(),
 	})
 	if err != nil {
 		return fmt.Errorf("open DB pool: %w", err)
@@ -76,6 +93,9 @@ func run() error {
 	defer rdb.Close()
 	if err := redis.Ping(ctx, rdb); err != nil {
 		return fmt.Errorf("ping Redis: %w", err)
+	}
+	if err := redisotel.InstrumentTracing(rdb); err != nil {
+		log.Printf("expiration-watcher: redisotel instrument tracing failed: %v", err)
 	}
 	log.Printf("expiration-watcher: Redis ping OK")
 

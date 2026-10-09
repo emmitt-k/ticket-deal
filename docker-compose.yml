@@ -118,9 +118,38 @@ services:
       - prometheus
     restart: unless-stopped
 
+  # ─── Distributed tracing storage & UI ───────────────────────
+  #
+  # Jaeger all-in-one image: accepts OTLP/gRPC on :4317 and OTLP/HTTP
+  # on :4318, stores spans in-memory (or in a BadgerDB volume), and
+  # serves the query UI on :16686. The Go services export spans via
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317.
+  #
+  # All-in-one is fine for local dev; production would split collector
+  # and storage (e.g. Jaeger collector + Elasticsearch / Kafka).
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: ticket-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC (what OTel SDKs export to by default)
+      - "4318:4318"     # OTLP HTTP (alternative)
+      - "14268:14268"   # Jaeger native agent (legacy, unused)
+    environment:
+      # Use BadgerDB so spans survive container restarts (default = in-memory).
+      SPAN_STORAGE_TYPE: badger
+      # Retention: 2 days is plenty for dev. 168h = 7d for prod.
+      BADGER_TTL: 48h
+      # Sane sampling cap so a 1000-VU burst doesn't OOM the box.
+      QUERY_MAX_LOOKBACK: 48h
+    volumes:
+      - jaeger-data:/badger
+    restart: unless-stopped
+
 # Named volumes so data survives `docker compose down`
 volumes:
   redis-data:
   postgres-data:
   prometheus-data:
   grafana-data:
+  jaeger-data:
