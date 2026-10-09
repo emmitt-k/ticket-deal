@@ -25,6 +25,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/redis/go-redis/extra/redisotel/v9"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/emmitt-k/ticket-deal/internal/api"
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
@@ -33,6 +35,7 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
+	"github.com/emmitt-k/ticket-deal/internal/tracing"
 	"github.com/emmitt-k/ticket-deal/internal/waitingroom"
 )
 
@@ -51,6 +54,17 @@ func run() error {
 	log.Printf("api: config loaded (addr=%s, jwt_secret=%d bytes, redis=%s)",
 		cfg.Addr, len(cfg.JWTSecret), cfg.Redis.Addr)
 
+	// ── OpenTelemetry tracing ─────────────────────────────────────
+	//
+	// Init must happen BEFORE the HTTP server starts so that
+	// otelhttp.Middleware below can intercept the very first request.
+	// The shutdown func is registered with the SIGINT/SIGTERM handler
+	// so the last few spans don't get lost on Ctrl+C.
+	tracingShutdown, err := tracing.Init(context.Background(), "api")
+	if err != nil {
+		log.Printf("api: tracing init failed (continuing without traces): %v", err)
+	}
+
 	// ── Redis client (shared by handlers and drainer) ──────────────
 	rdb := redis.NewClient(redis.Config{
 		Addr: cfg.Redis.Addr,
@@ -59,6 +73,12 @@ func run() error {
 	defer rdb.Close()
 	if err := redis.Ping(context.Background(), rdb); err != nil {
 		return err // fail fast if Redis is unreachable
+	}
+	// Auto-instrument every Redis call with a span (SET/GET/EVALSHA/etc.).
+	// Without this, redis.ReserveSeat would be a black box — you see the
+	// outer HTTP span but not the 3ms Lua call inside.
+	if err := redisotel.InstrumentTracing(rdb); err != nil {
+		log.Printf("api: redisotel instrument tracing failed: %v", err)
 	}
 
 	// ── Background drainer (promotes queued users as tokens refill) ─
@@ -127,9 +147,13 @@ func run() error {
 	})
 
 	// ── HTTP server ────────────────────────────────────────────────
+	// otelhttp.NewHandler wraps the router so every incoming request
+	// becomes a span named "HTTP <method> <path>". If the upstream
+	// caller sent a `traceparent` header, this span becomes a child of
+	// the upstream trace; otherwise it's a root span.
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           r,
+		Handler:           otelhttp.NewHandler(r, "api"),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -202,6 +226,16 @@ func run() error {
 	if err := srv.Shutdown(shutCtx); err != nil {
 		return err
 	}
+
+	// Flush any buffered spans before the process exits. Without this
+	// the last 1-2 seconds of spans are silently dropped (the batch
+	// processor hasn't fired yet).
+	if tracingShutdown != nil {
+		traceCtx, traceCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = tracingShutdown(traceCtx)
+		traceCancel()
+	}
+
 	log.Printf("api: clean shutdown complete")
 	return nil
 }

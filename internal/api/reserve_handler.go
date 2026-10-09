@@ -7,6 +7,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
@@ -14,6 +18,13 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
+
+// tracerName is the OTel "instrumentation library" identifier. Group
+// your spans under a stable name so Jaeger can filter by who created
+// them.
+const tracerName = "github.com/emmitt-k/ticket-deal/internal/api"
+
+var tracer = otel.Tracer(tracerName)
 
 // ReserveHandler limits POST /api/tickets/reserve.
 //
@@ -40,6 +51,22 @@ import (
 // for a real SQS implementation without touching this handler.
 func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// ── 0. Open the handler-level span ────────────────────────
+		//
+		// otelhttp.NewHandler already created a "POST /api/tickets/reserve"
+		// span for the whole request. This manual span sits *inside* that
+		// one and groups the business-logic steps (claims → lua → publish)
+		// so the waterfall shows the *flow*, not just the I/O.
+		ctx, span := tracer.Start(r.Context(), "reserve.handle",
+			trace.WithAttributes(
+				attribute.String("reservation.user_id", ""), // filled in below
+			),
+		)
+		defer span.End()
+		// From here on, use ctx (not r.Context()) so the spans below
+		// become children of reserve.handle.
+		r = r.WithContext(ctx)
+
 		// ── 1. Pull verified claims from context ──────────────────
 		claims := auth.ClaimsFromContext(r.Context())
 		if claims == nil {
@@ -50,6 +77,12 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 				"missing_claims", "auth middleware did not run")
 			return
 		}
+		// Tag the span with the verified identity. Once claims exist,
+		// overwrite the placeholder attribute set above.
+		span.SetAttributes(
+			attribute.Int64("reservation.event_id", int64(claims.EventID)),
+			attribute.String("reservation.user_id", claims.Subject),
+		)
 
 		// ── 2. Parse optional seats_requested ─────────────────────
 		// Body is optional; absent / empty body defaults to 1 seat.
@@ -75,18 +108,43 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 			}
 			seats = req.SeatsRequested
 		}
+		span.SetAttributes(attribute.Int("reservation.seats_requested", seats))
 
 		// ── 3. Atomic seat lock ───────────────────────────────────
+		//
+		// The redisotel auto-instrumentation already produces a child
+		// span for the EVALSHA call (e.g. span name "EVALSHA"), but
+		// it doesn't know what we were trying to *do*. This manual
+		// span adds the business meaning: "acquire a hold for this
+		// user on this event". Jaeger shows both — auto span inside,
+		// manual span outside, in the waterfall.
+		_, holdSpan := tracer.Start(r.Context(), "redis.acquire-hold",
+			trace.WithAttributes(
+				attribute.Int64("hold.event_id", int64(claims.EventID)),
+				attribute.Int64("hold.user_id_hash", hashUserID(claims.Subject)),
+				attribute.Int("hold.ttl_seconds", int(holdTTL.Seconds())),
+			),
+		)
 		result, err := redis.ReserveSeat(r.Context(), rdb,
 			claims.EventID, claims.Subject,
 			int(holdTTL.Seconds()), seats)
 		if err != nil {
+			holdSpan.RecordError(err)
+			holdSpan.SetStatus(codes.Error, "lua reserve script failed")
+			holdSpan.End()
 			log.Printf("api: reserve script failed event=%d user=%s: %v",
 				claims.EventID, claims.Subject, err)
 			apiutil.WriteError(w, http.StatusInternalServerError,
 				"internal_error", "reservation failed, try again")
 			return
 		}
+		// Tag the outcome so the Jaeger UI can group "sold_out" vs
+		// "already_holding" vs "reserved" without parsing logs.
+		holdSpan.SetAttributes(
+			attribute.Int("hold.status_code", int(result.Status)),
+			attribute.Int("hold.rejection_reason", int(result.Reason)),
+		)
+		holdSpan.End()
 
 		// ── 4. Map Lua outcome to HTTP response ───────────────────
 		switch result.Status {
@@ -132,6 +190,7 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		reservationID := uuid.NewString()
 		now := time.Now()
 		expiresAt := now.Add(holdTTL)
+		span.SetAttributes(attribute.String("reservation.id", reservationID))
 
 		// Build the wire payload via queue.Reservation so the JSON
 		// shape is guaranteed to match what the worker parses.
@@ -158,12 +217,22 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		// reservation: Redis already created the hold, and the worker
 		// will handle a redelivered message idempotently
 		// (INSERT ... ON CONFLICT DO NOTHING).
+		_, publishSpan := tracer.Start(r.Context(), "sqs.publish",
+			trace.WithAttributes(
+				attribute.String("messaging.system", "aws.sqs"),
+				attribute.String("messaging.destination.name", "ticket-reservations"),
+				attribute.Int("messaging.message.body.size", len(payload)),
+			),
+		)
 		if err := publisher.Publish(r.Context(), payload); err != nil {
+			publishSpan.RecordError(err)
+			publishSpan.SetStatus(codes.Error, "sqs publish failed")
 			log.Printf("api: publish failed (reservation still valid) res=%s: %v",
 				reservationID, err)
 		} else {
 			metrics.ReservationsCompleted.Inc()
 		}
+		publishSpan.End()
 
 		apiutil.WriteJSON(w, http.StatusOK, map[string]any{
 			"reservation_id": reservationID,
@@ -171,4 +240,19 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 			"expires_in":     int(holdTTL.Seconds()),
 		})
 	}
+}
+
+// hashUserID returns a stable, short hash of the user ID for use as a
+// span attribute. The raw user_id (which may be PII) is intentionally
+// NOT set as a span attribute — only this hash is. Lets you correlate
+// traces for the same user across requests without leaking identity.
+func hashUserID(s string) int64 {
+	var h int64
+	for _, b := range []byte(s) {
+		h = h*31 + int64(b)
+	}
+	if h < 0 {
+		h = -h
+	}
+	return h
 }
