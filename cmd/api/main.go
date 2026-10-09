@@ -30,6 +30,7 @@ import (
 
 	"github.com/emmitt-k/ticket-deal/internal/api"
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
+	slogmw "github.com/emmitt-k/ticket-deal/internal/apiutil/middleware"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
 	"github.com/emmitt-k/ticket-deal/internal/logging"
@@ -136,7 +137,10 @@ func run() error {
 
 	// ── HTTP router ────────────────────────────────────────────────
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+	// Replace chi/middleware.Logger with our slog-based access log
+	// so request lines carry the active OTel trace_id and structured
+	// fields (method, path, status, duration, client_ip, user_agent).
+	r.Use(slogmw.NewSlogAccessLog())
 	r.Use(middleware.Recoverer)
 
 	// Wrap every route in a middleware that records HTTP request
