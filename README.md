@@ -88,6 +88,7 @@ The three phases, in one line each:
 | DB explorer    | **pgcli**                                                                                           | `psql` with autocomplete + syntax highlighting + pretty tables                                                            |
 | Metrics        | **Prometheus** + **Grafana**                                                                        | `/metrics` on every service, scraped by Prometheus, visualized in a 9-panel "Ticket Deal — Overview" dashboard             |
 | Tracing        | **OpenTelemetry** → **Jaeger**                                                                      | OTLP/gRPC export, end-to-end waterfall from `api → Redis → SQS → worker → Postgres` with rich attributes                |
+| Logging        | `log/slog` (stdlib) + OTel trace correlation                                                        | Structured key-value logs with `trace_id` / `span_id` auto-injected on every line — paste a `trace_id` from Jaeger and find its log line in `jq` |
 | Containers     | **Docker Compose**                                                                                  | Whole stack with one command                                                                                              |
 
 > Why these choices (and which we explicitly rejected) → [`/docs/architecture.md`](docs/architecture.md)
@@ -303,6 +304,42 @@ POST  (otelhttp)                      [35ms]
 For the propagator details, manual span inventory, and SQS body-fallback
 rationale → [`/docs/tracing-plan.md`](docs/tracing-plan.md).
 
+### Logging (`log/slog` + OTel correlation)
+
+Every long-running service emits **structured** logs, with the active OTel `trace_id` and `span_id` injected on every line. No new dependencies — `log/slog` is stdlib since Go 1.21.
+
+```bash
+# Default: human-readable text (great for `tail -f` while developing)
+LOG_FORMAT=text make all-services
+
+# For Loki / Datadog / `jq`-fu, switch to JSON
+LOG_FORMAT=json LOG_LEVEL=info make all-services
+```
+
+A reservation's worker log line in **text** format (with active OTel span):
+
+```
+time=2026-10-09T15:00:00.000-07:00 level=INFO msg="reservation inserted"
+service=worker service_version=dev
+reservation_id=6880e7fa-1170-440f-883c-c5bca36002b0
+user=k6user-31 event=1 seats=1
+trace_id=fac1f09d3a4b5c6d7e8f9a0b1c2d3e4f span_id=71bebc50a1b2c3d4
+```
+
+Same line in **JSON** (`LOG_FORMAT=json`):
+
+```json
+{"time":"2026-10-09T15:00:00.000-07:00","level":"INFO","msg":"reservation inserted",
+ "service":"worker","service_version":"dev",
+ "reservation_id":"6880e7fa-1170-440f-883c-c5bca36002b0",
+ "user":"k6user-31","event":1,"seats":1,
+ "trace_id":"fac1f09d3a4b5c6d7e8f9a0b1c2d3e4f","span_id":"71bebc50a1b2c3d4"}
+```
+
+The 30-LOC `logging.ContextHandler` is what makes this work — it pulls the OTel span from the request context and appends `trace_id` / `span_id` to every record. HTTP access logs (replacing `chi/middleware.Logger`) carry the same correlation.
+
+For the design rationale, env var matrix, and what we deliberately kept as `log.Printf` (one-shot CLIs) → [`/docs/logging-plan.md`](docs/logging-plan.md).
+
 ---
 
 ## Project Roadmap
@@ -313,6 +350,7 @@ Done items are crossed off; remaining items are aspirational roadmap (not phase 
 - [ ] **Redis Cluster** — shard seats across nodes for >100k concurrent users
 - [x] **Observability** — Prometheus + Grafana (request rate, latency, reservation outcomes, worker throughput, expiration activity; `reservations_oversold_total` is the headline alert)
 - [x] **Distributed tracing** — OpenTelemetry → Jaeger, end-to-end waterfall across API → SQS → worker (with body-fallback for ElasticMQ in dev)
+- [x] **Structured logging** — `log/slog` across all 4 long-running services, with OTel `trace_id` / `span_id` auto-injected on every line (and HTTP access log via custom chi middleware)
 - [ ] **Payment gateway** — Stripe webhook handler that confirms reservations and releases the hold
 - [ ] **Seat-level granularity** — Redis Hash per event instead of a single counter
 - [ ] **Anti-bot** *(intentionally skipped in lite-auth; revisit if slash-traction emerges)* — CAPTCHA + device fingerprinting before JWT issuance

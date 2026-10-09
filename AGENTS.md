@@ -32,6 +32,7 @@
 | Queue | ElasticMQ (SQS-compatible, local) |
 | Metrics | Prometheus 2.55 + Grafana 11.3 |
 | Tracing | OpenTelemetry SDK 1.47 → Jaeger 1.76 (all-in-one) |
+| Logging | `log/slog` (stdlib, Go 1.21+) + custom OTel trace correlation handler |
 | Load testing | k6 (Go + JavaScript) |
 | Service scripts | Bash + curl |
 | Container runtime | Docker Compose |
@@ -162,6 +163,51 @@ POST (api)                         [35ms]
 Env vars:
 - `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`)
 - `OTEL_TRACES_SAMPLER_ARG` (default `1.0` = trace everything; lower in prod)
+
+#### Logging (`log/slog` + OTel correlation)
+
+Every long-running service initializes structured logging at the top of `main()`:
+
+```go
+logging.Init(logging.Config{
+    Level:   logging.LevelFromEnv(),   // LOG_LEVEL: debug/info/warn/error
+    Format:  logging.FormatFromEnv(),  // LOG_FORMAT: text (default) or json
+    Service: "api",                    // hardcoded per binary
+    Version: os.Getenv("SERVICE_VERSION"),
+})
+```
+
+After Init, anywhere in the binary call:
+
+- `slog.Info("msg", "key", val, ...)` — basic structured log
+- `slog.InfoContext(ctx, "msg", ...)` — preferred when a `ctx` is in scope; auto-injects `trace_id` and `span_id` from the active OTel span via `logging.ContextHandler`
+- `slog.WarnContext(ctx, ...)`, `slog.ErrorContext(ctx, ...)` — same with level
+
+Key files:
+- `internal/logging/logging.go` — `Init`, `LevelFromString`, env helpers
+- `internal/logging/context_handler.go` — 30-LOC `slog.Handler` wrapper that pulls `trace.SpanContextFromContext(ctx)` and adds `trace_id` + `span_id` attrs
+- `internal/apiutil/middleware/slog_logger.go` — chi access-log middleware (replaces `chi/middleware.Logger`); the access log line carries the request's `trace_id` because the OTel span is already active on the request ctx
+
+Conventions:
+- Functions with a `ctx` in scope use `*Context` variants so trace correlation works
+- `service=` and `service_version=` are prepended to every record by Init — drop the `"api: "` / `"worker: "` prefix from message text
+- `log.Fatalf` is replaced with `slog.Error + os.Exit(1)` so deferred shutdown funcs (tracing flush, DB pool close) still run
+- One-shot CLIs (`cmd/seed-inventory`, `cmd/mintjwt`) keep stdlib `log.Printf` — they run once and exit, so structured logs add no value (documented in `docs/logging-plan.md` §Decision 4)
+
+Env vars:
+- `LOG_LEVEL` (default `info`) — debug/info/warn/error
+- `LOG_FORMAT` (default `text`) — text (dev) / json (prod, Loki-ready)
+- `SERVICE_VERSION` (default `dev`) — set by build via `-ldflags` in CI
+
+Sample line (text format, with active span):
+```
+time=2026-10-09T15:00:00.000-07:00 level=INFO msg="reservation inserted" service=worker service_version=dev reservation_id=6880e7fa-... user=k6user-31 event=1 seats=1 trace_id=fac1f09d... span_id=71bebc50...
+```
+
+Same line in JSON format (`LOG_FORMAT=json`):
+```json
+{"time":"2026-10-09T15:00:00.000-07:00","level":"INFO","msg":"reservation inserted","service":"worker","service_version":"dev","reservation_id":"6880e7fa-...","user":"k6user-31","event":1,"seats":1,"trace_id":"fac1f09d...","span_id":"71bebc50..."}
+```
 
 ### Code Quality
 
