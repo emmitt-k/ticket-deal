@@ -2,7 +2,7 @@ package queue
 
 import (
 	"context"
-	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -95,14 +95,6 @@ func InjectTraceContext(ctx context.Context, input *sqs.SendMessageInput) {
 			StringValue: aws.String(v),
 		}
 	}
-
-	// Defensive debug: log what we injected so an operator can see
-	// whether the trace context was actually picked up. Remove this
-	// once SQS → worker propagation is verified end-to-end.
-	if tid, sid := TraceContextFromContext(ctx); tid != "" {
-		fmt.Printf("queue: inject trace_id=%s span_id=%s into SQS attrs=%v\n",
-			tid, sid, carrier.attrs)
-	}
 }
 
 // ExtractTraceContext pulls the trace context from an SQS message's
@@ -114,19 +106,60 @@ func InjectTraceContext(ctx context.Context, input *sqs.SendMessageInput) {
 //
 //	ctx = queue.ExtractTraceContext(ctx, msg)
 //	tracer.Start(ctx, "worker.handleMessage")
+//
+// Some local SQS emulators (ElasticMQ) don't preserve
+// MessageAttributes through the roundtrip, so we fall back to
+// the message body's `_traceparent` field if the attribute is
+// missing. Production SQS (real AWS) preserves attributes, so
+// the body fallback is a no-op there.
 func ExtractTraceContext(ctx context.Context, msg types.Message) context.Context {
-	if len(msg.MessageAttributes) == 0 {
-		fmt.Printf("queue: extract message has no attributes\n")
-		return ctx
-	}
 	carrier := sqsAttributeCarrier{attrs: make(map[string]string)}
-	for k, v := range msg.MessageAttributes {
-		if v.StringValue != nil {
-			carrier.attrs[k] = *v.StringValue
+
+	// First try: SQS message attributes (preferred, set by AWS SDK
+	// clients that respect the SQS API).
+	if len(msg.MessageAttributes) > 0 {
+		for k, v := range msg.MessageAttributes {
+			if v.StringValue != nil {
+				carrier.attrs[k] = *v.StringValue
+			}
 		}
 	}
-	fmt.Printf("queue: extract from SQS attrs=%v\n", carrier.attrs)
+
+	// Second try: message body `_traceparent` (set by some publishers
+	// that want guaranteed delivery across all SQS-compatible brokers).
+	// Look for a top-level `_traceparent` field in the JSON body.
+	if carrier.attrs["traceparent"] == "" {
+		if body := aws.ToString(msg.Body); body != "" {
+			carrier.attrs["traceparent"] = extractTraceparentFromBody(body)
+		}
+	}
+
+	if len(carrier.attrs) == 0 {
+		return ctx
+	}
 	return otel.GetTextMapPropagator().Extract(ctx, carrier)
+}
+
+// extractTraceparentFromBody parses the JSON message body looking
+// for a top-level `_traceparent` field. Returns "" if not present
+// or body isn't valid JSON. Doesn't fail loudly on parse errors —
+// the worst case is a root span, which is the same as no propagation.
+func extractTraceparentFromBody(body string) string {
+	// Cheap and cheerful: avoid importing encoding/json by using a
+	// simple string scan. The publisher embeds the field as
+	// `"_traceparent":"00-...-...-01",` so a substring search is
+	// reliable enough for the dev-time fallback.
+	const key = `"_traceparent":"`
+	i := strings.Index(body, key)
+	if i < 0 {
+		return ""
+	}
+	rest := body[i+len(key):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
 }
 
 // traceContextFromContext returns the trace_id and span_id of the

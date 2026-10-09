@@ -96,3 +96,24 @@ func TestExtractNoAttributes(t *testing.T) {
 	require.False(t, trace.SpanContextFromContext(got).IsValid(),
 		"context with no extracted attributes should not have a valid SpanContext")
 }
+
+// TestExtractFromBodyFallback verifies the body `_traceparent`
+// fallback works when MessageAttributes are empty (e.g. ElasticMQ
+// stripping them in dev). The body has the trace context as a
+// top-level JSON field, which ExtractTraceContext should pick up.
+func TestExtractFromBodyFallback(t *testing.T) {
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	msg := types.Message{
+		Body: aws.String(`{"reservation_id":"r1","_traceparent":"00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01"}`),
+		// MessageAttributes intentionally nil (simulating ElasticMQ)
+	}
+	ctx := ExtractTraceContext(context.Background(), msg)
+	sc := trace.SpanContextFromContext(ctx)
+	require.True(t, sc.IsValid(), "should extract trace from body fallback")
+	expectedTraceID := trace.TraceID{0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+		0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc}
+	require.Equal(t, expectedTraceID, sc.TraceID())
+}
