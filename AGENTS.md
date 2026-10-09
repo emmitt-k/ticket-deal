@@ -192,19 +192,21 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 
 ### Branch Strategy
 - `main`: stable, protected
-- Feature work: branch from main → PR → merge
+- Feature work: **always create a new feature branch** (`git checkout -b feature/<name>`) off `main` before making changes; **always push commits to the remote feature branch** (`git push origin feature/<name>`) when done — never commit directly to `main`
 
 ---
 
 ## Important Conventions
 
-1. **Load test before committing any reservation/Redis logic** — use `make loadtest-burst` to smoke-test correctness
-2. **Reset state between load test runs** — `make loadtest-state && make loadtest-jwts`
-3. **No external services in unit tests** — all tests use in-memory fakes; `go test ./...` passes without any docker services running
-4. **JWT TTL** — default 600s (10 min); set via `JWT_TTL_SECONDS` env var in `loadtest/mint-jwts.sh`
-5. **Ports**: API :8080, Dashboard :8082, Redis :6379, Postgres :5432, ElasticMQ :4566
-6. **Corporate proxy** — `http.proxy` is set globally in `~/.gitconfig`; SSH bypasses it, HTTPS does not. SSH is used for github.com pushes.
-7. **Commit style** — Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `ci:`)
+1. **New feature = new feature branch** — before doing anything non-trivial (new file, new behavior, refactor), ask Master: *"Should I make a new feature branch for this?"* Branch name: `feature/<short-name>`
+2. **Always push to remote when done** — after every commit, push to the remote feature branch immediately. Never leave commits unpushed.
+3. **Load test before committing any reservation/Redis logic** — use `make loadtest-burst` to smoke-test correctness
+4. **Reset state between load test runs** — `make loadtest-state && make loadtest-jwts`
+5. **No external services in unit tests** — all tests use in-memory fakes; `go test ./...` passes without any docker services running
+6. **JWT TTL** — default 600s (10 min); set via `JWT_TTL_SECONDS` env var in `loadtest/mint-jwts.sh`
+7. **Ports**: API :8080, Dashboard :8082, Redis :6379, Postgres :5432, ElasticMQ :4566
+8. **Corporate proxy** — `http.proxy` is set globally in `~/.gitconfig`; SSH bypasses it, HTTPS does not. SSH is used for github.com pushes.
+9. **Commit style** — Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `ci:`)
 
 ---
 
