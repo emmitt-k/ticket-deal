@@ -156,9 +156,7 @@ loadtest-burst: ## Run 1000-VU burst in background (~1s, dashboard stays populat
 		echo ""; \
 		exit 1; \
 	fi
-	./loadtest/reset-state.sh
-	./loadtest/mint-jwts.sh $(VUS)
-	@./loadtest/run-burst.sh
+	@./loadtest/run-burst.sh $(VUS)
 	@echo ""
 	@echo "→ burst running; dashboard at http://localhost:8082/"
 	@echo "→ to re-run: make stop-loadtest && make loadtest-burst"
@@ -172,9 +170,7 @@ loadtest-ramp: ## Run 7-stage ramp in background (~90s, dashboard tracks VU curv
 		echo ""; \
 		exit 1; \
 	fi
-	./loadtest/reset-state.sh
-	./loadtest/mint-jwts.sh $(VUS)
-	@./loadtest/run-ramp.sh
+	@./loadtest/run-ramp.sh $(VUS)
 	@echo ""
 	@echo "→ ramp running (~90s); dashboard at http://localhost:8082/"
 	@echo "→ to free the port: make stop-loadtest"
