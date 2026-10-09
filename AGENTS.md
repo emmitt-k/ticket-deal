@@ -78,6 +78,8 @@ make watcher-bg      # Start expiration-watcher in background
 make dashboard-bg    # Start live dashboard (http://localhost:8082/)
 make down            # Stop all docker compose services
 make status          # Show running processes, container state, DB/Redis counts
+make clean-logs      # Delete all log files (logs/*.log + logs/burst/* + logs/ramp/*)
+make clean-logs-truncate  # Truncate (don't delete) all log files; safe in-flight
 ```
 
 ### Load Testing
@@ -255,7 +257,8 @@ make purge        # clean + docker compose down (keeps volumes)
 │   ├── start-bg.sh            # Generic background process starter (pid + log)
 │   ├── stop-bg.sh             # Generic background process stopper (pid-based)
 │   ├── start-all.sh           # Start all services (used by make all-services)
-│   └── stop-all.sh            # Stop all services
+│   ├── stop-all.sh            # Stop all services
+│   └── clear-logs.sh          # Delete (or truncate) logs/*.log + logs/burst/* + logs/ramp/*; safe in-flight
 ├── docs/
 │   ├── architecture.md        # Full architecture deep-dive
 │   ├── comprehensive-go.md     # Go language tour
@@ -360,3 +363,20 @@ make test
 ```bash
 make loadtest-state && make loadtest-jwts && make loadtest-burst
 ```
+
+### Clean log files (start fresh for a new debugging session or load test)
+```bash
+# Wipe everything: service logs + k6 burst/ramp results
+make clean-logs
+
+# Targeted: just one service (e.g. keep worker.log, clear api.log)
+scripts/clear-logs.sh api
+
+# Targeted: just the k6 burst results (keep service logs)
+scripts/clear-logs.sh burst
+
+# Truncate instead of delete (keep files, reset content, safe in-flight)
+make clean-logs-truncate
+```
+
+`scripts/clear-logs.sh` warns if any service PIDs are alive before clearing. **`.pid` files are never touched** — they're managed by `start-bg.sh` / `stop-bg.sh`. The `burst/` and `ramp/` directories themselves are kept; only their contents are cleared, so `make loadtest-burst` doesn't fail on next run.
