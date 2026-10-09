@@ -198,7 +198,7 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 
 ## Important Conventions
 
-1. **New feature = new feature branch** — before doing anything non-trivial (new file, new behavior, refactor), ask Master: *"Should I make a new feature branch for this?"* Branch name: `feature/<short-name>`
+1. **Major changes = new feature branch** — for new features or significant refactors, create a branch first (`git checkout -b feature/<short-name>`). Small edits, bug fixes, doc tweaks, and one-off tasks can be done directly on the current branch.
 2. **Always push to remote when done** — after every commit, push to the remote feature branch immediately. Never leave commits unpushed.
 3. **Load test before committing any reservation/Redis logic** — use `make loadtest-burst` to smoke-test correctness
 4. **Reset state between load test runs** — `make loadtest-state && make loadtest-jwts`
