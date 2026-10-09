@@ -189,7 +189,7 @@ purge: clean down ## Clean + stop docker compose (keeps volumes)
 	@echo "✓ purged (volumes preserved; for full reset use 'docker compose down -v')"
 
 # ─── Status & logs ───────────────────────────────────────────────────
-.PHONY: status logs
+.PHONY: status logs clean-logs clean-logs-delete
 status: ## Show running processes, container state, and DB/Redis counts
 	@printf '\033[1m=== Containers ===\033[0m\n'
 	@$(DOCKER) compose ps
@@ -216,3 +216,9 @@ status: ## Show running processes, container state, and DB/Redis counts
 
 logs: ## Tail all background service logs (Ctrl-C to exit)
 	@ls -1 $(LOG_DIR)/*.log 2>/dev/null | xargs -I{} sh -c 'echo ""; echo "==> {}"; tail -f {}' || echo "(no log files in $(LOG_DIR)/)"
+
+clean-logs: ## Truncate all service log files in logs/*.log (keeps files; safe in-flight)
+	@./scripts/clear-logs.sh
+
+clean-logs-delete: ## Delete (rm) all service log files in logs/*.log
+	@./scripts/clear-logs.sh --delete
