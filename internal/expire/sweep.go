@@ -2,7 +2,7 @@ package expire
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
@@ -79,7 +79,7 @@ func FindAndExpireSweptRows(ctx context.Context, pool *db.Pool) ([]SweptRow, err
 // row is independent, and the next sweep won't re-process it (status
 // already EXPIRED in DB). Operator alerting should fire on INCRBY errors.
 func RunSweep(ctx context.Context, pool *db.Pool, rdb *redis.Client, service string, interval time.Duration) error {
-	log.Printf("expire: sweep starting (service=%s, interval=%s)", service, interval)
+	slog.InfoContext(ctx, "sweep starting", "service", service, "interval", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -90,7 +90,7 @@ func RunSweep(ctx context.Context, pool *db.Pool, rdb *redis.Client, service str
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("expire: sweep clean shutdown")
+			slog.InfoContext(ctx, "sweep clean shutdown")
 			return ctx.Err()
 		case <-ticker.C:
 			sweepOnce(ctx, pool, rdb, service)
@@ -104,21 +104,28 @@ func sweepOnce(ctx context.Context, pool *db.Pool, rdb *redis.Client, service st
 	metrics.ExpirationSweepCycles.WithLabelValues(service).Inc()
 	rows, err := FindAndExpireSweptRows(ctx, pool)
 	if err != nil {
-		log.Printf("expire: sweep query failed: %v", err)
+		slog.ErrorContext(ctx, "sweep query failed", "error", err)
 		return
 	}
 	if len(rows) == 0 {
 		return
 	}
 	metrics.ExpirationSeatsExpired.WithLabelValues(service).Add(float64(len(rows)))
-	log.Printf("expire: sweep transitioned %d row(s) to EXPIRED", len(rows))
+	slog.InfoContext(ctx, "sweep transitioned rows to EXPIRED", "count", len(rows))
 	for _, r := range rows {
 		if err := rdb.IncrBy(ctx, redis.InventoryKey(r.EventID), int64(r.Seats)).Err(); err != nil {
-			log.Printf("expire: sweep INCRBY failed event=%d user=%s seats=%d err=%v",
-				r.EventID, r.UserID, r.Seats, err)
+			slog.ErrorContext(ctx, "sweep INCRBY failed",
+				"event", r.EventID,
+				"user", r.UserID,
+				"seats", r.Seats,
+				"error", err,
+			)
 			continue
 		}
-		log.Printf("expire: sweep compensated event=%d user=%s seats=%d",
-			r.EventID, r.UserID, r.Seats)
+		slog.InfoContext(ctx, "sweep compensated",
+			"event", r.EventID,
+			"user", r.UserID,
+			"seats", r.Seats,
+		)
 	}
 }

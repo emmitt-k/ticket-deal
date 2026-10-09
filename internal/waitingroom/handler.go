@@ -11,7 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -50,7 +50,7 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 			ip, time.Now().UnixMilli(),
 		)
 		if err != nil {
-			log.Printf("wr: ip limit check failed ip=%s: %v", ip, err)
+			slog.ErrorContext(r.Context(), "ip limit check failed", "ip", ip, "error", err)
 			apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
 				"rate limit check failed, try again")
 			return
@@ -70,7 +70,11 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 		}
 		result, err := redis.TryAdmit(r.Context(), rdb, waitCfg, req.UserID, time.Now().UnixMilli())
 		if err != nil {
-			log.Printf("wr: TryAdmit failed event=%d user=%s: %v", req.EventID, req.UserID, err)
+			slog.ErrorContext(r.Context(), "TryAdmit failed",
+				"event", req.EventID,
+				"user", req.UserID,
+				"error", err,
+			)
 			apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
 				"waiting room unavailable, try again")
 			return
@@ -78,13 +82,17 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 
 		if result.Admitted {
 			// ── Admitted: mint JWT ───────────────────────────────────
-			token, err := auth.Issue(req.UserID, req.EventID, cfg.JWTSecret, 2*time.Minute)
-			if err != nil {
-				log.Printf("wr: Issue failed user=%s event=%d: %v", req.UserID, req.EventID, err)
-				apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
-					"failed to issue token, try again")
-				return
-			}
+		token, err := auth.Issue(req.UserID, req.EventID, cfg.JWTSecret, 2*time.Minute)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "Issue failed",
+				"user", req.UserID,
+				"event", req.EventID,
+				"error", err,
+			)
+			apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
+				"failed to issue token, try again")
+			return
+		}
 			apiutil.WriteJSON(w, http.StatusOK, map[string]any{
 				"token":      token,
 				"expires_in": 120, // seconds
@@ -96,7 +104,11 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 		pos, err := redis.Enqueue(r.Context(), rdb, req.EventID, req.UserID,
 			time.Now().UnixMilli(), cfg.WaitRoom.QueueTTLSeconds)
 		if err != nil {
-			log.Printf("wr: Enqueue failed event=%d user=%s: %v", req.EventID, req.UserID, err)
+			slog.ErrorContext(r.Context(), "Enqueue failed",
+				"event", req.EventID,
+				"user", req.UserID,
+				"error", err,
+			)
 			apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
 				"failed to enqueue, try again")
 			return
@@ -132,7 +144,11 @@ func QueueSSEHandler(rdb *redis.Client) http.HandlerFunc {
 		// Check if user is actually in the queue
 		pos, err := redis.GetPosition(r.Context(), rdb, eventID, userID)
 		if err != nil {
-			log.Printf("wr: GetPosition failed event=%d user=%s: %v", eventID, userID, err)
+			slog.ErrorContext(r.Context(), "GetPosition failed",
+				"event", eventID,
+				"user", userID,
+				"error", err,
+			)
 			apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
 				"failed to check queue position")
 			return
@@ -187,7 +203,7 @@ func streamSSE(ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
 ) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("wr: streamSSE recovered panic: %v", r)
+			slog.ErrorContext(ctx, "streamSSE recovered panic", "panic", r)
 		}
 	}()
 

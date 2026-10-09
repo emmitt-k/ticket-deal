@@ -3,7 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -98,7 +98,7 @@ func Poll(ctx context.Context, cfg ConsumerConfig, handler MessageHandler) error
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-			log.Printf("worker: ReceiveMessage failed (will retry): %v", err)
+			slog.WarnContext(ctx, "ReceiveMessage failed (will retry)", "error", err)
 			// Brief pause so we don't 100%-CPU a sick broker.
 			// ctx-aware sleep so shutdown isn't blocked for the full second.
 			t := time.NewTimer(time.Second)
@@ -126,8 +126,10 @@ func Poll(ctx context.Context, cfg ConsumerConfig, handler MessageHandler) error
 				// Don't delete. SQS will redeliver after visibility
 				// timeout. Log so an operator can see which message
 				// type is failing.
-				log.Printf("worker: handler error (will redeliver) id=%s: %v",
-					aws.ToString(msg.MessageId), herr)
+				slog.WarnContext(msgCtx, "handler error (will redeliver)",
+					"message_id", aws.ToString(msg.MessageId),
+					"error", herr,
+				)
 				continue
 			}
 
@@ -143,8 +145,10 @@ func Poll(ctx context.Context, cfg ConsumerConfig, handler MessageHandler) error
 				// Already-handled but not-deleted is the worst case:
 				// SQS will redeliver, and the DB layer will idempotently
 				// skip the duplicate. Log and move on.
-				log.Printf("worker: DeleteMessage failed (handler succeeded; DB idempotency will absorb redelivery) id=%s: %v",
-					aws.ToString(msg.MessageId), derr)
+				slog.WarnContext(ctx, "DeleteMessage failed (handler succeeded; DB idempotency will absorb redelivery)",
+					"message_id", aws.ToString(msg.MessageId),
+					"error", derr,
+				)
 			}
 		}
 	}

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -78,7 +78,10 @@ func RunWatcher(ctx context.Context, rdb *redis.Client, pool *db.Pool) error {
 			return err
 		}
 
-		log.Printf("expire: watcher error (reconnecting in %s): %v", backoff, err)
+		slog.WarnContext(ctx, "watcher error (reconnecting)",
+			"backoff", backoff,
+			"error", err,
+		)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -105,7 +108,7 @@ func watchOnce(ctx context.Context, rdb *redis.Client, pool *db.Pool, channel st
 	if _, err := pubsub.Receive(ctx); err != nil {
 		return fmt.Errorf("expire: subscribe: %w", err)
 	}
-	log.Printf("expire: watcher subscribed to %s", channel)
+	slog.InfoContext(ctx, "watcher subscribed", "channel", channel)
 
 	// Reset backoff on a successful subscribe — we're back online.
 	ch := pubsub.Channel()
@@ -127,8 +130,11 @@ func watchOnce(ctx context.Context, rdb *redis.Client, pool *db.Pool, channel st
 			if compErr := Compensate(ctx, pool, rdb, eventID, userID); compErr != nil {
 				// Transient — log and skip. The sweep will catch
 				// the row within 60 s if compensation failed.
-				log.Printf("expire: compensate failed event=%d user=%s err=%v",
-					eventID, userID, compErr)
+				slog.ErrorContext(ctx, "compensate failed",
+					"event", eventID,
+					"user", userID,
+					"error", compErr,
+				)
 			}
 		}
 	}

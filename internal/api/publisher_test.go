@@ -4,29 +4,37 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log"
-	"strings"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-// TestLogPublisher — the Phase 5 stub. It logs the body (with a [STUB
-// SQS publish] prefix) and returns nil. We capture the logger output
-// via log.SetOutput so the test doesn't pollute the test runner's stdout.
+// TestLogPublisher — the Phase 5 stub. It logs the body (with a
+// "stub SQS publish" message) and returns nil. We capture the slog
+// output by swapping the default logger for one that writes to a
+// buffer, so the test doesn't pollute the test runner's stdout.
+//
+// After the slog migration (see docs/logging-plan.md) the test no
+// longer uses the deprecated `[STUB SQS publish]` prefix; it checks
+// the structured fields directly so future log-format changes don't
+// break the test.
 func TestLogPublisher(t *testing.T) {
 	var buf bytes.Buffer
-	orig := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(orig) })
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	p := LogPublisher{}
 	require.NoError(t, p.Publish(context.Background(), []byte(`{"hello":"world"}`)))
 
 	out := buf.String()
-	require.Contains(t, out, "[STUB SQS publish]",
-		"the stub logs a recognizable prefix")
-	require.Contains(t, out, `{"hello":"world"}`,
+	require.Contains(t, out, "stub SQS publish",
+		"the stub logs a recognizable message")
+	// The body is rendered as a JSON-escaped quoted string in slog
+	// text format, so we check for the unescaped form. (The original
+	// `{"hello":"world"}` is the wire payload — log output quotes it.)
+	require.Contains(t, out, `body="{\"hello\":\"world\"}"`,
 		"the body is logged verbatim so a human can read what would have been sent")
 }
 
@@ -75,14 +83,21 @@ func mustEncode(v any) []byte {
 // TestPublisher_EmptyBodyLogPublisher tests that LogPublisher handles
 // an empty body without panicking. Edge case — unlikely in practice
 // (the handler always builds a real payload), but cheap to cover.
+//
+// After the slog migration we no longer count "[STUB SQS publish]"
+// occurrences — instead we just verify the call returns nil for both
+// nil and empty byte slices. Slog with no body attribute behaves
+// identically to the old log.Printf("%s", "") for an empty input.
 func TestPublisher_EmptyBodyLogPublisher(t *testing.T) {
 	var buf bytes.Buffer
-	orig := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(orig) })
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	p := LogPublisher{}
 	require.NoError(t, p.Publish(context.Background(), nil))
 	require.NoError(t, p.Publish(context.Background(), []byte{}))
-	require.Equal(t, 2, strings.Count(buf.String(), "[STUB SQS publish]"))
+	// Each call should produce exactly one structured log line that
+	// mentions the stub message. Two calls → two lines.
+	require.Equal(t, 2, bytes.Count(buf.Bytes(), []byte("stub SQS publish")))
 }
