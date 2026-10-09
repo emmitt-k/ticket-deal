@@ -194,62 +194,83 @@
     },
     {
       "title": "Seats Available",
-      "type": "stat",
+      "type": "timeseries",
       "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 24},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
       "targets": [
         {
-          "expr": "redis_seats_available",
+          "expr": "redis_seats_available{service=\"api\"}",
+          "legendFormat": "seats",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {"color": "red", "value": null},
-              {"color": "orange", "value": 50},
-              {"color": "green", "value": 100}
+              {"color": "orange", "value": 25},
+              {"color": "yellow", "value": 50},
+              {"color": "green", "value": 75}
             ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 3,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true
           }
         }
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {"calcs": ["lastNotNull"]}
+        "legend": {"showLegend": false},
+        "tooltip": {"mode": "single"}
       }
     },
     {
-      "title": "Waiting Room Queue",
-      "type": "stat",
+      "title": "Waiting Room Queue (capacity 100)",
+      "type": "timeseries",
       "datasource": "Prometheus",
-      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 24},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
       "targets": [
         {
-          "expr": "waiting_room_queue_length",
+          "expr": "waiting_room_queue_length{service=\"api\"}",
+          "legendFormat": "queued",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "thresholds"},
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {"color": "green", "value": null},
-              {"color": "orange", "value": 100},
-              {"color": "red", "value": 500}
+              {"color": "yellow", "value": 50},
+              {"color": "red", "value": 80}
             ]
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 3,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "spanNulls": true
           }
         }
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "reduceOptions": {"calcs": ["lastNotNull"]}
+        "legend": {"showLegend": false},
+        "tooltip": {"mode": "single"}
       }
     }
   ],
