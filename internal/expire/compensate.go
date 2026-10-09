@@ -23,6 +23,7 @@ import (
 	"log"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
+	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
 
@@ -52,6 +53,9 @@ func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
 	eventID int64, userID string,
 ) error {
 	seats, err := expireRowIfPending(ctx, pool, userID, eventID)
+	// Each call to Compensate is a "cycle" in event-driven terms —
+	// one Redis keyspace notification triggered one DB+INCRBY pair.
+	metrics.ExpirationSweepCycles.WithLabelValues("watcher").Inc()
 	if err != nil {
 		return fmt.Errorf("expire: transition row: %w", err)
 	}
@@ -75,6 +79,9 @@ func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
 			eventID, userID, seats, err)
 		return nil
 	}
+
+	// Record this as one watcher-driven expiration.
+	metrics.ExpirationSeatsExpired.WithLabelValues("watcher").Inc()
 
 	log.Printf("expire: compensated event=%d user=%s seats=%d", eventID, userID, seats)
 	return nil

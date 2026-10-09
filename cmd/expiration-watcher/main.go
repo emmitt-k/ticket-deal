@@ -25,15 +25,18 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
+	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
 
@@ -75,6 +78,36 @@ func run() error {
 		return fmt.Errorf("ping Redis: %w", err)
 	}
 	log.Printf("expiration-watcher: Redis ping OK")
+
+	// ── Metrics HTTP server (Prometheus scrape target) ────────────
+	//
+	// The expiration-watcher has no inbound HTTP — it's purely
+	// event-driven (Redis keyspace notifications). Spin up a tiny
+	// server on cfg.MetricsAddr (default :8083) just for /metrics.
+	metricsAddr := getEnv("METRICS_ADDR", ":8083")
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler())
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	metricsSrv := &http.Server{
+		Addr:              metricsAddr,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Printf("expiration-watcher: metrics server listening on %s", metricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			log.Printf("expiration-watcher: metrics server error: %v", err)
+		}
+	}()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shutCtx)
+	}()
 
 	// ── Watcher (blocks until ctx canceled) ────────────────────
 	//

@@ -69,7 +69,58 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  # ─── Metrics aggregation ─────────────────────────────────────
+  #
+  # Scrapes the Go services (api, worker, expiration-watcher) on
+  # the host machine via host.docker.internal — those services run
+  # outside Docker via `make all-services`. /metrics endpoints:
+  #   - API:      host.docker.internal:8080/metrics
+  #   - Worker:   host.docker.internal:8081/metrics
+  #   - Watcher:  host.docker.internal:8083/metrics
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: ticket-prometheus
+    ports:
+      - "9090:9090"   # Prometheus web UI
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'  # POST /-/reload for hot config reload
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # macOS/Windows: alias to host
+    restart: unless-stopped
+
+  # ─── Dashboards & visualization ──────────────────────────────
+  #
+  # Auto-provisions the Prometheus datasource and dashboard JSONs
+  # from /etc/grafana/provisioning and /var/lib/grafana/dashboards.
+  # Default admin credentials: admin / admin123 (local dev only).
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: ticket-grafana
+    ports:
+      - "3000:3000"   # Grafana web UI
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"           # optional: no login required
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 # Named volumes so data survives `docker compose down`
 volumes:
   redis-data:
   postgres-data:
+  prometheus-data:
+  grafana-data:

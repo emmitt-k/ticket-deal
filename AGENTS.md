@@ -46,6 +46,9 @@ Client → API (:8080) → Redis (rate-limit + waiting-room queue)
                    → ElasticMQ (async reservation publishing)
                             → Worker (:8081) consumes SQS → writes to Postgres
                             → Expiration-Watcher (keyspace notifications) → auto-expires holds
+
+Observability:
+  All services expose /metrics → Prometheus (:9090) → Grafana (:3000)
 ```
 
 **Key correctness invariants:**
@@ -77,16 +80,36 @@ make status          # Show running processes, container state, DB/Redis counts
 ### Load Testing
 
 ```bash
-make loadtest-state        # Reset Redis + Postgres to clean state (no events, no holds)
-make loadtest-jwts        # Mint 1000 JWTs for load test users
-make loadtest-burst        # 1000 VUs × 1s burst (correctness test: 100 winners, 0 oversell)
-make loadtest-ramp         # 7-stage ramp 0→50→200→1000 VUs over 90s (stress test)
+make loadtest-state        # Reset Redis + Postgres to clean state (only if you want to reset WITHOUT running a test)
+make loadtest-jwts        # Mint 1000 JWTs (only if you want to mint WITHOUT running a test)
+make loadtest-burst        # 1000 VUs × 1s burst — self-bootstraps (resets state + mints JWTs automatically)
+make loadtest-ramp         # 7-stage ramp 0→50→200→1000 VUs over 90s — self-bootstraps
 make stop-loadtest         # Kill any running k6 process (burst or ramp)
 ```
+
+**Both `loadtest-burst` and `loadtest-ramp` auto-reset state and mint JWTs before launching k6.** No need to call `loadtest-state` / `loadtest-jwts` first. Override the JWT count with `VUS=500` (Makefile) or as a positional arg to the wrapper script.
 
 **Load test logs** (never overwritten, timestamped):
 - `logs/burst/TS-burst.log`
 - `logs/ramp/TS-ramp.log`
+
+### Observability
+
+```bash
+# After `make all-services` + `docker compose up -d prometheus grafana`:
+#   Prometheus: http://localhost:9090
+#   Grafana:    http://localhost:3000  (admin / admin123, anonymous Viewer enabled)
+#   Dashboard:  "Ticket Deal" folder → "Ticket Deal — Overview"
+```
+
+All Go services expose `/metrics` (Prometheus format) on their own ports:
+- API: `:8080/metrics` (chi router)
+- Worker: `:8081/metrics` (dedicated tiny HTTP server, set `METRICS_ADDR` to change)
+- Expiration-watcher: `:8083/metrics` (set `METRICS_ADDR` to change)
+
+Prometheus scrapes via `host.docker.internal` — the Go services run on the host, not in Docker.
+
+**Most important metric:** `reservations_oversold_total` — should ALWAYS be 0. Alert if > 0.
 
 ### Code Quality
 
@@ -128,8 +151,8 @@ make purge        # clean + docker compose down (keeps volumes)
 │   ├── dashboard.html         # Live dashboard (open in browser)
 │   ├── reset-state.sh         # Reset Redis + Postgres to clean state
 │   ├── mint-jwts.sh           # Mint N JWTs to /tmp/k6_jwts.txt
-│   ├── run-burst.sh           # Run burst with timestamped log → logs/burst/
-│   └── run-ramp.sh            # Run ramp with timestamped log → logs/ramp/
+│   ├── run-burst.sh           # Run burst — auto-resets state + mints JWTs; timestamped log → logs/burst/
+│   └── run-ramp.sh            # Run ramp — auto-resets state + mints JWTs; timestamped log → logs/ramp/
 ├── scripts/
 │   ├── start-bg.sh            # Generic background process starter (pid + log)
 │   ├── stop-bg.sh             # Generic background process stopper (pid-based)
@@ -144,6 +167,14 @@ make purge        # clean + docker compose down (keeps volumes)
 │   ├── worker.log
 │   ├── burst/                 # Timestamped burst logs
 │   └── ramp/                  # Timestamped ramp logs
+├── monitoring/                # Prometheus + Grafana configs (mounted into Docker)
+│   ├── prometheus.yml         # scrape config (api, worker, watcher targets)
+│   └── grafana/
+│       ├── provisioning/      # auto-provisioned datasource + dashboard config
+│       │   ├── datasources/datasource.yml
+│       │   └── dashboards/dashboards.yml
+│       └── dashboards/
+│           └── ticket-deal-overview.json    # "Ticket Deal — Overview" dashboard
 ├── migrations/
 │   ├── 001_init.sql           # Reservations + seats schema
 │   ├── 002_seed.sql           # Seed data

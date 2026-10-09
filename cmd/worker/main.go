@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -53,6 +54,7 @@ import (
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
+	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
@@ -115,10 +117,40 @@ func run() error {
 	// propagate — losing the sweep doesn't kill SQS consumption,
 	// and the watcher (separate binary) covers the 99% case.
 	go func() {
-		if err := expire.RunSweep(ctx, pool, rdb, cfg.SweepInterval); err != nil &&
+		if err := expire.RunSweep(ctx, pool, rdb, "worker", cfg.SweepInterval); err != nil &&
 			!errors.Is(err, context.Canceled) {
 			log.Printf("worker: sweep exited with error: %v", err)
 		}
+	}()
+
+	// ── Metrics HTTP server (Prometheus scrape target) ────────────
+	//
+	// The worker is primarily an SQS consumer (no inbound HTTP), but
+	// we still need /metrics for Prometheus. Spin up a tiny dedicated
+	// server on cfg.MetricsAddr (default :8081) just for that.
+	metricsAddr := getEnv("METRICS_ADDR", ":8081")
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler())
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	metricsSrv := &http.Server{
+		Addr:              metricsAddr,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Printf("worker: metrics server listening on %s", metricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			log.Printf("worker: metrics server error: %v", err)
+		}
+	}()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shutCtx)
 	}()
 
 	// ── Worker loop ─────────────────────────────────────────────
@@ -155,15 +187,22 @@ func handleMessage(ctx context.Context, pool *db.Pool, raw []byte) error {
 		// Bad JSON can't be fixed by retrying. Log loud and bail
 		// (returning nil so the message gets deleted — otherwise we
 		// loop forever on the same broken message).
+		metrics.WorkerMessagesProcessed.WithLabelValues("malformed").Inc()
 		log.Printf("worker: malformed message (deleting) body=%q: %v", truncate(raw, 256), err)
 		return nil
 	}
 
+	dbStart := time.Now()
 	if err := db.InsertIfAbsent(ctx, pool, r); err != nil {
 		// Transient DB errors (connection lost, deadlock, etc.) are
 		// retried via SQS redelivery. We just log and return the error.
+		metrics.WorkerMessagesProcessed.WithLabelValues("error").Inc()
+		metrics.WorkerDBWrites.WithLabelValues("error").Inc()
 		return fmt.Errorf("insert reservation %s: %w", r.ReservationID, err)
 	}
+	metrics.WorkerDBWriteDuration.Observe(time.Since(dbStart).Seconds())
+	metrics.WorkerDBWrites.WithLabelValues("ok").Inc()
+	metrics.WorkerMessagesProcessed.WithLabelValues("ok").Inc()
 
 	log.Printf("worker: inserted reservation_id=%s user=%s event=%d seats=%d",
 		r.ReservationID, r.UserID, r.EventID, r.Seats)
