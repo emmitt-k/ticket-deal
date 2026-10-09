@@ -232,7 +232,7 @@ make stop-loadtest && make loadtest-burst
 make stop
 ```
 
-**Expected output** (printed by k6 and written to `logs/k6-*.log`):
+**Expected output** (printed by k6 and written to `logs/burst/TS-burst.log` or `logs/ramp/TS-ramp.log`):
 
 ```
 ─────────────── LOAD TEST RESULTS ───────────────

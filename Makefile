@@ -145,7 +145,7 @@ loadtest-jwts: ## Pre-mint N unique JWTs (VUS=1000)
 # k6 is run in the BACKGROUND (with --linger) so the Make target returns
 # immediately and the dashboard at http://localhost:8082/ stays populated
 # with the final state for inspection. Use `make stop-loadtest` to free
-# the port before re-running, or `tail -f logs/k6-burst.log` to follow.
+# the port before re-running, or `tail -f logs/burst/TS-burst.log` to follow.
 
 loadtest-burst: ## Run 1000-VU burst in background (~1s, dashboard stays populated)
 	@if ! curl -sf -m 2 http://localhost:8080/healthz >/dev/null 2>&1; then \
@@ -158,10 +158,9 @@ loadtest-burst: ## Run 1000-VU burst in background (~1s, dashboard stays populat
 	fi
 	./loadtest/reset-state.sh
 	./loadtest/mint-jwts.sh $(VUS)
-	@./scripts/start-bg.sh k6-burst k6 run --address $(K6_REST_ADDR) --linger loadtest/burst.js
+	@./loadtest/run-burst.sh
 	@echo ""
-	@echo "→ burst complete; k6 REST API still up so the dashboard stays live"
-	@echo "→ open http://localhost:8082/  ·  tail: tail -f logs/k6-burst.log"
+	@echo "→ burst running; dashboard at http://localhost:8082/"
 	@echo "→ to re-run: make stop-loadtest && make loadtest-burst"
 
 loadtest-ramp: ## Run 7-stage ramp in background (~90s, dashboard tracks VU curve)
@@ -175,10 +174,9 @@ loadtest-ramp: ## Run 7-stage ramp in background (~90s, dashboard tracks VU curv
 	fi
 	./loadtest/reset-state.sh
 	./loadtest/mint-jwts.sh $(VUS)
-	@./scripts/start-bg.sh k6-ramp k6 run --address $(K6_REST_ADDR) --linger loadtest/ramp.js
+	@./loadtest/run-ramp.sh
 	@echo ""
-	@echo "→ ramp running (~90s); dashboard tracks the VU curve in real time"
-	@echo "→ open http://localhost:8082/  ·  tail: tail -f logs/k6-ramp.log"
+	@echo "→ ramp running (~90s); dashboard at http://localhost:8082/"
 	@echo "→ to free the port: make stop-loadtest"
 
 stop-loadtest: ## Stop any background k6 (burst or ramp)
