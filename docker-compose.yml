@@ -146,6 +146,47 @@ services:
       - jaeger-data:/badger
     restart: unless-stopped
 
+  # ─── Log aggregation (Loki) ─────────────────────────────────
+  #
+  # Stores the Go service logs (slog → os.Stdout → logs/*.log on the
+  # host → Promtail → here) and serves them via the Loki HTTP API.
+  # Grafana queries Loki as a second datasource alongside Prometheus.
+  #
+  # Filesystem backend: zero extra services, but doesn't scale past
+  # one box. Swap to S3/GCS + replication_factor=3 for prod.
+  loki:
+    image: grafana/loki:3.3.0
+    container_name: ticket-loki
+    ports:
+      - "3100:3100"     # Loki HTTP API (push + query)
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+
+  # ─── Log shipper (Promtail) ─────────────────────────────────
+  #
+  # Tails the Go service log files written by `make all-services` and
+  # ships them to Loki with `service` + `trace_id` + `level` labels
+  # extracted via regex pipeline stages.
+  #
+  # The bind mount `./logs:/var/log/ticket-deal:ro` reads from the
+  # host's `logs/` dir (relative to this docker-compose.yml). Each
+  # `api.log`, `worker.log`, etc. becomes its own service label.
+  promtail:
+    image: grafana/promtail:3.3.0
+    container_name: ticket-promtail
+    ports:
+      - "9080:9080"     # Promtail's own /metrics (not directly used yet)
+    volumes:
+      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - ./logs:/var/log/ticket-deal:ro   # host's logs/ dir, read-only
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    restart: unless-stopped
+
 # Named volumes so data survives `docker compose down`
 volumes:
   redis-data:
@@ -153,3 +194,4 @@ volumes:
   prometheus-data:
   grafana-data:
   jaeger-data:
+  loki-data:
