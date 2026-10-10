@@ -44,10 +44,10 @@
         "label": "Service",
         "type": "query",
         "datasource": {"type": "loki", "uid": "Loki"},
-        "query": "label_values(service)",
+        "query": "label_values(service_name)",
         "refresh": 2,
         "includeAll": true,
-        "allValue": ".*",
+        "allValue": ".+",
         "multi": true,
         "current": {"text": "All", "value": "$__all"}
       },
@@ -55,13 +55,14 @@
         "name": "level",
         "label": "Min Level",
         "type": "custom",
+        "description": "Uses Promtail's auto-detected level (lowercase). All = .+ (must match at least 1 char — Loki 3.x rejects .* when both matchers are empty-compatible).",
         "options": [
-          {"text": "All", "value": "", "selected": true},
-          {"text": "INFO+", "value": "INFO|WARN|ERROR"},
-          {"text": "WARN+", "value": "WARN|ERROR"},
-          {"text": "ERROR", "value": "ERROR"}
+          {"text": "All", "value": ".+", "selected": true},
+          {"text": "INFO+", "value": "info|warn|error"},
+          {"text": "WARN+", "value": "warn|error"},
+          {"text": "ERROR", "value": "error"}
         ],
-        "current": {"text": "All", "value": ""},
+        "current": {"text": "All", "value": ".+"},
         "includeAll": false
       },
       {
@@ -109,9 +110,9 @@
       "gridPos": {"h": 6, "w": 12, "x": 0, "y": 2},
       "targets": [
         {
-          "expr": "sum by (service) (rate({service=~\"$service\"} | level=~\"$level\"[1m]))",
+          "expr": "sum by (service_name) (rate({service_name=~\"$service\"} | detected_level=~\"$level\"[1m]))",
           "refId": "A",
-          "legendFormat": "{{service}}"
+          "legendFormat": "{{service_name}}"
         }
       ],
       "fieldConfig": {
@@ -141,9 +142,9 @@
       "gridPos": {"h": 6, "w": 12, "x": 12, "y": 2},
       "targets": [
         {
-          "expr": "sum by (level) (rate({service=~\"$service\"}[1m]))",
+          "expr": "sum by (detected_level) (rate({service_name=~\"$service\"}[1m]))",
           "refId": "A",
-          "legendFormat": "{{level}}"
+          "legendFormat": "{{detected_level}}"
         }
       ],
       "fieldConfig": {
@@ -165,13 +166,13 @@
     {
       "id": 4,
       "title": "Live Log Stream",
-      "subtitle": "service = $service · level ≥ ${level:raw} · trace_id filter active when set",
+      "subtitle": "service = $service · detected_level ≥ ${level:raw} · trace_id filter active when set",
       "type": "logs",
       "datasource": {"type": "loki", "uid": "Loki"},
       "gridPos": {"h": 18, "w": 24, "x": 0, "y": 8},
       "targets": [
         {
-          "expr": "{service=~\"$service\"} | level=~\"$level\" |= \"${trace_id:raw}\" |= \"${search:raw}\"",
+          "expr": "{service_name=~\"$service\"} | detected_level=~\"$level\" |= \"${trace_id:raw}\" |= \"${search:raw}\"",
           "refId": "A",
           "queryType": "range"
         }

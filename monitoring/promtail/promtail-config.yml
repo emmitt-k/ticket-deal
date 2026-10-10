@@ -73,24 +73,15 @@ scrape_configs:
           service_name: dashboard-server
           __path__: /var/log/ticket-deal/dashboard-server.log
 
-    # Line-level pipeline: extract `level` from the body. Both text
-    # and json formats are supported. Each match block runs on every
-    # line and only sets the label if the regex matches.
-    pipeline_stages:
-      - match:
-          selector: '{job="ticket-deal"}'
-          stages:
-            # text format: level=ERROR
-            - regex:
-                expression: '(?:^|\s)level=(?P<lvl>DEBUG|INFO|WARN|ERROR)\b'
-            - labels:
-                level:
-
-      - match:
-          selector: '{job="ticket-deal"}'
-          stages:
-            # json format: "level":"ERROR"
-            - regex:
-                expression: '"level"\s*:\s*"(?P<lvl>DEBUG|INFO|WARN|ERROR)"'
-            - labels:
-                level:
+    # Line-level pipeline: nothing custom — Promtail's built-in
+    # `detected_level` label (lowercase) already classifies each line
+    # as debug/info/warn/error from the line body. We tried to set our
+    # own `level` label, but the `labels:` stage in Promtail 3.x with
+    # an empty value silently sets the label to "" (which Loki drops),
+    # and the `{{.lvl}}` template syntax for capture groups is finicky
+    # to get right. Using `detected_level` works out of the box and
+    # keeps the config simple.
+    #
+    # The "Ticket Deal — Logs" dashboard references `detected_level`
+    # directly (lowercase: info/warn/error/debug).
+    pipeline_stages: []
