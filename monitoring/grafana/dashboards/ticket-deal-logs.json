@@ -1,0 +1,191 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Searchable view of the Go service logs (api, worker, expiration-watcher, dashboard-server). Use the service + level dropdowns to narrow scope, or paste a trace_id from Jaeger to see all log lines for one request across services. trace_id is searched via line-content match (|=) — Loki labels only hold low-cardinality dimensions (service, level).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Open in Jaeger",
+      "url": "http://localhost:16686",
+      "type": "link",
+      "icon": "external link",
+      "tooltip": "Distributed tracing UI (separate window)"
+    },
+    {
+      "title": "Open in Prometheus",
+      "url": "http://localhost:9090",
+      "type": "link",
+      "icon": "external link",
+      "tooltip": "Metrics UI"
+    }
+  ],
+  "liveNow": true,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["ticket-deal", "logs"],
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {"type": "loki", "uid": "Loki"},
+        "query": "label_values(service)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      },
+      {
+        "name": "level",
+        "label": "Min Level",
+        "type": "custom",
+        "options": [
+          {"text": "All", "value": "", "selected": true},
+          {"text": "INFO+", "value": "INFO|WARN|ERROR"},
+          {"text": "WARN+", "value": "WARN|ERROR"},
+          {"text": "ERROR", "value": "ERROR"}
+        ],
+        "current": {"text": "All", "value": ""},
+        "includeAll": false
+      },
+      {
+        "name": "trace_id",
+        "label": "trace_id",
+        "type": "textbox",
+        "description": "Paste a 32-hex trace_id from Jaeger. Searched in the log body (|= \"trace_id=...\"), not as a label — high-cardinality would exhaust Loki's active-stream limit.",
+        "current": {"text": "", "value": ""}
+      },
+      {
+        "name": "search",
+        "label": "Body contains",
+        "type": "textbox",
+        "description": "Grep the log body (e.g. 'sold out', 'reservation_id')",
+        "current": {"text": "", "value": ""}
+      }
+    ]
+  },
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Ticket Deal — Logs",
+  "uid": "ticket-deal-logs",
+  "version": 1,
+  "weekStart": "",
+  "panels": [
+    {
+      "id": 1,
+      "title": "● LIVE",
+      "type": "text",
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 0},
+      "options": {
+        "mode": "markdown",
+        "content": "<div style=\"display:flex; align-items:center; gap:32px; font-family:ui-monospace,Menlo,monospace; font-size:14px; color:#9ca3af; letter-spacing:0.05em;\">\n  <span><span style=\"color:#22c55e; font-size:18px;\">●</span> <span style=\"color:#fff; font-weight:600;\">LIVE</span></span>\n  <span>SERVICE <span style=\"color:#fff;\">$service</span></span>\n  <span>LEVEL <span style=\"color:#fff;\">${level:raw}</span></span>\n  <span>TRACE <span style=\"color:#fff;\">${trace_id}</span></span>\n  <span>REFRESH <span style=\"color:#fff;\">5s</span></span>\n  <span style=\"margin-left:auto; color:#6b7280;\">Mini-Ticketmaster • ${__dashboard.title}</span>\n</div>",
+        "code": {"language": "plaintext", "showLineNumbers": false}
+      }
+    },
+    {
+      "id": 2,
+      "title": "Log Volume by Service (lines / sec)",
+      "subtitle": "Past 5 min",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 2},
+      "targets": [
+        {
+          "expr": "sum by (service) (rate({service=~\"$service\"} | level=~\"$level\"[1m]))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {"mode": "palette-classic"}
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 3,
+      "title": "Log Mix by Level (last 15m)",
+      "subtitle": "Stacked, by service",
+      "type": "timeseries",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 2},
+      "targets": [
+        {
+          "expr": "sum by (level) (rate({service=~\"$service\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "{{level}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "stacking": {"mode": "normal", "group": "A"},
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 4,
+      "title": "Live Log Stream",
+      "subtitle": "service = $service · level ≥ ${level:raw} · trace_id filter active when set",
+      "type": "logs",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 18, "w": 24, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "{service=~\"$service\"} | level=~\"$level\" |= \"${trace_id:raw}\" |= \"${search:raw}\"",
+          "refId": "A",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
+    }
+  ]
+}

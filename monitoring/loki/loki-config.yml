@@ -1,0 +1,98 @@
+# Grafana Loki configuration for the ticket-deal local dev stack.
+#
+# Production note: this config is intentionally minimal (filesystem
+# backend, single replica, no auth, no schema enforcement) because it
+# runs inside our private docker-compose network. For a real cluster
+# you'd want:
+#   - S3/GCS/Azure backend (filesystem doesn't scale)
+#   - `auth_enabled: true` with a reverse proxy in front
+#   - `replication_factor: 3` for the chunks/ingester rings
+#   - Compactor + boltdb-shipper or tsdb store
+# See https://grafana.com/docs/loki/latest/configuration/
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  log_level: info
+
+# Common storage path. Loki uses one backend per "schema" (rules,
+# chunks, index). We point all three at the filesystem backend, which
+# in this single-replica dev setup is just a directory.
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+# Ruler is disabled for dev. It evaluates recording/alerting rules
+# against incoming logs. Useful for "alert me if error count > N" but
+# out of scope for the first pass.
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-tmp
+  alertmanager_url: http://alertmanager:9093  # not running; alerts are no-ops
+  enable_api: false
+
+# Schema config: how log data is partitioned and retained. Two schemas
+# needed because Loki requires at least v10 + v11 co-exists for upgrade
+# scenarios, but we can collapse to just v13 for a fresh single-replica.
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Storage used to back the index. The "tsdb" mode is the current default
+# (single index file per period instead of per-tenant per-day boltdb).
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index
+    cache_location: /loki/tsdb-cache
+  filesystem:
+    directory: /loki/chunks
+
+# Where the compactor stores its working files. Same volume as chunks;
+# in a real cluster this would be S3.
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: false  # dev only; turn on for prod
+
+# Limits: tune for dev. Defaults are fine; explicitly setting a few
+# that we expect to bump up against.
+limits_config:
+  retention_period: 168h   # 7 days (matches Prometheus retention)
+  ingestion_rate_mb: 32    # 32 MB/s global ingest; plenty for 3 services
+  ingestion_burst_size_mb: 48
+  # Per-stream rate limit: 3 MB/s (default) is too low for sustained
+  # load tests. Bump to 16 MB/s so a single 90s ramp test doesn't
+  # trip the limit. We still have one stream per service.
+  per_stream_rate_limit: 16MB
+  per_stream_rate_limit_burst: 32MB
+  max_entries_limit_per_query: 5000
+  max_query_series: 500
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  allow_structured_metadata: true
+
+# Frontend (query path) settings. Default worker count is 4; in dev
+# that's enough.
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
