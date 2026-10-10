@@ -211,6 +211,59 @@ Same line in JSON format (`LOG_FORMAT=json`):
 {"time":"2026-10-09T15:00:00.000-07:00","level":"INFO","msg":"reservation inserted","service":"worker","service_version":"dev","reservation_id":"6880e7fa-...","user":"k6user-31","event":1,"seats":1,"trace_id":"fac1f09d...","span_id":"71bebc50..."}
 ```
 
+#### Logs (Grafana Loki + Promtail)
+
+```bash
+# After `make all-services` + `docker compose up -d loki promtail`:
+#   Loki HTTP API:  http://localhost:3100
+#   Promtail:       http://localhost:9080  (its own /metrics, rarely used directly)
+#   Grafana:        http://localhost:3000  → "Ticket Deal" folder → "Ticket Deal — Logs"
+```
+
+**Architecture:**
+```
+Go services (host) → logs/*.log → Promtail (in docker) → Loki (in docker) → Grafana
+```
+
+The Go services write to `logs/<service>.log` on the host (via `nohup` from
+`scripts/start-bg.sh`). Promtail runs in a container, bind-mounts the host's
+`logs/` directory, tails the files, parses `service` (from filename) +
+`trace_id` (from line body, both text and json formats) as Loki labels, and
+pushes them as streams. Loki stores them on disk (`loki-data` volume).
+
+**Config files:**
+- `monitoring/loki/loki-config.yml` — filesystem backend, single replica, 7-day retention
+- `monitoring/promtail/promtail-config.yml` — scrape job + regex pipeline stages
+
+**Useful Loki queries (LogQL, used in Grafana → Explore):**
+```logql
+# Everything from the API
+{service="api"}
+
+# Errors only, across all services
+{service=~".+"} | level="ERROR"
+
+# All log lines for one specific request (paste trace_id from Jaeger)
+{service=~"api|worker"} |~ "fac1f09d12ab34cd56ef78ab90cd1234"
+
+# Sold-out events from the last 5m
+{service="api"} |~ "sold_out" [5m]
+```
+
+**Trace → Logs workflow (the killer combo):**
+1. Spot a slow trace in Jaeger → grab the `trace_id` (32-hex)
+2. Open Grafana → "Ticket Deal — Logs" dashboard → paste it into the `trace_id` field
+3. See every log line for that request across api/worker/watcher, all timestamped and ordered
+
+The reverse (log → trace) is also wired up: the Loki datasource in
+`monitoring/grafana/provisioning/datasources/datasource.yml` has a
+`derivedField` that makes `trace_id` values in log lines clickable, jumping
+to the matching Jaeger trace.
+
+**No Go code changes were needed to add Loki** — it's a pure infra add. The
+slog `ContextHandler` already injects `trace_id` into every log line, and
+Promtail's regex stages extract it as a label.
+
 ### Code Quality
 
 ```bash

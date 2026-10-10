@@ -308,10 +308,13 @@ changes are mechanical (`log.Printf` → `slog.Info` with the same args).
 
 ## Future work (not in this PR)
 
-- **Grafana Loki + Promtail** — JSON logs make this trivial to add as a
-  follow-up. Single `docker-compose.yml` block, Promtail tails
-  `logs/*.log` and ships to Loki. Grafana gets a third data source in the
-  same UI as Prometheus and Jaeger.
+- ✅ **Grafana Loki + Promtail** — shipped on `feature/loki` (commit
+  to follow). Adds 2 docker services (Loki + Promtail), bind-mounts
+  `logs/` so Promtail tails the Go service log files, auto-provisions
+  Loki as a Grafana datasource, and ships a "Ticket Deal — Logs"
+  dashboard. `trace_id` is extracted as a Loki label via regex, so
+  copy-pasting a trace_id from Jaeger filters logs to that one request
+  across all services. No Go code changes were required.
 - **Log-based alerts in Grafana** — `count_over_time({service="api"}
   |~ "level=ERROR" [5m])` → alert on error-rate spikes.
 - **OTel-native logs** — OTel has its own logs signal. Switching to it
