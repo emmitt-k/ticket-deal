@@ -73,7 +73,22 @@ type Config struct {
 // log without trace correlation — still structured, still useful.
 func Init(cfg Config) *slog.Logger {
 	if cfg.Output == nil {
-		cfg.Output = os.Stdout
+		// LOG_FILE lets a binary write logs directly to a file (used by
+		// the dockerised services — ./logs/<svc>.log bind-mounted into
+		// the container, so Promtail can ship them without going via
+		// docker logs). When unset, fall back to stdout (12-factor;
+		// captured to logs/<svc>.log by scripts/start-bg.sh on host).
+		if path := strings.TrimSpace(os.Getenv("LOG_FILE")); path != "" {
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "logging: LOG_FILE=%s open failed (%v); falling back to stdout\n", path, err)
+				cfg.Output = os.Stdout
+			} else {
+				cfg.Output = f
+			}
+		} else {
+			cfg.Output = os.Stdout
+		}
 	}
 	if cfg.Service == "" {
 		cfg.Service = envOr("SERVICE_NAME", "unknown")

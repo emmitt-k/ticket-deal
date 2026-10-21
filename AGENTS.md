@@ -228,6 +228,11 @@ Conventions:
 
 Env vars:
 - `LOG_LEVEL` (default `info`) — debug/info/warn/error
+- `LOG_FILE` (default empty) — if set, the logger writes to this path
+  instead of stdout. Used by the dockerised Go services so they can
+  write directly into the bind-mounted `./logs/<svc>.log` (Promtail then
+  ships those files to Loki). On host mode, leave unset — `start-bg.sh`
+  redirects stdout to `logs/<svc>.log` instead.
 - `LOG_FORMAT` (default `text`) — text (dev) / json (prod, Loki-ready)
 - `SERVICE_VERSION` (default `dev`) — set by build via `-ldflags` in CI
 
