@@ -66,9 +66,9 @@ The three phases, in one line each:
 | 6   | SQS & Worker                | ✅ Done      | `internal/queue` (publisher + consumer + Reservation wire type), `internal/db` (pgx pool + InsertIfAbsent), `cmd/worker` consumer binary; `SQSPublisher` wired into API; at-least-once + idempotent INSERT; 16 tests |
 | 7   | Expiration handling         | ✅ Done      | `internal/expire` (Compensate + RunWatcher + RunSweep), `cmd/expiration-watcher` (PSUBSCRIBE `__keyevent@0__:expired`), sweep goroutine inside `cmd/worker`; watcher fires real-time, sweep is the safety net; both converge on a single CAS UPDATE so only one INCRBY happens per (user, event); 20 tests (incl. 50-goroutine race, multi-seat, idempotent) |
 | 8   | Load test + invariants      | ✅ Done      | `loadtest/burst.js` (1000 VUs, 1 iter — pure shock) + `loadtest/ramp.js` (7-stage 0→50→200→1000 VUs, ~90s); live dashboard on http://localhost:8082 (polls k6 REST); 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
-| 9   | Polish                      | ✅ Done      | `Makefile` (30+ targets, `make help`), `scripts/start-bg.sh` + `stop-bg.sh` (idempotent PID-tracked bg), `make status` shows live container + service + DB/Redis state; all commands now one-liners |
+| 9   | Polish                      | ✅ Done      | `Makefile` (30+ targets, `make help`); all services (infra + the 4 long-running Go services) brought up by one `docker compose --env-file .env.docker up -d`; legacy host-mode `make all-services` kept for fast `go run` iteration; structured logging + Loki/Promtail log shipping; 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
 
-> Full phased plan with file layout, code snippets, verification steps, and the lite-auth design → [`/docs/implementation-plan.md`](docs/implementation-plan.md)
+> Full phased plan with file layout, code snippets, verification steps, and the lite-auth design → [`/docs/architecture.md`](docs/architecture.md)
 
 ---
 
@@ -123,10 +123,18 @@ The three phases, in one line each:
 │   └── elasticmq.conf        # Pre-creates 'reservations' queue on boot (2-RTT cheaper than manual aws-cli)
 ├── loadtest/                 # k6 scripts (Phase 8)
 ├── docs/
-│   ├── architecture.md       # System design + diagrams + failure modes
-│   └── implementation-plan.md # Phased build plan
-├── docker-compose.yml        # Redis 7 + Postgres 16 + ElasticMQ, all with healthchecks
-├── .env.example              # Template — copy to .env (NEVER commit .env)
+│   ├── architecture.md            # System design + diagrams + failure modes
+│   ├── product-roadmap.md         # Where we are, what's next, build order
+│   ├── tracing-crashcourse.md     # Learn OpenTelemetry from scratch (background)
+│   ├── comprehensive-redis.md     # Lua atomicity, keyspace notifications
+│   └── comprehensive-go.md        # Go patterns used in this codebase
+├── docker-compose.yml        # Redis 7 + Postgres 16 + ElasticMQ + observability + the 4 Go services (api, worker, watcher, dashboard-server), all with healthchecks
+├── Dockerfile                # Multi-stage, distroless/static-debian12:nonroot; one file, parameterised by SERVICE build arg
+├── .dockerignore             # Keeps the build context tight (.git, logs, monitoring, etc.)
+├── scripts/
+│   └── setup-docker-env.sh   # One-time: creates .env.docker from .env.docker.example (reuses host .env JWT_SECRET)
+├── .env.example              # Template — copy to .env (NEVER commit .env) — host-mode run config
+├── .env.docker.example       # Template — copy to .env.docker (NEVER commit .env.docker) — dockerised run config
 ├── go.mod                    # module github.com/emmitt-k/ticket-deal
 └── README.md
 ```
@@ -138,38 +146,45 @@ The three phases, in one line each:
 ### Prerequisites
 
 ```bash
-brew install go libpq redis pgcli k6
-brew install --cask docker   # if you don't have Docker Desktop yet
+brew install k6
+brew install --cask docker   # Docker Desktop
+```
+
+That's it. The 4 long-running Go services are now Dockerised too — `docker compose up -d` brings up **everything** (infra + Go services + observability), no Go toolchain required for just running it.
+
+If you want to develop the Go services themselves (edit source, rebuild, etc.) you'll also need:
+
+```bash
+brew install go
 ```
 
 (`libpq` is keg-only on Apple Silicon — if `psql` isn't on PATH, run `brew link --force libpq`.)
 
 ### Run it
 
-The whole project is driven by `make`. Run `make help` for the full list; the common first-time flow:
+First-time setup (one-shot per clone):
 
 ```bash
-make doctor          # check prereqs (go, docker, k6, curl)
-make up              # start Redis + Postgres + ElasticMQ via docker compose
-make migrate         # apply all 3 SQL migrations in order
-make env             # copy .env.example → .env (edit JWT_SECRET if you want)
-make seed            # copy events.initial_inventory from Postgres → Redis
-make build           # build all 6 binaries into bin/
-make test-race       # prove 1k concurrent reservations → exactly N winners
+git clone <repo> ticket-deal && cd ticket-deal
+make doctor                            # check prereqs (docker, k6)
+./scripts/setup-docker-env.sh          # create .env.docker from .env.docker.example + your host .env's JWT_SECRET
+docker compose --env-file .env.docker up -d --build
 ```
 
-Then for the daily dev loop:
+That's every service running: redis, postgres, elasticmq, jaeger, prometheus, grafana, loki, promtail, **api, worker, expiration-watcher, dashboard-server**.
+
+Daily dev loop:
 
 ```bash
-# Run the system
-make all-services    # start api + worker + watcher in background (logs → logs/)
-make dashboard-bg    # start the k6 live dashboard on http://localhost:8082/
-open http://localhost:8082/      # watch load tests in real time
-make status          # see what is running + DB/Redis counts
-make logs            # tail all background logs
+# Run / inspect / restart / log
+docker compose --env-file .env.docker up -d                 # bring everything up
+docker compose --env-file .env.docker ps                    # what's up
+docker compose --env-file .env.docker logs -f api worker    # tail logs across services
+docker compose --env-file .env.docker restart api           # rebuild + restart one service
+docker compose --env-file .env.docker down                  # stop everything
 
 # Test it
-make all-services
+make env                                                    # create host-side .env from .env.example (for mintjwt + ad-hoc CLI)
 JWT=$(USER_ID=smoke-user EVENT_ID=1 make -s mintjwt)
 curl -sS -X POST http://localhost:8080/api/tickets/enter \
   -H "Content-Type: application/json" -d '{"user_id":"smoke-user","event_id":1}'
@@ -184,8 +199,21 @@ make loadtest-ramp   # 0→50→200→1000 VUs, ~90s — wave ramp (dashboard tr
 make status          # reserved=100, sold_out=1.8M, p(99)=62ms after the ramp
 
 # Stop everything
-make stop            # api/worker/watcher/dashboard
-make stop-loadtest   # any backgrounded k6 (burst or ramp)
+docker compose --env-file .env.docker down                  # infra + Go services
+make stop-loadtest                                           # any backgrounded k6 (burst or ramp)
+```
+
+#### Legacy: host-mode services (still works, not recommended)
+
+The old flow had Go services running on the host via `make all-services` and only infra in Docker. That still works if you want it (e.g. for rapid local iteration with `go run`), but the canonical flow is Docker compose. Both modes read the same `.env` — JWTs minted with `make mintjwt` verify against either the host or the dockerised API as long as the `JWT_SECRET` matches.
+
+```bash
+make up               # infra only (Redis + Postgres + ElasticMQ)
+make migrate          # apply migrations + seed if first run
+make build            # all 6 binaries into bin/
+make all-services     # api + worker + watcher in background on host
+make dashboard-bg     # dashboard-server in background on host
+make stop             # stop all 4
 ```
 
 ### What you should see
@@ -225,15 +253,15 @@ The shared live dashboard (`loadtest/dashboard.html` served by `cmd/dashboard-se
 **How to run** (commands are also in [Quick Start](#quick-start) above):
 
 ```bash
-make all-services dashboard-bg     # 1. start the system
-open http://localhost:8082/         # 2. open the live UI in your browser
-make loadtest-burst                # 3a. correctness shock — ~1s
+docker compose --env-file .env.docker up -d   # 1. start everything (system + observability)
+open http://localhost:8082/                    # 2. open the live UI in your browser
+make loadtest-burst                            # 3a. correctness shock — ~1s
 # or:
-make loadtest-ramp                 # 3b. wave ramp — ~90s, VU count climbs
+make loadtest-ramp                             # 3b. wave ramp — ~90s, VU count climbs
 # 4. (optional) re-run:
 make stop-loadtest && make loadtest-burst
 # 5. (cleanup)
-make stop
+docker compose --env-file .env.docker down
 ```
 
 **Expected output** (printed by k6 and written to `logs/burst/TS-burst.log` or `logs/ramp/TS-ramp.log`):
@@ -259,29 +287,24 @@ Tune the load: `make loadtest-burst VUS=500`, `make loadtest-ramp VUS=2000`. Tar
 Live metrics for every service, scrape-and-dashboard ready:
 
 ```bash
-# Bring up the stack (one-time)
-docker compose up -d prometheus grafana
-
-# Run your services (as usual)
-make all-services
+# Bring up everything (one-time, or for any dev session)
+docker compose --env-file .env.docker up -d
 
 # Open dashboards
 #   Prometheus:  http://localhost:9090
 #   Grafana:     http://localhost:3000   (admin / admin123)
 #   Dashboard:   "Ticket Deal" folder → "Ticket Deal — Overview"
-```
+```The dashboard shows request rate, p99 latency, reservation outcomes (held vs sold_out vs oversold), worker throughput, DB write latency, and expiration activity. The headline metric is **`reservations_oversold_total`** — should always be `0`. Alert if it ticks.
 
-The dashboard shows request rate, p99 latency, reservation outcomes (held vs sold_out vs oversold), worker throughput, DB write latency, and expiration activity. The headline metric is **`reservations_oversold_total`** — should always be `0`. Alert if it ticks.
-
-For the full metrics inventory and how to add a new one → [`/docs/observability-plan.md`](docs/observability-plan.md).
+For the full metrics inventory and how to add a new one → [`/docs/architecture.md`](docs/architecture.md) §Observability.
 
 ### Tracing (OpenTelemetry + Jaeger)
 
 End-to-end distributed traces, OTLP/gRPC → Jaeger:
 
 ```bash
-docker compose up -d jaeger
-make all-services
+# Bring up everything (one command)
+docker compose --env-file .env.docker up -d
 
 # Open Jaeger UI
 #   http://localhost:16686
@@ -303,18 +326,19 @@ POST  (otelhttp)                      [35ms]
 ```
 
 For the propagator details, manual span inventory, and SQS body-fallback
-rationale → [`/docs/tracing-plan.md`](docs/tracing-plan.md).
+rationale → [`/docs/tracing-crashcourse.md`](docs/tracing-crashcourse.md).
 
 ### Logging (`log/slog` + OTel correlation)
 
 Every long-running service emits **structured** logs, with the active OTel `trace_id` and `span_id` injected on every line. No new dependencies — `log/slog` is stdlib since Go 1.21.
 
 ```bash
-# Default: human-readable text (great for `tail -f` while developing)
-LOG_FORMAT=text make all-services
+# Default: human-readable text (great for `docker logs -f` while developing)
+# LOG_FORMAT=text is set in .env.docker.example by default.
+docker compose --env-file .env.docker logs -f api
 
 # For Loki / Datadog / `jq`-fu, switch to JSON
-LOG_FORMAT=json LOG_LEVEL=info make all-services
+LOG_FORMAT=json LOG_LEVEL=info docker compose --env-file .env.docker up -d
 ```
 
 A reservation's worker log line in **text** format (with active OTel span):
@@ -339,12 +363,14 @@ Same line in **JSON** (`LOG_FORMAT=json`):
 
 The 30-LOC `logging.ContextHandler` is what makes this work — it pulls the OTel span from the request context and appends `trace_id` / `span_id` to every record. HTTP access logs (replacing `chi/middleware.Logger`) carry the same correlation.
 
-For the design rationale, env var matrix, and what we deliberately kept as `log.Printf` (one-shot CLIs) → [`/docs/logging-plan.md`](docs/logging-plan.md).
+For the design rationale, env var matrix, and what we deliberately kept as `log.Printf` (one-shot CLIs) → [`/docs/architecture.md`](docs/architecture.md) §Logging.
 
 ### Log search (Grafana Loki + Promtail)
 
 ```bash
-# After `make all-services` + `docker compose up -d loki promtail`:
+# Brought up automatically by `docker compose up -d`. To see them explicitly:
+docker compose --env-file .env.docker ps   # confirm loki + promtail are running
+
 #   Loki HTTP API:  http://localhost:3100
 #   Grafana:        http://localhost:3000  → "Ticket Deal" folder → "Ticket Deal — Logs"
 ```
@@ -352,10 +378,10 @@ For the design rationale, env var matrix, and what we deliberately kept as `log.
 **Architecture:**
 
 ```
-Go services (host) → logs/*.log → Promtail (in docker) → Loki (in docker) → Grafana
+Go services (in docker) ──bind mount ./logs──> logs/*.log (host) ──bind mount──> Promtail ──> Loki ──> Grafana
 ```
 
-The Go services write to `logs/<service>.log` on the host (via `nohup` from `scripts/start-bg.sh`). Promtail runs in a container, bind-mounts the host's `logs/` directory, tails the files, parses `service` (from filename) + `trace_id` (from line body, both text and json formats) as Loki labels, and pushes them as streams. Loki stores them on disk (`loki-data` volume).
+With everything in Docker, the Go services and Promtail share the host's `logs/` directory via two bind mounts (`./logs:/app/logs` on the Go services, `./logs:/var/log/ticket-deal:ro` on Promtail). Promtail parses `service` (from filename) + `trace_id` (from line body, both text and json formats) as Loki labels, and pushes them as streams. Loki stores them on disk (`loki-data` volume).
 
 **The killer combo — Trace → Logs:**
 
