@@ -43,6 +43,26 @@ type Config struct {
 	// events here; the worker (cmd/worker) consumes them. EndpointURL
 	// points at local ElasticMQ in dev, "" for prod (real SQS).
 	SQS SQSConfig
+
+	// Postgres is the database connection used by the API for
+	// reservation lookups (Layer 1, GET /api/reservations/:id +
+	// GET /api/me/reservations). Hot path (/reserve) does NOT
+	// touch Postgres — only Redis. The worker writes reservation
+	// rows into Postgres after SQS so the API's reads are at most
+	// a few hundred ms behind Redis (the system of record during
+	// sell-time).
+	Postgres PostgresConfig
+}
+
+// PostgresConfig is the subset of db.Config the API server needs to
+// dial Postgres. Mirrors the existing RedisConfig shape — small,
+// explicit, no surprises.
+type PostgresConfig struct {
+	// DSN is the full libpq connection string, e.g.
+	// "postgres://user:pass@host:5432/db?sslmode=disable".
+	// Composed from POSTGRES_* env vars in Load() if not set
+	// directly — prefer that path so prod can still inject a raw DSN.
+	DSN string
 }
 
 // SQSConfig groups the AWS-side knobs both the API publisher and the
@@ -127,6 +147,14 @@ func Load() (*Config, error) {
 			EndpointURL: getEnv("SQS_ENDPOINT_URL", ""),
 			QueueURL:    getEnv("SQS_QUEUE_URL", ""),
 		},
+		Postgres: PostgresConfig{
+			// Prefer an explicit DATABASE_URL if one is set — it can
+			// encode sslmode, IAM-based authentication, or anything
+			// else. Fall back to the POSTGRES_* family by composing
+			// a DSN. The fallback shape matches what .env.example
+			// documents.
+			DSN: getEnv("DATABASE_URL", buildPostgresDSNFromEnv()),
+		},
 	}
 
 	return cfg, nil
@@ -162,4 +190,22 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// buildPostgresDSNFromEnv composes a libpq-style DSN from the
+// POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_HOST / POSTGRES_PORT /
+// POSTGRES_DB env vars (each with a default). Used as the fallback
+// when DATABASE_URL isn't set — keeps the existing .env workflow
+// working for tools that use the part-by-part form.
+//
+// Output: "postgres://user:pass@host:port/db?sslmode=disable"
+// Empty parts fall back to safe defaults so a partially-set env
+// still produces a working DSN.
+func buildPostgresDSNFromEnv() string {
+	user := getEnv("POSTGRES_USER", "tickets")
+	pass := getEnv("POSTGRES_PASSWORD", "tickets")
+	host := getEnv("POSTGRES_HOST", "localhost")
+	port := getEnv("POSTGRES_PORT", "5432")
+	db := getEnv("POSTGRES_DB", "tickets")
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, pass, host, port, db)
 }
