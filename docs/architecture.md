@@ -1122,7 +1122,9 @@ The whole HTTP server bootstrap. **Order of init matters** (later depends on ear
 4. `metrics.Handler()` is mounted on `/metrics` (chi router).
 5. The chi router is wrapped in `otelhttp.NewHandler(router, "api")` — every HTTP request becomes a parent span automatically.
 6. `slogmw.NewSlogAccessLog()` replaces `chi/middleware.Logger` — every request gets an access log line with the OTel `trace_id` auto-injected by the `ContextHandler`.
-7. Mounts `/healthz` + `/api/tickets/{enter,queue,reserve}` (the reserve route is behind `auth.Middleware()`).
+7. Mounts `/healthz` + `/readyz` + the Prometheus `/metrics` endpoint + `/api/tickets/{enter,queue,reserve}` (reserve is behind `auth.Middleware()`).
+   - `/healthz` — process-alive only, returns 200 unconditionally (used by K8s livenessProbe).
+   - `/readyz` — deep dep checks (Redis ping, Postgres ping, SQS GetQueueAttributes). Three goroutines each with a 500ms per-check timeout, fan-in via buffered channel. Returns `200 + {ready:true,...}` if all checks are "ok" or "not_configured", `503 + {ready:false,...}` otherwise. Dev mode (no `SQS_QUEUE_URL` configured) reports sqs:"not_configured" and still counts as healthy.
 8. Layer 1 (product-roadmap.md): mounts three reservation routes under a new top-level `/api` group, all behind `auth.Middleware()`:
    - `GET /api/reservations/{id}` — returns the caller's reservation row by UUID (403 if it belongs to someone else, 404 if no row matches).
    - `GET /api/me/reservations` — caller's own list, newest first; query params `?status=` (optional filter), `?limit=` (default 20, max 100), `?offset=`. Returns a JSON array (possibly empty).
