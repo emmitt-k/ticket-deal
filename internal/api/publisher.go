@@ -27,8 +27,22 @@ import (
 //     Returning ctx.Err() early is acceptable; the handler logs and
 //     proceeds (the Redis hold is already created — the worker can
 //     be replayed from another instance).
+//   - Ping must honour the caller's context deadline. The /readyz
+//     handler (Layer 1 item 4) relies on this to distinguish a
+//     slow SQS from a dead one. See ReadyZHandler for the contract.
 type ReservationPublisher interface {
 	Publish(ctx context.Context, body []byte) error
+
+	// Ping is a bounded health-check used by the /readyz endpoint.
+	// Implementations must return ctx.Err() (or wrap it) when the
+	// caller's deadline elapses, so the handler can render
+	// "timeout after 500ms" instead of an opaque AWS error.
+	//
+	// LogPublisher.Ping returns nil (always healthy — no transport
+	// to probe). SQS-backed implementations should issue
+	// GetQueueAttributes against the bound queue URL — it verifies
+	// both the SQS service AND the queue-specific configuration.
+	Ping(ctx context.Context) error
 }
 
 // LogPublisher is the Phase 5 stub. It pretends to publish by writing
@@ -45,3 +59,9 @@ func (LogPublisher) Publish(ctx context.Context, body []byte) error {
 	slog.InfoContext(ctx, "stub SQS publish", "body", string(body))
 	return nil
 }
+
+// Ping returns nil because there's no transport to probe — LogPublisher
+// just writes to stdout. /readyz reflects this at the handler level
+// (sqs: "not_configured"), not the publisher level, so dev-mode
+// processes still report ready=true without a queue configured.
+func (LogPublisher) Ping(_ context.Context) error { return nil }
