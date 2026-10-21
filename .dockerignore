@@ -1,0 +1,55 @@
+# Build context for the Go service Dockerfile.
+# Keep this list tight — anything here is excluded from `docker build` so
+# it doesn't bloat the build context or end up in the final image.
+
+# ─── VCS (avoid embedding build metadata; Go refuses to if .git is here) ───
+.git
+.gitignore
+.gitattributes
+
+# ─── Local build artefacts (we only need source) ───
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ─── Runtime artefacts not needed at build time ───
+# logs/        written by the running services; mounted as volume, not copied
+# docs/        documentation, not source
+# monitoring/  used by compose-side services (prometheus, grafana, loki, promtail)
+# loadtest/    k6 scripts; mounted into dashboard-server at runtime, not baked in
+# scripts/     host-side helpers (start-bg.sh etc.), used by Makefile not services
+# migrations/  used by the one-shot seed tool, not by long-running services
+# docker/      compose-side configs (elasticmq.conf)
+logs/
+docs/
+monitoring/
+loadtest/
+scripts/
+migrations/
+docker/
+
+# ─── Editor / OS junk ───
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.AppleDouble
+.LSOverride
+
+# ─── Env files (NEVER bake secrets into an image) ───
+.env
+.env.*
+!.env.example
+
+# ─── README and docs at root ───
+README.md
+AGENTS.md
+
+# ─── Docker files (self-reference to keep the context small) ───
+Dockerfile
+.dockerignore
+docker-compose.yml
