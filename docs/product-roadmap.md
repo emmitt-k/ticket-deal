@@ -55,8 +55,8 @@ But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today*
 |---|---|---|
 | `PENDING_PAYMENT` | Worker `db.InsertIfAbsent` | `internal/db/reservations.go` |
 | `EXPIRED` | Watcher + sweep job | `internal/expire/compensate.go` |
-| `CONFIRMED` | **nothing** — defined but no path | ❌ no handler |
-| `CANCELLED` | **nothing** — defined but no path | ❌ no handler |
+| `CONFIRMED` | **nothing** — defined but no path | ❌ no handler (Layer 2, item 7 — Stripe webhook) |
+| `CANCELLED` | POST /api/reservations/{id}/cancel | `internal/api/cancel_reservation_handler.go` ✅ |
 
 This is the single biggest "code-defined-but-unwired" gap. Adding the missing
 transitions is Layer 1, item 1.
@@ -64,7 +64,6 @@ transitions is Layer 1, item 1.
 ### What's not there at all (not even a stub)
 
 - No payment integration — `CONFIRMED` is unreachable (see above)
-- No cancel endpoint — `CANCELLED` is unreachable
 - No webhook receiver — systems can't be told things changed
 - No notifications service — second consumer on the queue pattern
 - No admin/ops API — no way for support to look up / cancel / refund
@@ -124,7 +123,7 @@ Both require JWT auth. The second one is paginated (cursor or offset+limit; offs
 is fine for now). The `ReservationRow` JSON shape is the same thing the worker
 writes — define it in `internal/db/types.go` once and reuse.
 
-### 3. `POST /api/reservations/:id/cancel`
+### 3. `POST /api/reservations/:id/cancel` ✅ Done
 
 **Effort:** ~half a day. **Unlocks:** the most common user action in any ticketing
 system.
@@ -185,7 +184,7 @@ Stripe-grade. Real systems live and die by this.
 After this layer, the system has:
 - ✅ A real state machine users can drive  *(Layer 1 item 1 — done)*
 - ✅ Look-up their own tickets  *(Layer 1 item 2 — done)*
-- Cancel them
+- ✅ Cancel them  *(Layer 1 item 3 — done; branch `feature/cancel-reservation`)*
 - Network-retry safely
 - Tell ops "I'm healthy and all my deps are reachable"
 
