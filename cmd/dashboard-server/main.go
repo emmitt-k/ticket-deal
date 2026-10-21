@@ -20,14 +20,23 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+
+	"github.com/emmitt-k/ticket-deal/internal/logging"
 )
 
 func main() {
+	logging.Init(logging.Config{
+		Level:   logging.LevelFromEnv(),
+		Format:  logging.FormatFromEnv(),
+		Service: "dashboard-server",
+		Version: os.Getenv("SERVICE_VERSION"),
+	})
+
 	addr := flag.String("addr", envOr("DASHBOARD_ADDR", ":8082"), "address to listen on (e.g. :8082)")
 	k6URL := flag.String("k6", envOr("K6_REST_URL", "http://localhost:6565"), "k6 REST API base URL")
 	htmlPath := flag.String("html", envOr("DASHBOARD_HTML", "loadtest/dashboard.html"), "path to dashboard.html")
@@ -36,12 +45,15 @@ func main() {
 	// Load the HTML once at startup; log a clear error if it's missing.
 	html, err := os.ReadFile(*htmlPath)
 	if err != nil {
-		log.Fatalf("dashboard: cannot read %s: %v (run from the repo root, or set -html)", *htmlPath, err)
+		slog.Error("cannot read dashboard HTML (run from the repo root, or set -html)",
+			"path", *htmlPath, "error", err)
+		os.Exit(1)
 	}
 
 	target, err := url.Parse(*k6URL)
 	if err != nil {
-		log.Fatalf("dashboard: bad k6 URL %q: %v", *k6URL, err)
+		slog.Error("bad k6 URL", "url", *k6URL, "error", err)
+		os.Exit(1)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	// Inject a permissive Origin so the (proxied) k6 response is treated same-origin
@@ -70,8 +82,12 @@ func main() {
 		_, _ = w.Write(html)
 	})
 
-	log.Printf("dashboard: serving on http://localhost%s/  (k6 REST: %s, html: %s)", *addr, *k6URL, *htmlPath)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	slog.Info("dashboard serving",
+		"addr", *addr,
+		"k6_rest", *k6URL,
+		"html", *htmlPath,
+	)
+	slog.Error("dashboard server exited", "error", http.ListenAndServe(*addr, mux))
 }
 
 func envOr(key, def string) string {

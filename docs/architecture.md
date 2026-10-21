@@ -2,9 +2,18 @@
 
 > The full story behind Mini-Ticketmaster — what each piece does, why it exists, and what failure it prevents.
 
-This document complements the [README](../README.md). The README is the project landing page; this is the engineering manual. **§1–§12 explain the design**, **§13 is a per-file reference** for when you need to find or modify a specific file.
+This document complements the [README](../README.md). The README is the project landing page; this is the engineering manual. **§1–§14 explain the design**, **§15 is a per-file reference** for when you need to find or modify a specific file.
 
-**Code state reflected:** through Phase 9 (Makefile + polish). Phases 0–9 are landed; the whole project is driven by `make help`. The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) produces exactly 100 × 200 + 900 × 409 — see the [Load testing](../README.md#load-testing-k6--live-dashboard) section of the README.
+**Code state reflected:** through Phase 13 (4-pillar observability). Phases 0–9 (the core system) are landed and unchanged; Phases 10–13 layered on a complete observability stack split across 4 stacked feature branches:
+
+| Branch | Phase | What |
+|---|---|---|
+| `feature/observability` | 10 | Prometheus scrape + Grafana "Ticket Deal — Overview" dashboard |
+| `feature/tracing` | 11 | OTel SDK + Jaeger UI + SQS traceparent propagation (ElasticMQ body-fallback) |
+| `feature/logging` | 12 | `log/slog` migration + custom `ContextHandler` for trace_id/span_id correlation + clear-logs script |
+| `feature/loki` | 13 | Loki + Promtail + Grafana "Ticket Deal — Logs" dashboard (trace_id in label-derived log line → click → Jaeger) |
+
+The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) still produces exactly 100 × 200 + 900 × 409 — and now every one of those requests shows up in all three observability sinks, joined by `trace_id`. See §14 for the story.
 
 ---
 
@@ -22,7 +31,8 @@ This document complements the [README](../README.md). The README is the project 
 10. [Why SQS Standard (Not FIFO)](#10-why-sqs-standard-not-fifo)
 11. [Failure Modes & Mitigations](#11-failure-modes--mitigations)
 12. [Known Development Sharp Edges](#12-known-development-sharp-edges)
-13. [File-by-File Reference](#13-file-by-file-reference)
+13. [The Observability Pillar](#13-the-observability-pillar)
+14. [File-by-File Reference](#14-file-by-file-reference)
 
 ---
 
@@ -51,23 +61,48 @@ graph TB
         PG["PostgreSQL 16<br/>Source of truth"]
     end
 
+    subgraph Obs["Observability Pillar — see §14"]
+        Prom["Prometheus<br/>:9090 scrape"]
+        Grafana["Grafana<br/>:3000 dashboards"]
+        Jaeger["Jaeger<br/>:16686 traces"]
+        Loki["Loki<br/>:3100 log search"]
+        Promtail["Promtail<br/>tail + ship"]
+        Logs["logs/*.log<br/>(host)"]
+    end
+
     User -->|"HTTP"| API
     API <-->|"Lua: token / ZADD / ZRANK"| RR
     API <-->|"text/event-stream"| SSE
     SSE -->|"position / admitted"| User
     API <-->|"EVAL reserve.lua"| RI
-    API -->|"SendMessage"| SQS
-    SQS -->|"ReceiveMessage"| Worker
+    API -->|"SendMessage<br/>(+ traceparent)"| SQS
+    SQS -->|"ReceiveMessage<br/>(propagate ctx)"| Worker
     Worker -->|"INSERT ... ON CONFLICT<br/>RETURNING seats"| PG
     RI -.->|"hold key TTL expires"| Watcher
     Watcher -.->|"Compensate:<br/>UPDATE EXPIRED + INCRBY"| PG
     Watcher -.->|"INCR"| RI
     Worker -.->|"60s sweep:<br/>UPDATE EXPIRED + INCRBY"| PG
     Worker -.->|"INCR"| RI
+
+    API -.->|"/metrics"| Prom
+    Worker -.->|"/metrics"| Prom
+    Watcher -.->|"/metrics"| Prom
+    Prom --> Grafana
+
+    API -.->|"OTLP gRPC :4317"| Jaeger
+    Worker -.->|"OTLP gRPC :4317"| Jaeger
+    Watcher -.->|"OTLP gRPC :4317"| Jaeger
+
+    API -.->|"slog (stdout → file)"| Logs
+    Worker -.->|"slog (stdout → file)"| Logs
+    Watcher -.->|"slog (stdout → file)"| Logs
+    Logs -.->|"tail"| Promtail
+    Promtail -->|"push"| Loki
+    Loki --> Grafana
+    Grafana -.->|"trace_id click → Jaeger"| Jaeger
 ```
 
 **Four latency tiers, each with its own SLA:**
-
 
 | Tier      | Components                 | Target          | Why                                                    |
 | ----------- | ---------------------------- | ----------------- | -------------------------------------------------------- |
@@ -77,6 +112,8 @@ graph TB
 | **Cold**  | Worker → Postgres (sweep) | every 60 s      | Safety net for missed keyspace events                  |
 
 The cardinal rule: **Postgres never touches the hot path.** This is the design constraint that shapes every decision below.
+
+The observability layer is **a side-channel, not part of the request path.** The hot path is unchanged — every observability wire on the right is sampled/buffered locally and shipped to a side system. A failure in Promtail, Loki, or even the whole Jaeger OTLP exporter does not affect a single user request. (See §14.6 for the "trace_id is the join key" story that makes all three sinks queryable as one.)
 
 ---
 
@@ -673,6 +710,11 @@ graph TB
 | 12 | Orphan hold key (no DB row)          | Seat stuck held forever               | Logged by`Compensate`; operator must manually INCR inventory (see §9 caveat)                                                  |
 | 13 | INCRBY fails after DB EXPIRED flip   | DB says released, Redis says sold     | `Compensate` logs `WARN`; sweep won't re-process (status is EXPIRED). Operator alerting required.                              |
 | 14 | AWS SDK initialized with empty creds | SQS client fails on first SendMessage | `internal/queue/aws.go` injects dummy `local/local` creds when `SQS_ENDPOINT_URL` is non-empty. **Local dev only** — see §12 |
+| 15 | Prometheus down | Dashboards stop refreshing; no alerts fire | Hot path is unaffected (Prometheus scrapes are pull-based, timeouts only). Once Prometheus is back, `/metrics` re-scrapes; counters resume from current values (Prometheus computes `rate()` correctly across the gap). |
+| 16 | Jaeger / OTLP collector down | Spans buffered in-memory are dropped on shutdown | `tracing.Init` returns a shutdown func; main calls it on `SIGTERM`. If the OTLP endpoint is unreachable, spans are *not* retried — they're dropped (acceptable: next request will be traced). Lower `OTEL_TRACES_SAMPLER_ARG` in prod so a transient gap isn't a big loss. |
+| 17 | Promtail / Loki down | Logs still write to `logs/<service>.log`; only Grafana search breaks | Local file buffer is durable. Run `make clear-logs` to inspect offline. Promtail resumes shipping from the last read offset when it restarts (it does NOT replay missed lines from earlier). |
+| 18 | `trace_id` made a Loki label | Loki starts 429-ing after ~5k unique values | The label cardinality rule (§13.5): only `service_name` and `detected_level` are labels. `trace_id` is a body field, queried via LogQL `\|= "<id>"`. If you ever see `429` from Loki, suspect a new label. |
+| 19 | `make build` not used; raw `go build ./cmd/...` | Stray binaries (`./api`, `./worker`, …) in repo root | Use `make build` (or `go build -o bin/<name> ./cmd/<name>`). The Makefile rule enforces `-o`; raw `go build` doesn't. See AGENTS.md §Important Conventions #8. |
 
 ---
 
@@ -743,7 +785,227 @@ If you ever bump the per-process connection count above the Redis server's `maxc
 
 ---
 
-## 13. File-by-File Reference
+## 13. The Observability Pillar
+
+> **Why this section exists:** Phases 10–13 added a complete 4-pillar observability stack on top of the core system. The hot path is unchanged — every observability wire below is **a side-channel** that samples/buffers locally and ships to a side system. A failure in any observability sink does not affect a single user request.
+
+### 13.1 Why observability, why now
+
+The core system (§§1–10) is correct on paper but **blind at runtime**. The burst test can show "100 reserved, 900 sold_out" — but a real production system needs to answer:
+
+| Question | Pillar that answers it |
+|---|---|
+| "How many reservations/sec right now? Is p(99) climbing?" | **Metrics** |
+| "Why was *this one* request slow? Where did the time go?" | **Traces** |
+| "What code path did this trace hit? What was the error message?" | **Logs** |
+| "Is this anomaly real, or a transient blip?" | **All three**, joined by `trace_id` |
+
+A single pillar gives one of these answers. **All four, joined by `trace_id`, give you the others for free** (§13.6). This is the design.
+
+### 13.2 The four pillars at a glance
+
+```mermaid
+graph LR
+    subgraph P1["Pillar 1 — Metrics (what's the number?)"]
+        M1["Prometheus<br/>numeric time series"]
+        M2["Grafana<br/>'Ticket Deal — Overview'<br/>7 panels"]
+    end
+    subgraph P2["Pillar 2 — Traces (where did the time go?)"]
+        T1["OTel SDK<br/>auto + manual spans"]
+        T2["Jaeger UI<br/>waterfall view"]
+    end
+    subgraph P3["Pillar 3 — Logs (what happened, in detail?)"]
+        L1["log/slog + ContextHandler<br/>trace_id auto-injected"]
+        L2["Loki + Promtail<br/>label-indexed log search"]
+        L3["Grafana<br/>'Ticket Deal — Logs'<br/>live stream + filters"]
+    end
+    subgraph Join["The join key"]
+        K["trace_id<br/>(32-hex, in every line/span/metric)"]
+    end
+    P1 --> K
+    P2 --> K
+    P3 --> K
+```
+
+| Pillar | Sink | Format | Cardinality | Sample question |
+|---|---|---|---|---|
+| **Metrics** | Prometheus → Grafana | numeric time series | low (label is `service`, `path`, `status`) | "What's the p(99) of `/reserve` over the last 5m?" |
+| **Traces** | Jaeger UI | tree of spans | medium (per-request `trace_id`, `span_id`) | "Show me the slowest 5 traces in the last 10m." |
+| **Logs** | Loki → Grafana | text lines with key=value attrs | low (label is `service_name`, `detected_level`) | "Find every log line for trace `fac1f09d…`." |
+| **(Join)** | `trace_id` | 32-hex W3C TraceContext | one per request | "Show me everything that happened in this one request." |
+
+### 13.3 Metrics: Prometheus + Grafana
+
+**What it answers:** "Is the system healthy? Is something degrading? Did we just oversell?"
+
+**The wire.** Every Go service exposes `/metrics` on its own port (Prometheus text format):
+
+| Service | Endpoint |
+|---|---|
+| API | `http://localhost:8080/metrics` (mounted on the chi router) |
+| Worker | `http://localhost:8081/metrics` (dedicated tiny HTTP server, env `METRICS_ADDR`) |
+| Expiration-watcher | `http://localhost:8083/metrics` (env `METRICS_ADDR`) |
+
+The Go services run on the host (not in Docker); Prometheus runs in a container and scrapes them via `host.docker.internal`. See `monitoring/prometheus.yml` for the scrape config.
+
+**The metric catalog** (`internal/metrics/metrics.go`): every metric name, label set, and histogram bucket is defined in **one file** so all services use identical semantics. Highlights:
+
+| Metric | Type | Labels | Use |
+|---|---|---|---|
+| `reservations_held_total` | counter | — | Throughput: reservations accepted |
+| `reservations_completed_total` | counter | — | Throughput: SQS publish succeeded |
+| `reservations_oversold_total` | counter | — | **The alarm metric. MUST stay 0.** |
+| `reservations_sold_out_total` | counter | — | Load shedding: 409s returned |
+| `reservations_already_holding_total` | counter | — | Idempotency: same user retried |
+| `redis_seats_available` | gauge | `event_id` | Live inventory (periodically sampled) |
+| `waiting_room_queue_length` | gauge | `event_id` | Live queue depth |
+| `http_requests_total` | counter | `service, path, method, status` | Per-route, per-status traffic |
+| `http_request_duration_seconds` | histogram | `service, path` | Latency p50/p90/p99 |
+
+The **defining invariant** of this project: `reservations_oversold_total` is always 0. If it goes positive, *something fundamental broke* and a human needs to look. The Grafana "Ticket Deal — Overview" dashboard has a single-stat panel pinned to this metric in the top-left so it's the first thing the eye lands on.
+
+**The dashboard** (`monitoring/grafana/dashboards/ticket-deal-overview.json`): 7 panels, dark "control room" aesthetic. Top row: oversold counter (red, always 0), reservations held/sold_out rate, HTTP error rate. Middle: p50/p90/p99 latency by route (line graph over 5m window), live inventory gauge per event. Bottom: queue depth per event, status code split (200/409/other as stacked area).
+
+Auto-provisioned on Grafana startup via `monitoring/grafana/provisioning/dashboards/dashboards.yml` — no manual `import JSON` step.
+
+### 13.4 Traces: OpenTelemetry + Jaeger
+
+**What it answers:** "Why was *this one* request slow? Where did the time go? Which call took 200ms?"
+
+**The wire.** Every Go service calls `tracing.Init(ctx, "api"|"worker"|"expiration-watcher")` at startup. This sets up:
+
+1. The **global `TracerProvider`** with a W3C TraceContext propagator.
+2. An **OTLP/gRPC exporter** pointing at `http://localhost:4317` (Jaeger's all-in-one collector port). Env override: `OTEL_EXPORTER_OTLP_ENDPOINT`.
+3. A **sampler** controlled by `OTEL_TRACES_SAMPLER_ARG` (default `1.0` = trace everything; lower in prod to sample).
+4. A shutdown func that flushes pending spans — invoked during graceful shutdown so the last 5s of spans aren't lost.
+
+**Auto-instrumentation** (no per-request code needed):
+
+| Library | What it traces |
+|---|---|
+| `otelhttp.NewHandler(router, "api")` | Every HTTP request becomes a parent span (api only) |
+| `redisotel.InstrumentTracing(rdb)` | Every Redis call (GET, SET, EVALSHA) becomes a child span |
+| `otelpgx.NewTracer()` on `pgxpool.ConnConfig` | Every pgx query becomes a child span (worker + watcher) |
+
+**Manual spans** in the reserve flow (`internal/api/reserve_handler.go`):
+
+| Span | Kind | Attributes | Parent |
+|---|---|---|---|
+| `reserve.handle` | internal | `event_id`, `user_id`, `seats_requested`, `reservation.id` | HTTP root |
+| `redis.acquire-hold` | client | `redis.op=EVALSHA`, `seats` | `reserve.handle` |
+| `sqs.publish` | producer | `messaging.system=aws_sqs`, `messaging.destination=reservations` | `reserve.handle` |
+
+**The hard part: SQS context propagation.** SQS has no native trace header propagation. The publisher (`internal/queue/trace.go`) writes the W3C `traceparent` header into **two** places:
+
+1. `MessageAttributes` (AWS-standard) — preserved by real AWS SQS.
+2. The JSON body as `_traceparent` — **required** for ElasticMQ, which strips `MessageAttributes` in local dev.
+
+The consumer tries `MessageAttributes` first, falls back to the body. Both paths are tested in `internal/queue/trace_test.go`. End result: the worker's `worker.handleMessage` span is a **child of** the API's `sqs.publish` span, even though they run in different processes with a queue between them.
+
+**The waterfall** for a single `POST /api/tickets/reserve` (typical happy path):
+
+```
+POST /api/tickets/reserve           [35ms]   ← HTTP root
+└─ reserve.handle (api)             [35ms]   ← manual parent
+   ├─ redis.acquire-hold (api)      [3ms]    ← Lua EVAL
+   │  └─ EVALSHA (api)              [1ms]    ← auto-instrumented
+   └─ sqs.publish (api)             [22ms]   ← SQS SendMessage
+      └─ (queue latency)            [~ms]    ← invisible to trace
+         └─ worker.handleMessage    [1ms]    ← consumer span, parent jumps
+            ├─ pool.acquire (wkr)   [0ms]    ← auto-instrumented
+            └─ INSERT (wkr)         [1ms]    ← pgx auto-instrumented
+```
+
+**The Jaeger UI** (http://localhost:16686) lets you filter by service (`api`, `worker`, `expiration-watcher`) or by `trace_id`. The "min duration" filter is the go-to for "show me the slow ones."
+
+### 13.5 Logs: `log/slog` + Loki + Promtail
+
+**What it answers:** "What code path did this trace hit? What was the exact error message? Who got rate-limited?"
+
+**The wire.** Every long-running service (api, worker, watcher, dashboard-server) calls `logging.Init(logging.Config{...})` **first thing in `main()`** — before any other code, so even `tracing.Init` failures are captured in the right format. The config takes level, format (text/json), service name, and version; env vars are `LOG_LEVEL`, `LOG_FORMAT`, `SERVICE_VERSION`.
+
+The init wraps `slog`'s default `Handler` in a **`ContextHandler`** (`internal/logging/context_handler.go`, ~30 LOC) that pulls the active OTel span off the request `ctx` and auto-injects `trace_id` + `span_id` into every log line. The convention is: **if you have a `ctx`, use `slog.InfoContext(ctx, ...)`; if not, use `slog.Info(...)`** (rare). The ContextHandler is a no-op when there's no active span (e.g. one-shot CLIs).
+
+**The chi access log** (`internal/apiutil/middleware/slog_logger.go`) replaces `chi/middleware.Logger`. It runs *after* the OTel HTTP middleware, so the access log line carries the request's `trace_id` automatically. One swap, every request gets correlated.
+
+**The shipping pipeline:**
+
+```
+Go service ──slog (stdout)──> nohup catches it ──> logs/<service>.log
+                                                       │
+                                                       ▼  (host bind mount)
+                                                  /var/log/ticket-deal  ◀── Promtail (in container)
+                                                       │
+                                                       ▼  (parse + label)
+                                                  Loki  ──>  Grafana "Ticket Deal — Logs"
+```
+
+Promtail (`monitoring/promtail/promtail-config.yml`) tails each `logs/<service>.log` file and ships to Loki (`monitoring/loki/loki-config.yml`, port 3100). Loki stores the lines in a filesystem backend (single-replica, 7-day retention) and serves them via its HTTP API.
+
+**The label cardinality rule (CRITICAL).** Loki indexes only a small set of *labels* per log line. Every unique (label-set → stream) combination counts against Loki's **active-stream cap (~5,000 in default config)**. If you make `trace_id` a label, you blow past that cap in 5,000 requests. **Rule:** only **low-cardinality** dimensions become labels (`service_name`, `detected_level`); high-cardinality fields (`trace_id`, `user_id`, `reservation_id`) stay in the log **body** and are queried via LogQL line-filter `|= "..."` (text contains), not label match.
+
+**The Promtail 3.x gotchas** (all earned in production debugging — see `monitoring/promtail/promtail-config.yml` for inline comments):
+
+1. `__path__` is consumed during file discovery, so `relabel_configs` can't see the expanded path. **Workaround:** one `scrape_configs` block per file, each with an explicit `service_name` label, not a glob + regex.
+2. `labels: level:` (empty value) silently sets the label to `""`, which Loki drops. The `{{.lvl}}` template syntax for capture groups is finicky. **Workaround:** drop the custom pipeline entirely; Promtail's built-in `detected_level` (lowercase) does the same job.
+
+**The Loki 3.x query gotcha.** LogQL rejects queries where *every* matcher is empty-compatible. So `{service_name=~".*"} | detected_level=~".*"` is rejected with:
+```
+queries require at least one regexp or equality matcher that does not have
+an empty-compatible value. For instance, app=~".*" does not meet this
+requirement, but app=~".+" will
+```
+The "All" default for every variable on the logs dashboard is `.+` (positive match, requires ≥1 char), not `.*`.
+
+**The Grafana "Ticket Deal — Logs" dashboard** (`monitoring/grafana/dashboards/ticket-deal-logs.json`, uid `ticket-deal-logs`): 4 panels + 4 variables.
+
+- **Variables:** `service` (multi-select from `label_values(service_name)`), `level` (All / INFO+ / WARN+ / ERROR — uses `detected_level` regex), `trace_id` (text box), `search` (text box).
+- **Panel 1 (text):** "How to use this dashboard" hint.
+- **Panel 2 (timeseries):** Log volume by service, last 1m rate.
+- **Panel 3 (timeseries):** Log mix by detected level, last 1m rate.
+- **Panel 4 (logs):** Live log stream with all four variable filters applied.
+
+### 13.6 The killer combo: `trace_id` is the join key
+
+The whole reason for picking W3C TraceContext + auto-injecting `trace_id` into every log line is this workflow:
+
+```mermaid
+sequenceDiagram
+    actor Dev
+    participant J as Jaeger UI
+    participant G as Grafana Logs
+
+    Dev->>J: Filter api, min duration 200ms
+    J-->>Dev: Slow trace abc123...
+    Dev->>Dev: Copy trace_id (32-hex)
+    Dev->>G: Paste into trace_id variable
+    G-->>Dev: Every log line for this trace,<br/>across api → SQS → worker,<br/>timestamped and ordered
+    Dev->>Dev: Find the WARN/ERROR line
+    Note over Dev,G: Reverse direction (log → trace) is wired too:<br/>Grafana's Loki datasource has a `derivedField`<br/>that makes trace_id values in log lines clickable,<br/>jumping straight back to Jaeger
+```
+
+In practice, the workflow is:
+
+1. **Spot a slow trace in Jaeger** → "This POST took 380ms, the SQS publish alone took 250ms." Grab the `trace_id` from the URL or the span.
+2. **Open Grafana → "Ticket Deal — Logs"** → paste the `trace_id` into the `trace_id` variable. See every log line for that request, across services, in time order. The 250ms publish usually has a `WARN` line right next to it explaining why.
+3. **Click the `trace_id` value in a log line** → Grafana jumps back to Jaeger showing the full waterfall. (Wired via `derivedField` in `monitoring/grafana/provisioning/datasources/datasource.yml`.)
+
+**The reverse** (log → trace) is the one that gets used most in practice: you're reading logs, see a `WARN: publish failed`, click the `trace_id`, Jaeger opens with the full request context. You can do this in two clicks from the Grafana logs panel.
+
+### 13.7 Why this design (the decisions behind the choices)
+
+| Decision | Why |
+|---|---|
+| **3-pillar Prometheus+Jaeger+Loki, not a SaaS like Datadog/New Relic** | Self-hostable, no per-GB fees, every layer is replaceable. The 4th pillar (Grafana) ties it together with a single UI. |
+| **OpenTelemetry SDK, not a vendor-specific tracer** | Vendor-neutral. The OTLP exporter sends to Jaeger today, to Tempo or Honeycomb tomorrow, with zero code change. |
+| **`log/slog` from stdlib, not zap/zerolog/logrus** | `slog` is in stdlib since Go 1.21; no dep churn, no `init()` magic, structured attrs by default. The custom `ContextHandler` is 30 lines and replaces every other logger's equivalent. |
+| **W3C TraceContext, not B3 or Jaeger's own** | The standard. Every observability vendor supports it. Cross-service propagation "just works" because it's the same header everywhere. |
+| **Filesystem Loki backend, not S3** | Local dev doesn't need S3. The storage layer is pluggable; same `loki-config.yml` works with `aws: { s3: … }` block in prod. |
+| **Label cardinality cap, not "index everything"** | Loki's stream cap is a hard limit (~5k by default). Knowing which dimensions are low-cardinality is the difference between a queryable system and a 429-spamming outage. |
+| **OTLP/gRPC, not OTLP/HTTP** | Lower overhead, multiplexing, bidi streaming. Jaeger all-in-one accepts both, so `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` works out of the box. |
+| **Text logs to stdout, not journald/syslog** | One format, one tool (`tail`, `grep`, `jq`), no surprise container-log rotation. Promtail tails the file directly. |
+
+## 14. File-by-File Reference
 
 > **Reading guide:** each entry lists purpose, key types/functions, and what depends on it. When you forget how something fits, scan the matching entry. Files are grouped by directory.
 
@@ -763,15 +1025,71 @@ Standard Go ignores (`*.test`, `coverage.out`), editor cruft (`.vscode/`, `.idea
 
 #### `docker-compose.yml`
 
-Three services, all with healthchecks wired into `depends_on: condition: service_healthy`:
+**Eight services**, all with healthchecks wired into `depends_on: condition: service_healthy` (where applicable):
 
-- **`redis`** — `redis:7-alpine` with `--notify-keyspace-events Ex` (Phase 7) + `--appendonly yes` (durability) + `--maxmemory 512mb` + `--maxmemory-policy allkeys-lru`.
-- **`postgres`** — `postgres:16-alpine`, env from `POSTGRES_USER/PASSWORD/DB` (default `tickets/tickets/tickets`).
-- **`elasticmq`** — `softwaremill/elasticmq:latest`, mounts `./docker/elasticmq.conf` so the `reservations` queue is auto-created with 30 s visibility + 20 s long-poll.
+| Service | Image | Port(s) | Purpose |
+|---|---|---|---|
+| `redis` | `redis:7-alpine` | 6379 | Hot path: token buckets, hold keys, Lua |
+| `postgres` | `postgres:16-alpine` | 5432 | Cold path: source of truth |
+| `elasticmq` | `softwaremill/elasticmq:latest` | 9324 | Async: SQS-compatible queue |
+| `prometheus` | `prom/prometheus:v2.55.0` | 9090 | Metrics scrape |
+| `grafana` | `grafana/grafana:11.3.0` | 3000 | Dashboards (admin/admin123) |
+| `jaeger` | `jaegertracing/all-in-one:1.76.0` | 16686, 4317-4318, 14268 | OTLP collector + UI |
+| `loki` | `grafana/loki:3.3.0` | 3100 | Log storage (HTTP API, no UI) |
+| `promtail` | `grafana/promtail:3.3.0` | 9080 | Log shipper (binds host `./logs`) |
+
+Volumes: `redis-data`, `postgres-data`, `prometheus-data`, `grafana-data`, `jaeger-data`, `loki-data`. Configs are bind-mounted from `monitoring/{prometheus,grafana,jaeger,loki,promtail}/`.
+
+Notes:
+- `redis` is started with `--notify-keyspace-events Ex` (Phase 7) + `--appendonly yes` (durability) + `--maxmemory 512mb` + `--maxmemory-policy allkeys-lru`.
+- `postgres` env from `POSTGRES_USER/PASSWORD/DB` (default `tickets/tickets/tickets`).
+- `elasticmq` mounts `./docker/elasticmq.conf` so the `reservations` queue is auto-created with 30 s visibility + 20 s long-poll.
+- `prometheus` scrapes the Go services via `host.docker.internal` (services run on the host, not in Docker).
+- `jaeger` accepts OTLP/gRPC on `:4317` and OTLP/HTTP on `:4318`.
+- `promtail` reads the host's `./logs` directory and ships to `loki` on `:3100`.
 
 #### `docker/elasticmq.conf`
 
 Pre-creates the `reservations` queue on boot — saves the dev the `aws --endpoint-url=... sqs create-queue` step. Standard type (no max-receive-count → no DLQ).
+
+---
+
+### `monitoring/` — observability configs
+
+All observability side-channel configs. Bind-mounted into the corresponding Docker service by `docker-compose.yml`. Self-contained: nothing in this directory is imported by the Go code; they're pure config for Prometheus / Grafana / Jaeger / Loki / Promtail.
+
+#### `monitoring/prometheus.yml`
+
+Scrape config. Three targets (`api:8080`, `worker:8081`, `expiration-watcher:8083` — the Go services run on the host and Prometheus reaches them via `host.docker.internal`). 10s scrape interval. Used as Prometheus's `--config.file` flag.
+
+#### `monitoring/grafana/provisioning/`
+
+Auto-provisioned datasource + dashboard configs so Grafana is "ready" the moment it starts (no manual `Add datasource` or `Import JSON` step).
+
+- **`datasources/datasource.yml`** — Prometheus + Loki datasources. The Loki datasource has a `derivedField` that extracts `trace_id` (32-hex) from log lines and turns it into a clickable link to Jaeger (`http://localhost:16686/trace/${...}`). This is what makes the log → trace navigation "just work."
+- **`dashboards/dashboards.yml`** — provider config that points Grafana at `monitoring/grafana/dashboards/` and auto-loads every JSON file it finds there on startup.
+
+#### `monitoring/grafana/dashboards/ticket-deal-overview.json`
+
+**"Ticket Deal — Overview"** dashboard (uid `ticket-deal-overview`). 7 panels, dark "control room" aesthetic, Prometheus-backed. The headline panel is `reservations_oversold_total` (top-left, single-stat, must always read 0). Other panels: held/completed rate, sold-out rate, HTTP error rate, p50/p90/p99 latency by route, live inventory gauge per event, queue depth per event, status code split.
+
+Designed in `docs/dashboard-redesign-plan.md` and shipped on `feature/observability`.
+
+#### `monitoring/grafana/dashboards/ticket-deal-logs.json`
+
+**"Ticket Deal — Logs"** dashboard (uid `ticket-deal-logs`). 4 panels, Loki-backed. Variables: `service` (multi-select from `label_values(service_name)`), `level` (All/INFO+/WARN+/ERROR, uses Promtail's `detected_level` regex with `.+` for "All" — see §13.5), `trace_id` (text box), `search` (text box). Panel 1 is a "how to use" hint. Panel 2 is log volume by service (1m rate). Panel 3 is log mix by level (1m rate). Panel 4 is the live log stream with all four variable filters applied. The "killer combo" workflow (§13.6) starts here.
+
+#### `monitoring/loki/loki-config.yml`
+
+Loki 3.3.0 single-replica config. Filesystem backend (no S3 in dev — swap to `aws: { s3: … }` for prod). `auth_enabled: false` (local dev). `ingestion_rate_mb: 32` and `per_stream_rate_limit: 16MB` (both bumped from defaults to absorb burst load). 7-day retention via `compactor`. Schema v13 with tsdb. Bound to `:3100`; no UI (use Grafana as the frontend).
+
+#### `monitoring/promtail/promtail-config.yml`
+
+Promtail 3.3.0 config. **One `scrape_configs` block per log file** (api, worker, expiration-watcher, dashboard-server) — see §13.5 for the Promtail 3.x `__path__` gotcha. Each block has an explicit `service_name` label (NOT a glob + regex; that doesn't work in Promtail 3.x because `__path__` is consumed during file discovery). `pipeline_stages: []` — no custom level extraction; Promtail's built-in `detected_level` (lowercase) does the job. Bind-mounts the host's `./logs` to `/var/log/ticket-deal:ro` in `docker-compose.yml`.
+
+#### `monitoring/jaeger/`
+
+The Jaeger all-in-one container reads no config file by default — the `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` in the Go services is the entire contract. (If we ever need a config, this is where it would go.)
 
 #### `go.mod` / `go.sum`
 
@@ -783,8 +1101,12 @@ Module `github.com/emmitt-k/ticket-deal`, Go 1.27.1. Direct deps:
 - `github.com/jackc/pgx/v5` + `pgxpool` — Postgres (Phase 6)
 - `github.com/aws/aws-sdk-go-v2` + `awsconfig` + `service/sqs` — SQS (Phase 6)
 - `github.com/redis/go-redis/v9` — Redis client + Lua EVAL (Phase 2, 4, 7)
+- `github.com/redis/go-redis/extra/redisotel/v9` — Redis OTel auto-instrumentation (Phase 11)
 - `github.com/joho/godotenv` — `.env` overlay (Phase 3)
 - `github.com/stretchr/testify` — test assertions everywhere
+- `github.com/prometheus/client_golang` — Prometheus metrics (Phase 10)
+- `go.opentelemetry.io/otel` + `sdk` + `exporters/otlp/otlptrace/otlptracegrpc` + `instrumentation/net/http/otelhttp` + `instrumentation/github.com/redis` + `instrumentation/github.com/jackc/pgx` — OTel SDK + auto-instrumentation (Phase 11)
+- `go.opentelemetry.io/contrib/instrumentation/runtime` — Go runtime metrics (goroutines, GC, heap) (Phase 10)
 
 ---
 
@@ -792,7 +1114,16 @@ Module `github.com/emmitt-k/ticket-deal`, Go 1.27.1. Direct deps:
 
 #### `cmd/api/main.go`
 
-The whole HTTP server bootstrap. Loads config, builds Redis client, starts the drainer goroutine (`waitingroom.StartDrainer`), builds the chi router, mounts `/healthz` + `/api/tickets/{enter,queue,reserve}`, runs the `http.Server` with graceful shutdown on `SIGINT`/`SIGTERM` (5-second grace).
+The whole HTTP server bootstrap. **Order of init matters** (later depends on earlier):
+
+1. `logging.Init(...)` — first, so every subsequent slog call uses the right handler (including any that might fire during `tracing.Init` failure).
+2. `tracing.Init(ctx, "api")` — sets up the global OTel TracerProvider, OTLP/gRPC exporter → Jaeger, returns a shutdown func.
+3. `redisotel.InstrumentTracing(rdb)` — wraps the Redis client so every `EVAL` becomes a child span.
+4. `metrics.Handler()` is mounted on `/metrics` (chi router).
+5. The chi router is wrapped in `otelhttp.NewHandler(router, "api")` — every HTTP request becomes a parent span automatically.
+6. `slogmw.NewSlogAccessLog()` replaces `chi/middleware.Logger` — every request gets an access log line with the OTel `trace_id` auto-injected by the `ContextHandler`.
+7. Mounts `/healthz` + `/api/tickets/{enter,queue,reserve}` (the reserve route is behind `auth.Middleware()`).
+8. `http.Server` with graceful shutdown on `SIGINT`/`SIGTERM` (5-second grace). The shutdown sequence: HTTP server (stop accepting) → drainer goroutine (cancel) → tracing shutdown (flush pending spans, ~5s budget).
 
 `buildPublisher()` is the key wiring function: if `SQS_QUEUE_URL` is set, constructs `ReservationAPIPublisher(SQSPublisher(sqsClient))`; otherwise falls back to `LogPublisher` so the API stays runnable for handler work without a worker. Returns a `config.Config` value (not pointer) — handlers read it once at handler-construction time.
 
@@ -839,6 +1170,16 @@ Tests for the handler and publisher interface. Handler tests use `httptest` and 
 #### `internal/apiutil/response.go`
 
 Two helpers used by every handler: `WriteJSON(w, status, v)` sets `application/json` content-type, encodes, writes; `WriteError(w, status, code, message)` is the shortcut for the uniform error envelope `{"error":string, "message":string}`. Adding fields like `request_id` to every response means one edit here.
+
+#### `internal/apiutil/middleware/slog_logger.go`
+
+**Phase 12 replacement for `chi/middleware.Logger`.** A chi-compatible middleware that writes one structured `slog.InfoContext(ctx, "http request", ...)` line per request, with `method`, `path`, `status`, `bytes`, `duration_ms`, `remote_addr`, and `user_agent` as attrs. The `ctx` is the OTel-instrumented one (the chi router is wrapped in `otelhttp.NewHandler` upstream), so the `ContextHandler` auto-injects `trace_id`/`span_id` into every line — meaning the access log and the trace are queryable by the same key in Grafana.
+
+`X-Forwarded-For` is honored (first hop), falling back to `RemoteAddr`. ~95 LOC, no external deps.
+
+#### `internal/apiutil/middleware/slog_logger_test.go`
+
+8 unit tests using `httptest`. Verifies: line is emitted with the right level, correct status code captured (via `statusRecorder` wrapper around `ResponseWriter`), trace_id present when ctx has a span, no attrs leaked.
 
 ---
 
@@ -949,7 +1290,42 @@ Used only by `waitingroom.EnterHandler`. Not imported by Phase 5/6/7.
 
 #### `internal/iplimit/scripts/ip_bucket.lua`
 
-49 lines. Lazy-refill per-IP bucket, no queue. State per IP: Redis Hash `{tokens, last_refill_ms}`. 1-day TTL on the hash (safety net).****
+49 lines. Lazy-refill per-IP bucket, no queue. State per IP: Redis Hash `{tokens, last_refill_ms}`. 1-day TTL on the hash (safety net).
+
+---
+
+### `internal/logging/` — Phase 12 `log/slog` wrapper
+
+The structured-logging package. Every long-running service calls `logging.Init(...)` first thing in `main()`; one-shot CLIs (`cmd/seed-inventory`, `cmd/mintjwt`) keep stdlib `log.Printf` because they run once and exit (deliberate, documented in `docs/logging-plan.md`).
+
+#### `internal/logging/logging.go`
+
+`Init(Config{Level, Format, Service, Version})` installs a slog handler as `slog.SetDefault()`. Helpers: `LevelFromString` (parses `LOG_LEVEL` env: debug/info/warn/error), `FormatFromEnv` (parses `LOG_FORMAT` env: text/json), `Setup()` (the no-config version for one-shot CLIs). The `service=` and `service_version=` attributes are prepended to every record by `Init` — callers drop the `"api: "` / `"worker: "` text prefix from log messages.
+
+#### `internal/logging/context_handler.go`
+
+**~30 LOC, the keystone of the trace → log join.** A `slog.Handler` wrapper that, for every `Handle(ctx, record)`, calls `trace.SpanContextFromContext(ctx)` and adds `trace_id` and `span_id` attributes to the record if a span is active. The wrap is one level: `ContextHandler{inner: slog.Default().Handler()}.Handle(...)` — so any record emitted with a `ctx` (via `slog.InfoContext(ctx, ...)`) gets correlated. Records emitted without a ctx (e.g. during early startup, before `tracing.Init` runs) pass through with no extra attrs.
+
+#### `internal/logging/*_test.go`
+
+Unit tests for the handler and init. Verifies: a record emitted *with* an active span gets `trace_id`/`span_id`; a record emitted *without* a span (or before tracing is up) doesn't crash and emits no extra attrs; the Init function correctly parses env vars and panics on bad input. All tests pass without any external service.
+
+---
+
+### `internal/metrics/` — Phase 10 Prometheus catalog
+
+#### `internal/metrics/metrics.go`
+
+**The single source of truth for metric names, label sets, and bucket boundaries.** Every service imports this package; nothing else defines Prometheus metrics directly. All metrics register with the default registry via `promauto` on package import.
+
+Exposed groups (full list in the file):
+
+- **HTTP** — `http_requests_total` (counter, labels: `service, path, method, status`), `http_request_duration_seconds` (histogram, labels: `service, path`, 11-bucket: 1ms → 5s).
+- **Reservations** — `reservations_held_total`, `reservations_completed_total`, `reservations_oversold_total` (the alarm — must always be 0), `reservations_sold_out_total`, `reservations_already_holding_total`.
+- **Redis state** — `redis_seats_available` (gauge, label: `event_id`), `waiting_room_queue_length` (gauge, label: `event_id`). Set by the api binary's `seatsAdapter`/`queueAdapter` (small interface adapters that satisfy `metrics.SeatsAvailableGetter` / `metrics.QueueSizeGetter` without a circular import on `internal/redis`).
+- **Go runtime** — wired via `runtime.NewGoCollector()` and `runtime.NewProcessCollector()` in the `Handler()` wrapper. Goroutines, GC pause time, heap, fd count, all free.
+
+`Handler()` returns a `http.Handler` for the chi `/metrics` route. Each service runs this on its own port (api :8080, worker :8081, watcher :8083 — `METRICS_ADDR` env for the latter two).
 
 ---
 
@@ -970,6 +1346,19 @@ Used only by `waitingroom.EnterHandler`. Not imported by Phase 5/6/7.
 #### `internal/queue/aws.go`
 
 Shared `NewSQSClient(ctx, AWSConfig{Region, EndpointURL, QueueURL})`. Detects `EndpointURL != ""` and injects dummy `local/local` creds if unset — see §12 sharp edge #1. Sets `o.BaseEndpoint = cfg.EndpointURL` on the SDK client.
+
+#### `internal/queue/trace.go`
+
+**Phase 11's hard part: SQS context propagation.** SQS has no native trace header propagation. This file provides:
+
+- `InjectOTelIntoReservation(ctx, body []byte) (attrs map[string]types.MessageAttributeValue, bodyWithTraceparent []byte, err error)` — called by the publisher. Pulls the active W3C TraceContext off the request ctx, serializes it as a `traceparent` MessageAttribute (real AWS SQS preserves this), AND embeds the same value into the JSON body as a top-level `_traceparent` field (ElasticMQ strips MessageAttributes, so the body fallback is the only path that works in local dev). Both writes are best-effort: an empty `traceparent` from a no-op ctx produces a body without the field, and the consumer treats it as a "no upstream trace" message.
+- `ExtractOTelFromMessage(ctx, attrs, body []byte) (newCtx context.Context, ok bool)` — called by the consumer. Tries the MessageAttribute first, falls back to parsing the body. If both fail, returns the original ctx unchanged (the consumer still runs, just as a root span).
+
+The result: a Jaeger trace shows the worker's `worker.handleMessage` span as a **child of** the API's `sqs.publish` span, even across the queue. The body fallback is the keystone — see `internal/queue/trace_test.go` which exercises both paths (with-attribute and body-only) to guarantee local dev matches prod.
+
+#### `internal/queue/trace_test.go`
+
+Tests both propagation paths. (1) Publisher injects the `traceparent` MessageAttribute + body field when ctx has a span. (2) Consumer extracts from MessageAttribute when present. (3) Consumer falls back to body when MessageAttribute is empty (the ElasticMQ case). (4) Both empty → consumer starts a root span. ~150 LOC, no external deps (uses an in-memory context only).
 
 ---
 
@@ -1005,6 +1394,23 @@ Wraps `token_bucket.lua`:
 #### `internal/redis/reserve_test.go` / `waitingroom_test.go`
 
 Critical coverage: `TestReserve_NoOversell` is the headline — 1000 concurrent goroutines fight for 10 seats, exactly 10 win, 990 get `sold_out`. Without Lua atomicity, this fails catastrophically.
+
+---
+
+### `internal/tracing/` — Phase 11 OpenTelemetry init
+
+#### `internal/tracing/tracing.go`
+
+`Init(ctx, serviceName) (shutdown func(context.Context) error, err error)` — sets up the global `TracerProvider` + W3C `TraceContext` propagator + OTLP/gRPC exporter. Idempotent (safe to call from multiple binaries in the same process for tests, though we don't do that). The shutdown func flushes pending spans (~5s budget) — main calls it on `SIGTERM` so the last 5s of spans aren't lost.
+
+Env vars:
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — default `http://localhost:4317` (Jaeger all-in-one).
+- `OTEL_TRACES_SAMPLER_ARG` — default `1.0` (trace everything; lower in prod for cost).
+
+The package also sets up the **W3C TraceContext propagator as global**, so any code that does `otel.GetTextMapPropagator().Inject(ctx, carrier)` (e.g. the SQS publisher writing into MessageAttributes) uses W3C format by default. The consumer uses `Extract` with the same propagator.
+
+This is the single setup point — `cmd/{api,worker,expiration-watcher}/main.go` each call it once.
 
 ---
 
@@ -1064,6 +1470,26 @@ Phase 7's schema change. Adds `seats INTEGER NOT NULL DEFAULT 1 CHECK (seats >= 
 
 The phased checklist. Each phase has its goal, files created, wiring steps, and verification commands. The single source of truth for "what's next." Companion to this file.
 
+#### `docs/observability-plan.md`
+
+Phase 10 plan. The argument for Prometheus + Grafana over SaaS alternatives (Datadog, New Relic), the metric catalog (what to measure, why, what buckets), the "Ticket Deal — Overview" dashboard layout, and the "control-room" design rationale. ~4.9KB.
+
+#### `docs/tracing-plan.md`
+
+Phase 11 plan. Why OpenTelemetry (not vendor-specific), the W3C TraceContext choice, manual span strategy in the reserve flow, SQS context propagation strategy, OTLP/gRPC vs HTTP trade-offs, and the sample waterfall walkthrough. ~8.7KB.
+
+#### `docs/tracing-crashcourse.md`
+
+A 3-page "learn tracing fast" — covers spans, contexts, propagation, sampling, and the bag of vocabulary. Written for someone who has never used OTel before. Companion to `tracing-plan.md` (which is the project-specific application). ~11KB.
+
+#### `docs/logging-plan.md`
+
+Phase 12 plan. Why `log/slog` (stdlib, no dep churn) over zap/zerolog/logrus, the `ContextHandler` design (the 30-LOC wrapper that joins traces and logs), the chi access log migration, the `LOG_FORMAT=text|json` convention, the convention for `*Context` variants, the one-shot-CLI exception, and the Phase 13 addendum (Loki). ~16KB.
+
+#### `docs/dashboard-redesign-plan.md`
+
+The design rationale for the "control room" aesthetic of `ticket-deal-overview.json`: why dark theme, why the 7-panel layout, why `reservations_oversold_total` is top-left and red, why per-route latency is line-graphed instead of stat'd. ~7.8KB.
+
 #### `docs/comprehensive-go.md`
 
 Background reading on the Go patterns used here (Lua EVAL wrappers, pool management, context plumbing). Not load-bearing — read when you want depth.
@@ -1072,13 +1498,23 @@ Background reading on the Go patterns used here (Lua EVAL wrappers, pool managem
 
 Background reading on Redis primitives used (Lua atomicity, keyspace notifications, ZSET semantics, stream consumer patterns). Not load-bearing.
 
----
+---### `scripts/` — Phase 9 bg-service helpers + Phase 12 log cleanup
 
-### `scripts/`
+#### `scripts/start-bg.sh`
 
-Empty (was a scratchpad for the old `mintjwt.go` smoke helper; the helper was promoted to `cmd/mintjwt/main.go` so the JWT secret could be env-driven and the binary could be committed). Anything that used to live here should either become a `cmd/<name>/main.go` or be deleted.
+Launch a binary in the background, save PID to `logs/<name>.pid`, log stdout+stderr to `logs/<name>.log`. Idempotent: if the PID file is alive, prints "already running" and exits 0; if the PID is stale, cleans up and starts fresh. Sleeps 0.3s after launch and checks the PID — if the process died during startup (bad import, port already bound, etc.), tails the log and exits 1. macOS doesn't ship `setsid`; the `nohup ... & disown` pattern is what we use.
 
-### `loadtest/` — Phase 8 k6 rig
+#### `scripts/stop-bg.sh`
+
+Reads `logs/<name>.pid`, sends SIGINT, waits 5s for graceful shutdown, escalates to SIGKILL only if still alive. Removes the PID file on success. No-op (with a friendly message) if the service isn't running. The 5-second grace matches the API's `http.Server` graceful-shutdown timeout.
+
+#### `scripts/clear-logs.sh`
+
+Phase 12. **Default: delete** all `logs/*.log`, `logs/burst/*`, and `logs/ramp/*` files. With `--truncate` flag: keep the files but `: >` them (safer in-flight). Warns if any service PIDs are alive before clearing. **Never** touches `*.pid` files (managed by start-bg/stop-bg). The `burst/` and `ramp/` directories themselves are kept; only their contents are cleared, so `make loadtest-burst` doesn't fail on next run. Exposed as `make clean-logs` and `make clean-logs-truncate`.
+
+> Historical note: there used to be a `scripts/mintjwt.go` scratch helper, but it was promoted to `cmd/mintjwt/main.go` so the JWT secret could be env-driven and the binary could be committed. The `.go` file in this directory is the leftover untracked artifact; safe to delete.
+
+### `loadtest/` — Phase 8 k6 rig + Phase 9 self-bootstrapping wrappers
 
 #### `loadtest/burst.js`
 
@@ -1092,6 +1528,18 @@ The wave-shaped companion to `burst.js`. Uses the `ramping-vus` executor with 7 
 
 Single-file dark-themed dashboard. No build step, no external deps — vanilla HTML + inline CSS + ~70 lines of fetch/JSON polling. Auto-polls `/v1/metrics` every 1s; renders active VUs, request rate + 60-point sparkline, latency p50/p90/p95/p99 table, 200/409/other counters, iteration progress bar, and a connection-status dot. Opened via the `cmd/dashboard-server` proxy so it's same-origin with k6's REST API (no CORS extensions required).
 
+#### `loadtest/run-burst.sh` / `loadtest/run-ramp.sh`
+
+Phase 9 **self-bootstrapping wrappers**. Each script:
+
+1. Verifies the API is up (`curl -sf -m 2 http://localhost:8080/healthz`).
+2. Calls `reset-state.sh` to truncate the test event's reservations and re-seed inventory.
+3. Calls `mint-jwts.sh` to pre-mint the JWT pool (default 1000, override with `VUS=N` env).
+4. Invokes `k6 run burst.js` (or `ramp.js`) via `scripts/start-bg.sh`, saving output to a **timestamped** log file in `logs/burst/<TS>-burst.log` or `logs/ramp/<TS>-ramp.log` (never overwritten, accumulated across runs).
+5. Saves the k6 PID to `logs/k6-burst.pid` (or `k6-ramp.pid`) so `make stop-loadtest` can find it.
+
+Net effect: `make loadtest-burst` is now a one-liner that goes from "dirty dev state" → "burst test running with valid JWTs and clean state" in a single command. Override behavior with env vars: `EVENT_ID=2 ./loadtest/run-burst.sh`, `VUS=500 ./loadtest/run-burst.sh`, etc.
+
 #### `loadtest/reset-state.sh`
 
 Idempotent state reset for repeat runs. Truncates `reservations WHERE event_id=$EVENT_ID`, deletes all `hold:event:$EVENT_ID:user:*` keys (via Lua `KEYS` + `DEL`), re-runs `go run ./cmd/seed-inventory` to repopulate `inventory:event:$EVENT_ID` from Postgres, then prints a one-line verification (reservations count, inventory value, hold-key count). Reads `EVENT_ID`/`EXPECTED_INV` from env. Avoids the macOS-bash-3 UTF-8 `…` quirk by using ASCII `...` everywhere.
@@ -1102,25 +1550,36 @@ Pre-mints N unique JWTs to a file (default `/tmp/k6_jwts.txt`, one JWT per line)
 
 ---
 
-### `Makefile` + `scripts/` — Phase 9 polish
+### `Makefile` — Phase 9 polish + Phase 12 log-cleanup targets
 
 #### `Makefile`
 
-The single entry point for the whole project. `make help` lists 30+ targets (every line is grepped for `## comment` so descriptions stay in sync). Targets are grouped: setup (`up`, `migrate`, `seed`, `env`, `doctor`), build (`build`, `vet`, `test`, `test-race`), run-foreground (`api`, `worker`, `watcher`), run-background (`api-bg`, `worker-bg`, `watcher-bg`, `dashboard-bg`, `all-services`, `stop`), tools (`mintjwt`, `dashboard`), load-test (`loadtest-burst`, `loadtest-ramp`, `loadtest-state`, `loadtest-jwts`, `stop-loadtest`), cleanup (`clean`, `purge`), status (`status`, `logs`). Common overrides via `make <target> VUS=500 EVENT_ID=2 USER=alice`.
+The single entry point for the whole project. `make help` lists 40+ targets (every line is grepped for `## comment` so descriptions stay in sync). Targets are grouped:
+
+- **Setup**: `up`, `migrate`, `seed`, `env`, `doctor`
+- **Build**: `build`, `vet`, `test`, `test-race`
+- **Run foreground**: `api`, `worker`, `watcher`
+- **Run background**: `api-bg`, `worker-bg`, `watcher-bg`, `dashboard-bg`, `all-services`, `stop`
+- **Tools**: `mintjwt`, `dashboard`
+- **Load test**: `loadtest-burst`, `loadtest-ramp`, `loadtest-state`, `loadtest-jwts`, `stop-loadtest`
+- **Cleanup**: `clean`, `clean-logs` (delete log files), `clean-logs-truncate` (truncate log files), `purge`
+- **Status**: `status`, `logs`
+
+Common overrides via `make <target> VUS=500 EVENT_ID=2 USER=alice`.
 
 The two load-test targets pre-flight a `curl -sf -m 2 http://localhost:8080/healthz` and fail fast with a clear "API not running on :8080" message if the API isn't up — prevents the silent-failure mode where k6 fires 1000 requests into a dead socket and the dashboard shows 1000 `connection refused` as "other_status". They run k6 in the background (via `scripts/start-bg.sh k6-burst k6 ... --linger`) so the Make target returns immediately and the dashboard stays populated with the final state.
 
-#### `scripts/start-bg.sh`
-
-Launch a binary in the background, save PID to `logs/<name>.pid`, log stdout+stderr to `logs/<name>.log`. Idempotent: if the PID file is alive, prints "already running" and exits 0; if the PID is stale, cleans up and starts fresh. Sleeps 0.3s after launch and checks the PID — if the process died during startup (bad import, port already bound, etc.), tails the log and exits 1. macOS doesn't ship `setsid`; the `nohup ... & disown` pattern is what we use.
-
-#### `scripts/stop-bg.sh`
-
-Reads `logs/<name>.pid`, sends SIGINT, waits 5s for graceful shutdown, escalates to SIGKILL only if still alive. Removes the PID file on success. No-op (with a friendly message) if the service isn't running. The 5-second grace matches the API's `http.Server` graceful-shutdown timeout.
+**The `build` rule is the only one that creates production binaries.** It always uses `-o bin/<name>`, so it can never accidentally leave stray `./api`, `./worker`, etc. in the repo root. See AGENTS.md §Important Conventions #8.
 
 ## See also
 
 - [README](../README.md) — project landing page (status table, tech stack, quick start)
+- [AGENTS.md](../AGENTS.md) — canonical AI-assistant context (project layout, conventions, env vars)
 - [`/docs/implementation-plan.md`](implementation-plan.md) — phased checklist (what's next)
+- [`/docs/observability-plan.md`](observability-plan.md) — Phase 10: metrics design
+- [`/docs/tracing-plan.md`](tracing-plan.md) — Phase 11: tracing design + SQS propagation
+- [`/docs/tracing-crashcourse.md`](tracing-crashcourse.md) — learn OTel from scratch (companion to `tracing-plan.md`)
+- [`/docs/logging-plan.md`](logging-plan.md) — Phase 12/13: slog + Loki
+- [`/docs/dashboard-redesign-plan.md`](dashboard-redesign-plan.md) — "Ticket Deal — Overview" dashboard design rationale
 - [`/docs/comprehensive-redis.md`](comprehensive-redis.md) — Redis deep-dive (Lua atomicity, keyspace notifications)
 - [`/docs/comprehensive-go.md`](comprehensive-go.md) — Go patterns used in this codebase

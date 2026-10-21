@@ -20,7 +20,7 @@ package expire
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -104,15 +104,23 @@ func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
 		// alerting handle it.
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "INCRBY inventory failed")
-		log.Printf("expire: WARN marked DB EXPIRED but INCRBY failed event=%d user=%s seats=%d err=%v",
-			eventID, userID, seats, err)
+		slog.WarnContext(ctx, "marked DB EXPIRED but INCRBY failed",
+			"event", eventID,
+			"user", userID,
+			"seats", seats,
+			"error", err,
+		)
 		return nil
 	}
 
 	// Record this as one watcher-driven expiration.
 	metrics.ExpirationSeatsExpired.WithLabelValues("watcher").Inc()
 
-	log.Printf("expire: compensated event=%d user=%s seats=%d", eventID, userID, seats)
+	slog.InfoContext(ctx, "compensated",
+		"event", eventID,
+		"user", userID,
+		"seats", seats,
+	)
 	return nil
 }
 

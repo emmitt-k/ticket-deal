@@ -24,7 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,15 +38,22 @@ import (
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/expire"
+	"github.com/emmitt-k/ticket-deal/internal/logging"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 	"github.com/emmitt-k/ticket-deal/internal/tracing"
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	logging.Init(logging.Config{
+		Level:   logging.LevelFromEnv(),
+		Format:  logging.FormatFromEnv(),
+		Service: "expiration-watcher",
+		Version: os.Getenv("SERVICE_VERSION"),
+	})
 	if err := run(); err != nil {
-		log.Fatalf("expiration-watcher: %v", err)
+		slog.Error("expiration-watcher startup failed", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -59,13 +66,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("expiration-watcher: starting (redis=%s, db=%s)",
-		cfg.RedisAddr, redactDSN(cfg.DatabaseURL))
+	slog.Info("expiration-watcher starting",
+		"redis", cfg.RedisAddr,
+		"db", redactDSN(cfg.DatabaseURL),
+	)
 
 	// ── OpenTelemetry tracing ─────────────────────────────────
 	tracingShutdown, err := tracing.Init(context.Background(), "expiration-watcher")
 	if err != nil {
-		log.Printf("expiration-watcher: tracing init failed (continuing without traces): %v", err)
+		slog.Warn("tracing init failed (continuing without traces)", "error", err)
 	}
 	defer func() {
 		if tracingShutdown != nil {
@@ -86,7 +95,7 @@ func run() error {
 		return fmt.Errorf("open DB pool: %w", err)
 	}
 	defer pool.Close()
-	log.Printf("expiration-watcher: DB pool open (max=3, min=1)")
+	slog.Info("DB pool open", "max", 3, "min", 1)
 
 	// ── Redis client ───────────────────────────────────────────
 	rdb := redis.NewClient(redis.Config{Addr: cfg.RedisAddr})
@@ -95,9 +104,9 @@ func run() error {
 		return fmt.Errorf("ping Redis: %w", err)
 	}
 	if err := redisotel.InstrumentTracing(rdb); err != nil {
-		log.Printf("expiration-watcher: redisotel instrument tracing failed: %v", err)
+		slog.Warn("redisotel instrument tracing failed", "error", err)
 	}
-	log.Printf("expiration-watcher: Redis ping OK")
+	slog.Info("Redis ping OK")
 
 	// ── Metrics HTTP server (Prometheus scrape target) ────────────
 	//
@@ -117,10 +126,10 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		log.Printf("expiration-watcher: metrics server listening on %s", metricsAddr)
+		slog.Info("metrics server listening", "addr", metricsAddr)
 		if err := metricsSrv.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
-			log.Printf("expiration-watcher: metrics server error: %v", err)
+			slog.Error("metrics server error", "error", err)
 		}
 	}()
 	defer func() {
@@ -136,7 +145,7 @@ func run() error {
 	if err := expire.RunWatcher(ctx, rdb, pool); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("expire watcher: %w", err)
 	}
-	log.Printf("expiration-watcher: clean shutdown")
+	slog.Info("clean shutdown")
 	return nil
 }
 

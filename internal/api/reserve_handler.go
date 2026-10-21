@@ -2,7 +2,7 @@ package api
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -132,8 +132,11 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 			holdSpan.RecordError(err)
 			holdSpan.SetStatus(codes.Error, "lua reserve script failed")
 			holdSpan.End()
-			log.Printf("api: reserve script failed event=%d user=%s: %v",
-				claims.EventID, claims.Subject, err)
+			slog.ErrorContext(r.Context(), "reserve script failed",
+				"event", claims.EventID,
+				"user", claims.Subject,
+				"error", err,
+			)
 			apiutil.WriteError(w, http.StatusInternalServerError,
 				"internal_error", "reservation failed, try again")
 			return
@@ -174,8 +177,11 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		if result.Status != redis.StatusReserved {
 			// Shouldn't happen — the Lua script only returns one of the
 			// three statuses above. Treat as a programming error.
-			log.Printf("api: reserve returned unknown status %d event=%d user=%s",
-				result.Status, claims.EventID, claims.Subject)
+			slog.ErrorContext(r.Context(), "reserve returned unknown status",
+				"status", result.Status,
+				"event", claims.EventID,
+				"user", claims.Subject,
+			)
 			apiutil.WriteError(w, http.StatusInternalServerError,
 				"internal_error", "unexpected reservation outcome")
 			return
@@ -207,7 +213,7 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		if err != nil {
 			// json.Marshal on a primitive-only struct cannot fail at
 			// runtime; treat as a programming error.
-			log.Printf("api: marshal publish payload failed: %v", err)
+			slog.ErrorContext(r.Context(), "marshal publish payload failed", "error", err)
 			apiutil.WriteError(w, http.StatusInternalServerError,
 				"internal_error", "failed to build event message")
 			return
@@ -227,8 +233,10 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, holdTTL t
 		if err := publisher.Publish(r.Context(), payload); err != nil {
 			publishSpan.RecordError(err)
 			publishSpan.SetStatus(codes.Error, "sqs publish failed")
-			log.Printf("api: publish failed (reservation still valid) res=%s: %v",
-				reservationID, err)
+			slog.ErrorContext(r.Context(), "publish failed (reservation still valid)",
+				"reservation_id", reservationID,
+				"error", err,
+			)
 		} else {
 			metrics.ReservationsCompleted.Inc()
 		}

@@ -12,7 +12,7 @@ package waitingroom
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -94,7 +94,10 @@ func drainLoop(ctx context.Context, wg *sync.WaitGroup,
 	defer wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("wr: drainLoop recovered panic event=%d: %v", eventID, r)
+			slog.ErrorContext(ctx, "drainLoop recovered panic",
+				"event", eventID,
+				"panic", r,
+			)
 		}
 	}()
 
@@ -112,7 +115,10 @@ func drainLoop(ctx context.Context, wg *sync.WaitGroup,
 		case <-ticker.C:
 			queueSize, err := redis.QueueSize(ctx, cfg.RDB, eventID)
 			if err != nil {
-				log.Printf("wr: drain QueueSize failed event=%d: %v", eventID, err)
+				slog.WarnContext(ctx, "drain QueueSize failed",
+					"event", eventID,
+					"error", err,
+				)
 				continue
 			}
 			if queueSize == 0 {
@@ -143,20 +149,30 @@ func drainLoop(ctx context.Context, wg *sync.WaitGroup,
 					break
 				}
 				if err != nil {
-					log.Printf("wr: ZPopMin failed event=%d: %v", eventID, err)
+					slog.WarnContext(ctx, "ZPopMin failed",
+						"event", eventID,
+						"error", err,
+					)
 					break
 				}
 
 				// Issue JWT for this promoted user
 				token, err := auth.Issue(userID, eventID, cfg.JWTSecret, 2*time.Minute)
 				if err != nil {
-					log.Printf("wr: Issue failed event=%d user=%s: %v", eventID, userID, err)
+					slog.ErrorContext(ctx, "Issue failed",
+						"event", eventID,
+						"user", userID,
+						"error", err,
+					)
 					continue
 				}
 
 				// Deliver JWT to the user's SSE goroutine
 				if ok := Deliver(eventID, userID, token); !ok {
-					log.Printf("wr: user %s has no active SSE stream (event=%d)", userID, eventID)
+					slog.WarnContext(ctx, "user has no active SSE stream",
+						"event", eventID,
+						"user", userID,
+					)
 				}
 			}
 		}

@@ -88,6 +88,8 @@ The three phases, in one line each:
 | DB explorer    | **pgcli**                                                                                           | `psql` with autocomplete + syntax highlighting + pretty tables                                                            |
 | Metrics        | **Prometheus** + **Grafana**                                                                        | `/metrics` on every service, scraped by Prometheus, visualized in a 9-panel "Ticket Deal — Overview" dashboard             |
 | Tracing        | **OpenTelemetry** → **Jaeger**                                                                      | OTLP/gRPC export, end-to-end waterfall from `api → Redis → SQS → worker → Postgres` with rich attributes                |
+| Logging        | `log/slog` (stdlib) + OTel trace correlation                                                        | Structured key-value logs with `trace_id` / `span_id` auto-injected on every line — paste a `trace_id` from Jaeger and find its log line in `jq` |
+| Log search     | **Grafana Loki** + **Promtail**                                                                     | Tails `logs/*.log` from the host into Loki; "Ticket Deal — Logs" dashboard in Grafana with service + trace_id filters        |
 | Containers     | **Docker Compose**                                                                                  | Whole stack with one command                                                                                              |
 
 > Why these choices (and which we explicitly rejected) → [`/docs/architecture.md`](docs/architecture.md)
@@ -303,6 +305,68 @@ POST  (otelhttp)                      [35ms]
 For the propagator details, manual span inventory, and SQS body-fallback
 rationale → [`/docs/tracing-plan.md`](docs/tracing-plan.md).
 
+### Logging (`log/slog` + OTel correlation)
+
+Every long-running service emits **structured** logs, with the active OTel `trace_id` and `span_id` injected on every line. No new dependencies — `log/slog` is stdlib since Go 1.21.
+
+```bash
+# Default: human-readable text (great for `tail -f` while developing)
+LOG_FORMAT=text make all-services
+
+# For Loki / Datadog / `jq`-fu, switch to JSON
+LOG_FORMAT=json LOG_LEVEL=info make all-services
+```
+
+A reservation's worker log line in **text** format (with active OTel span):
+
+```
+time=2026-10-09T15:00:00.000-07:00 level=INFO msg="reservation inserted"
+service=worker service_version=dev
+reservation_id=6880e7fa-1170-440f-883c-c5bca36002b0
+user=k6user-31 event=1 seats=1
+trace_id=fac1f09d3a4b5c6d7e8f9a0b1c2d3e4f span_id=71bebc50a1b2c3d4
+```
+
+Same line in **JSON** (`LOG_FORMAT=json`):
+
+```json
+{"time":"2026-10-09T15:00:00.000-07:00","level":"INFO","msg":"reservation inserted",
+ "service":"worker","service_version":"dev",
+ "reservation_id":"6880e7fa-1170-440f-883c-c5bca36002b0",
+ "user":"k6user-31","event":1,"seats":1,
+ "trace_id":"fac1f09d3a4b5c6d7e8f9a0b1c2d3e4f","span_id":"71bebc50a1b2c3d4"}
+```
+
+The 30-LOC `logging.ContextHandler` is what makes this work — it pulls the OTel span from the request context and appends `trace_id` / `span_id` to every record. HTTP access logs (replacing `chi/middleware.Logger`) carry the same correlation.
+
+For the design rationale, env var matrix, and what we deliberately kept as `log.Printf` (one-shot CLIs) → [`/docs/logging-plan.md`](docs/logging-plan.md).
+
+### Log search (Grafana Loki + Promtail)
+
+```bash
+# After `make all-services` + `docker compose up -d loki promtail`:
+#   Loki HTTP API:  http://localhost:3100
+#   Grafana:        http://localhost:3000  → "Ticket Deal" folder → "Ticket Deal — Logs"
+```
+
+**Architecture:**
+
+```
+Go services (host) → logs/*.log → Promtail (in docker) → Loki (in docker) → Grafana
+```
+
+The Go services write to `logs/<service>.log` on the host (via `nohup` from `scripts/start-bg.sh`). Promtail runs in a container, bind-mounts the host's `logs/` directory, tails the files, parses `service` (from filename) + `trace_id` (from line body, both text and json formats) as Loki labels, and pushes them as streams. Loki stores them on disk (`loki-data` volume).
+
+**The killer combo — Trace → Logs:**
+
+1. Spot a slow trace in Jaeger → grab the `trace_id` (32-hex)
+2. Open Grafana → "Ticket Deal — Logs" dashboard → paste it into the `trace_id` field
+3. See every log line for that request across api/worker/watcher, all timestamped and ordered
+
+The reverse (log → trace) is also wired up: the Loki datasource in `monitoring/grafana/provisioning/datasources/datasource.yml` has a `derivedField` that makes `trace_id` values in log lines clickable, jumping to the matching Jaeger trace.
+
+**No Go code changes were needed to add Loki** — it's a pure infra add. The slog `ContextHandler` already injects `trace_id` into every log line, and Promtail's regex stages extract it as a label.
+
 ---
 
 ## Project Roadmap
@@ -313,6 +377,8 @@ Done items are crossed off; remaining items are aspirational roadmap (not phase 
 - [ ] **Redis Cluster** — shard seats across nodes for >100k concurrent users
 - [x] **Observability** — Prometheus + Grafana (request rate, latency, reservation outcomes, worker throughput, expiration activity; `reservations_oversold_total` is the headline alert)
 - [x] **Distributed tracing** — OpenTelemetry → Jaeger, end-to-end waterfall across API → SQS → worker (with body-fallback for ElasticMQ in dev)
+- [x] **Structured logging** — `log/slog` across all 4 long-running services, with OTel `trace_id` / `span_id` auto-injected on every line (and HTTP access log via custom chi middleware)
+- [x] **Log aggregation** — Grafana Loki + Promtail, "Ticket Deal — Logs" dashboard with service + trace_id filters, click-through from log line to Jaeger trace
 - [ ] **Payment gateway** — Stripe webhook handler that confirms reservations and releases the hold
 - [ ] **Seat-level granularity** — Redis Hash per event instead of a single counter
 - [ ] **Anti-bot** *(intentionally skipped in lite-auth; revisit if slash-traction emerges)* — CAPTCHA + device fingerprinting before JWT issuance

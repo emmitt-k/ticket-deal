@@ -32,6 +32,7 @@
 | Queue | ElasticMQ (SQS-compatible, local) |
 | Metrics | Prometheus 2.55 + Grafana 11.3 |
 | Tracing | OpenTelemetry SDK 1.47 → Jaeger 1.76 (all-in-one) |
+| Logging | `log/slog` (stdlib, Go 1.21+) + custom OTel trace correlation handler |
 | Load testing | k6 (Go + JavaScript) |
 | Service scripts | Bash + curl |
 | Container runtime | Docker Compose |
@@ -77,6 +78,8 @@ make watcher-bg      # Start expiration-watcher in background
 make dashboard-bg    # Start live dashboard (http://localhost:8082/)
 make down            # Stop all docker compose services
 make status          # Show running processes, container state, DB/Redis counts
+make clean-logs      # Delete all log files (logs/*.log + logs/burst/* + logs/ramp/*)
+make clean-logs-truncate  # Truncate (don't delete) all log files; safe in-flight
 ```
 
 ### Load Testing
@@ -163,6 +166,104 @@ Env vars:
 - `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`)
 - `OTEL_TRACES_SAMPLER_ARG` (default `1.0` = trace everything; lower in prod)
 
+#### Logging (`log/slog` + OTel correlation)
+
+Every long-running service initializes structured logging at the top of `main()`:
+
+```go
+logging.Init(logging.Config{
+    Level:   logging.LevelFromEnv(),   // LOG_LEVEL: debug/info/warn/error
+    Format:  logging.FormatFromEnv(),  // LOG_FORMAT: text (default) or json
+    Service: "api",                    // hardcoded per binary
+    Version: os.Getenv("SERVICE_VERSION"),
+})
+```
+
+After Init, anywhere in the binary call:
+
+- `slog.Info("msg", "key", val, ...)` — basic structured log
+- `slog.InfoContext(ctx, "msg", ...)` — preferred when a `ctx` is in scope; auto-injects `trace_id` and `span_id` from the active OTel span via `logging.ContextHandler`
+- `slog.WarnContext(ctx, ...)`, `slog.ErrorContext(ctx, ...)` — same with level
+
+Key files:
+- `internal/logging/logging.go` — `Init`, `LevelFromString`, env helpers
+- `internal/logging/context_handler.go` — 30-LOC `slog.Handler` wrapper that pulls `trace.SpanContextFromContext(ctx)` and adds `trace_id` + `span_id` attrs
+- `internal/apiutil/middleware/slog_logger.go` — chi access-log middleware (replaces `chi/middleware.Logger`); the access log line carries the request's `trace_id` because the OTel span is already active on the request ctx
+
+Conventions:
+- Functions with a `ctx` in scope use `*Context` variants so trace correlation works
+- `service=` and `service_version=` are prepended to every record by Init — drop the `"api: "` / `"worker: "` prefix from message text
+- `log.Fatalf` is replaced with `slog.Error + os.Exit(1)` so deferred shutdown funcs (tracing flush, DB pool close) still run
+- One-shot CLIs (`cmd/seed-inventory`, `cmd/mintjwt`) keep stdlib `log.Printf` — they run once and exit, so structured logs add no value (documented in `docs/logging-plan.md` §Decision 4)
+
+Env vars:
+- `LOG_LEVEL` (default `info`) — debug/info/warn/error
+- `LOG_FORMAT` (default `text`) — text (dev) / json (prod, Loki-ready)
+- `SERVICE_VERSION` (default `dev`) — set by build via `-ldflags` in CI
+
+Sample line (text format, with active span):
+```
+time=2026-10-09T15:00:00.000-07:00 level=INFO msg="reservation inserted" service=worker service_version=dev reservation_id=6880e7fa-... user=k6user-31 event=1 seats=1 trace_id=fac1f09d... span_id=71bebc50...
+```
+
+Same line in JSON format (`LOG_FORMAT=json`):
+```json
+{"time":"2026-10-09T15:00:00.000-07:00","level":"INFO","msg":"reservation inserted","service":"worker","service_version":"dev","reservation_id":"6880e7fa-...","user":"k6user-31","event":1,"seats":1,"trace_id":"fac1f09d...","span_id":"71bebc50..."}
+```
+
+#### Logs (Grafana Loki + Promtail)
+
+```bash
+# After `make all-services` + `docker compose up -d loki promtail`:
+#   Loki HTTP API:  http://localhost:3100
+#   Promtail:       http://localhost:9080  (its own /metrics, rarely used directly)
+#   Grafana:        http://localhost:3000  → "Ticket Deal" folder → "Ticket Deal — Logs"
+```
+
+**Architecture:**
+```
+Go services (host) → logs/*.log → Promtail (in docker) → Loki (in docker) → Grafana
+```
+
+The Go services write to `logs/<service>.log` on the host (via `nohup` from
+`scripts/start-bg.sh`). Promtail runs in a container, bind-mounts the host's
+`logs/` directory, tails the files, parses `service` (from filename) +
+`trace_id` (from line body, both text and json formats) as Loki labels, and
+pushes them as streams. Loki stores them on disk (`loki-data` volume).
+
+**Config files:**
+- `monitoring/loki/loki-config.yml` — filesystem backend, single replica, 7-day retention
+- `monitoring/promtail/promtail-config.yml` — scrape job + regex pipeline stages
+
+**Useful Loki queries (LogQL, used in Grafana → Explore):**
+```logql
+# Everything from the API
+{service="api"}
+
+# Errors only, across all services
+{service=~".+"} | level="ERROR"
+
+# All log lines for one specific request (paste trace_id from Jaeger)
+{service=~"api|worker"} |~ "fac1f09d12ab34cd56ef78ab90cd1234"
+
+# Sold-out events from the last 5m
+{service="api"} |~ "sold_out" [5m]
+```
+
+**Trace → Logs workflow (the killer combo):**
+1. Spot a slow trace in Jaeger → grab the `trace_id` (32-hex)
+2. Open Grafana → "Ticket Deal — Logs" dashboard → paste it into the `trace_id` field
+3. See every log line for that request across api/worker/watcher, all timestamped and ordered
+
+The reverse (log → trace) is also wired up: the Loki datasource in
+`monitoring/grafana/provisioning/datasources/datasource.yml` has a
+`derivedField` that makes `trace_id` values in log lines clickable, jumping
+to the matching Jaeger trace.
+
+**No Go code changes were needed to add Loki** — it's a pure infra add. The
+slog `ContextHandler` already injects `trace_id` into every log line, and
+Promtail's regex stages extract it as a label.
+
 ### Code Quality
 
 ```bash
@@ -209,7 +310,8 @@ make purge        # clean + docker compose down (keeps volumes)
 │   ├── start-bg.sh            # Generic background process starter (pid + log)
 │   ├── stop-bg.sh             # Generic background process stopper (pid-based)
 │   ├── start-all.sh           # Start all services (used by make all-services)
-│   └── stop-all.sh            # Stop all services
+│   ├── stop-all.sh            # Stop all services
+│   └── clear-logs.sh          # Delete (or truncate) logs/*.log + logs/burst/* + logs/ramp/*; safe in-flight
 ├── docs/
 │   ├── architecture.md        # Full architecture deep-dive
 │   ├── comprehensive-go.md     # Go language tour
@@ -288,6 +390,7 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 5. **Ports**: API :8080, Dashboard :8082, Redis :6379, Postgres :5432, ElasticMQ :4566
 6. **Corporate proxy** — `http.proxy` is set globally in `~/.gitconfig`; SSH bypasses it, HTTPS does not. SSH is used for github.com pushes.
 7. **Commit style** — Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `ci:`)
+8. **Always use `make build` (or `go build -o bin/<name> ./cmd/<name>`)** — never raw `go build ./cmd/<name>/...`. Without `-o`, Go writes the binary to the CWD named after the cmd dir (`./api`, `./worker`, etc.), polluting the repo root. The strays are .gitignored so they won't be committed, but they clutter `ls` and confuse tooling. `make build` always uses `-o $(BIN_DIR)/<name>`, so it can't make this mistake.
 
 ---
 
@@ -314,3 +417,20 @@ make test
 ```bash
 make loadtest-state && make loadtest-jwts && make loadtest-burst
 ```
+
+### Clean log files (start fresh for a new debugging session or load test)
+```bash
+# Wipe everything: service logs + k6 burst/ramp results
+make clean-logs
+
+# Targeted: just one service (e.g. keep worker.log, clear api.log)
+scripts/clear-logs.sh api
+
+# Targeted: just the k6 burst results (keep service logs)
+scripts/clear-logs.sh burst
+
+# Truncate instead of delete (keep files, reset content, safe in-flight)
+make clean-logs-truncate
+```
+
+`scripts/clear-logs.sh` warns if any service PIDs are alive before clearing. **`.pid` files are never touched** — they're managed by `start-bg.sh` / `stop-bg.sh`. The `burst/` and `ramp/` directories themselves are kept; only their contents are cleared, so `make loadtest-burst` doesn't fail on next run.

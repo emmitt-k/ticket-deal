@@ -8,7 +8,7 @@ package api
 
 import (
 	"context"
-	"log"
+	"log/slog"
 )
 
 // ReservationPublisher is the seam between the API handler and the
@@ -41,7 +41,7 @@ type ReservationPublisher interface {
 type LogPublisher struct{}
 
 // Publish logs the body and returns nil. Always succeeds.
-func (LogPublisher) Publish(_ context.Context, body []byte) error {
-	log.Printf("api: [STUB SQS publish] %s", string(body))
+func (LogPublisher) Publish(ctx context.Context, body []byte) error {
+	slog.InfoContext(ctx, "stub SQS publish", "body", string(body))
 	return nil
 }

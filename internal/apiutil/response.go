@@ -6,7 +6,7 @@ package apiutil
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 )
 
@@ -26,7 +26,7 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("apiutil: encode failed: %v", err)
+		slog.Error("encode failed", "error", err)
 	}
 }
 
