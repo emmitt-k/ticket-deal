@@ -1165,6 +1165,14 @@ Defines the `ReservationPublisher` interface (`Publish(ctx, []byte) error`) — 
 
 `POST /api/tickets/reserve` handler. Pulls verified claims out, parses optional `{seats_requested}` body (defaults to 1, caps at 10), calls `redis.ReserveSeat`, maps Lua outcomes to HTTP codes (200, 400, 401, 404, 409 sold_out, 409 already_holding, 500), on success mints a `reservation_id` (UUID), marshals `queue.Reservation` as JSON, calls `publisher.Publish` (logs failure but does not roll back — Redis hold is already created; orphan key scenario), responds 200.
 
+**Idempotency-Key support (Layer 1 item 5).** When the client sends an `Idempotency-Key: <token>` header (lenient UUID-shaped, max 255 chars), the handler:
+  - Computes a sha256 of the request body (`redis.HashBody`) so same-body retries are recognisable.
+  - Looks up `idempotency:<key>` in Redis. Hit + same body → returns the cached status + body verbatim with `Idempotency-Replayed: true` (no second reservation minted, no second SQS publish).
+  - Hit + different body → `409 idempotency_key_mismatch` (Stripe-style, catches client bugs that retry with a different request body under the same key).
+  - Miss → acquires a short-TTL SETNX in-flight lock (`idempotency:<key>:inflight`, 5s). Concurrent retries on the same key get `409 in_flight`; the loser does NOT reserve. After the winner completes, the lock is released and the response is cached for 24h (`SETEX idempotency:<key> 86400 <cachedRecord>` where `cachedRecord = {body_hash, status, response}`).
+  - On any non-200 outcome, the lock is released but the response is NOT cached — per the spec ("on success, SETEX"), retry-against-transient errors get a fresh attempt.
+Backed by `internal/redis/idempotency.go` (`NewIdempotency`, `Lookup`, `AcquireLock`, `ReleaseLock`, `Store`). Two Prometheus counters: `idempotency_replays_total`, `idempotency_body_mismatch_total`.
+
 #### `internal/api/publisher_test.go` / `internal/api/reserve_handler_test.go`
 
 Tests for the handler and publisher interface. Handler tests use `httptest` and mock publishers. Critical coverage: each Lua outcome maps to the right HTTP code; seats_requested validation; publisher failure doesn't roll back.
