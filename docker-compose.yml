@@ -194,7 +194,7 @@ services:
     command: -config.file=/etc/promtail/config.yml
     depends_on:
       - loki
-    restart: unless-stopged
+    restart: always
 
   # ─── Go services (built from the shared Dockerfile) ────────
   #
@@ -217,6 +217,8 @@ services:
         SERVICE: api
     image: ticket-deal-api:dev
     container_name: ticket-api
+    environment:
+      LOG_FILE: /app/logs/api.log        # bind mount + per-service file (see volumes:)
     env_file: .env.docker
     ports:
       - "8080:8080"     # public: curl /reserve, browser dashboard users
@@ -243,6 +245,8 @@ services:
         SERVICE: worker
     image: ticket-deal-worker:dev
     container_name: ticket-worker
+    environment:
+      LOG_FILE: /app/logs/worker.log
     env_file: .env.docker
     ports:
       - "8081:8081"     # Prometheus scrapes /metrics; user can curl for debug
@@ -265,6 +269,8 @@ services:
         SERVICE: expiration-watcher
     image: ticket-deal-watcher:dev
     container_name: ticket-expiration-watcher
+    environment:
+      LOG_FILE: /app/logs/expiration-watcher.log
     env_file: .env.docker
     ports:
       - "8083:8083"
@@ -283,6 +289,8 @@ services:
         SERVICE: dashboard-server
     image: ticket-deal-dashboard:dev
     container_name: ticket-dashboard
+    environment:
+      LOG_FILE: /app/logs/dashboard-server.log
     env_file: .env.docker
     ports:
       - "8082:8082"
