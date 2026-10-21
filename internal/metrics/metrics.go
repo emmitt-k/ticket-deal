@@ -73,6 +73,24 @@ var (
 		},
 	)
 
+	// Idempotency-Key cache outcomes (Layer 1 item 5). Lets ops see
+	// replay traffic vs fresh reserves at a glance, plus catch any
+	// upward drift on body-mismatch (which usually signals a client
+	// bug — they retried with a different body without rotating the
+	// key).
+	IdempotencyReplays = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "idempotency_replays_total",
+			Help: "Total POST /reserve requests that returned a cached Idempotency-Key response.",
+		},
+	)
+	IdempotencyBodyMismatch = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "idempotency_body_mismatch_total",
+			Help: "Total Idempotency-Key requests rejected because the cached body's hash didn't match.",
+		},
+	)
+
 	ReservationsSoldOut = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "reservations_sold_out_total",

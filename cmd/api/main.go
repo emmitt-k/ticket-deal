@@ -185,6 +185,11 @@ func run() error {
 	if cfg.SQS.QueueURL != "" {
 		sqsReadinessCheck = publisher.Ping
 	}
+
+	// Layer 1 item 5 — Idempotency-Key support on POST /reserve.
+	// Built once at startup; the handler reads/writes cache keys
+	// under the configured prefix (default "idempotency:").
+	idempotency := redis.NewIdempotency(rdb, redis.IdempotencyConfig{})
 	r.Get("/readyz", api.ReadyZHandler(api.ReadinessChecks{
 		Redis:    func(ctx context.Context) error { return redis.Ping(ctx, rdb) },
 		Postgres: func(ctx context.Context) error { return pool.Ping(ctx) },
@@ -202,7 +207,7 @@ func run() error {
 		r.Get("/queue", waitingroom.QueueSSEHandler(rdb))
 		// Phase 5/6: /reserve (JWT-protected) — Lua reserve → SQS publish
 		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reserve",
-			api.ReserveHandler(rdb, publisher,
+			api.ReserveHandler(rdb, publisher, idempotency,
 				time.Duration(cfg.ReserveHoldTTL)*time.Second))
 	})
 
