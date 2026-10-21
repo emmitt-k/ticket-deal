@@ -166,6 +166,31 @@ func run() error {
 		apiutil.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	// Layer 1 item 4 (docs/product-roadmap.md) — deep readiness check.
+	// The split between /healthz (process-alive) and /readyz (deps
+	// reachable) is the standard K8s pattern: a failed Postgres should
+	// kick the pod out of the LB's ready set without triggering a
+	// restart loop.
+	//
+	// Each check runs in parallel with a 500ms per-check timeout.
+	// SQS uses publisher.Ping from commit 1; if SQS isn't configured
+	// (dev mode → LogPublisher), the check func is nil → handler
+	// reports sqs: "not_configured" and treats that as healthy.
+	//
+	// Build the publisher ONCE at startup and reuse for both /reserve
+	// (uses Publish) and /readyz (uses Ping). Was inline `buildPublisher
+	// (*cfg)` before; promoting to a variable lets us share it.
+	publisher := buildPublisher(*cfg)
+	var sqsReadinessCheck func(ctx context.Context) error
+	if cfg.SQS.QueueURL != "" {
+		sqsReadinessCheck = publisher.Ping
+	}
+	r.Get("/readyz", api.ReadyZHandler(api.ReadinessChecks{
+		Redis:    func(ctx context.Context) error { return redis.Ping(ctx, rdb) },
+		Postgres: func(ctx context.Context) error { return pool.Ping(ctx) },
+		SQS:      sqsReadinessCheck, // nil = dev mode → "not_configured"
+	}))
+
 	// Prometheus scrape endpoint. Standard /metrics path, no auth
 	// (Prometheus runs on the same Docker network; in production,
 	// this would be network-firewalled or behind a sidecar).
@@ -177,7 +202,7 @@ func run() error {
 		r.Get("/queue", waitingroom.QueueSSEHandler(rdb))
 		// Phase 5/6: /reserve (JWT-protected) — Lua reserve → SQS publish
 		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reserve",
-			api.ReserveHandler(rdb, buildPublisher(*cfg),
+			api.ReserveHandler(rdb, publisher,
 				time.Duration(cfg.ReserveHoldTTL)*time.Second))
 	})
 
