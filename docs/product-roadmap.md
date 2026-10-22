@@ -63,7 +63,6 @@ transitions is Layer 1, item 1.
 
 ### What's not there at all (not even a stub)
 
-- No `GET /api/reservations/:id` — users can't look up their own ticket
 - No payment integration — `CONFIRMED` is unreachable (see above)
 - No cancel endpoint — `CANCELLED` is unreachable
 - No webhook receiver — systems can't be told things changed
@@ -81,7 +80,7 @@ transitions is Layer 1, item 1.
 > **Goal:** the system looks like a real product on the outside. Small,
 > focused, one weekend's worth of work. Builds the spine that Layer 2 hangs off.
 
-### 1. Reservation state machine (with typed transitions)
+### 1. Reservation state machine (with typed transitions) ✅ Done
 
 **Effort:** ~half a day. **Blocks:** items 2, 3, 8 (admin), 6 (Stripe).
 
@@ -110,7 +109,7 @@ it runs the CAS UPDATE with a `WHERE status = $from` clause so concurrent
 cancellations can't double-flip. Returns `ErrInvalidTransition` if the row is in
 the wrong state.
 
-### 2. `GET /api/reservations/:id` and `GET /api/me/reservations`
+### 2. `GET /api/reservations/:id` and `GET /api/me/reservations` ✅ Done
 
 **Effort:** ~2 hours. **Unblocks:** the dashboard-the-user-sees use case.
 
@@ -184,8 +183,8 @@ Stripe-grade. Real systems live and die by this.
 ### Layer 1 deliverable
 
 After this layer, the system has:
-- A real state machine users can drive
-- Look-up their own tickets
+- ✅ A real state machine users can drive  *(Layer 1 item 1 — done)*
+- ✅ Look-up their own tickets  *(Layer 1 item 2 — done)*
 - Cancel them
 - Network-retry safely
 - Tell ops "I'm healthy and all my deps are reachable"

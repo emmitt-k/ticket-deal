@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -36,6 +37,7 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/logging"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
+	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 	"github.com/emmitt-k/ticket-deal/internal/tracing"
 	"github.com/emmitt-k/ticket-deal/internal/waitingroom"
@@ -98,6 +100,18 @@ func run() error {
 	if err := redisotel.InstrumentTracing(rdb); err != nil {
 		slog.Warn("redisotel instrument tracing failed", "error", err)
 	}
+
+	// ── Postgres pool (used by Layer 1 read endpoints: /api/reservations/:id,
+	//    /api/me/reservations). Hot path (/reserve) does NOT touch Postgres —
+	//    only Redis. The pool uses the worker's same DSN so reads see the
+	//    same row writes the worker just committed (no cross-instance lag).
+	pool, err := db.NewPool(context.Background(), db.Config{
+		DSN: cfg.Postgres.DSN,
+	})
+	if err != nil {
+		return fmt.Errorf("api: open postgres pool: %w", err)
+	}
+	defer pool.Close()
 
 	// ── Background drainer (promotes queued users as tokens refill) ─
 	drainerCfg := waitingroom.DrainerConfig{
@@ -165,6 +179,24 @@ func run() error {
 		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reserve",
 			api.ReserveHandler(rdb, buildPublisher(*cfg),
 				time.Duration(cfg.ReserveHoldTTL)*time.Second))
+	})
+
+	// Layer 1 (product-roadmap.md) — read-only reservation lookups.
+	// Both routes require JWT auth (auth.Middleware). The pool is
+	// the worker's *db.Pool; we pass the same instance so /api/me
+	// reads the same row writes the worker just committed (no
+	// eventual-consistency gap for the user). Both endpoints are
+	// backed by the new internal/db.ListReservationsByUser + the
+	// composite index in migrations/004.
+	r.Route("/api", func(r chi.Router) {
+		// GET /api/reservations/{id}  — single reservation by UUID
+		r.With(auth.Middleware(cfg.JWTSecret)).Get("/reservations/{id}",
+			api.GetReservationHandler(pool))
+
+		// GET /api/me/reservations  — caller's own reservations, newest first
+		// Optional ?status=, ?limit= (default 20, max 100), ?offset=
+		r.With(auth.Middleware(cfg.JWTSecret)).Get("/me/reservations",
+			api.ListMyReservationsHandler(pool))
 	})
 
 	// ── HTTP server ────────────────────────────────────────────────

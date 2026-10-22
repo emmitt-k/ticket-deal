@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -71,34 +70,32 @@ func InsertIfAbsent(ctx context.Context, pool *Pool, r queue.Reservation) error 
 	return nil
 }
 
-// ReservationRow mirrors the table layout for read-back helpers
-// (e.g. tests that want to assert the row shape). Not used in
-// production code yet — Phase 7's worker might use it.
-type ReservationRow struct {
-	ReservationID string
-	UserID        string
-	EventID       int64
-	Status        string
-	ExpiresAt     time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-}
+// ReservationRow has moved to internal/db/types.go (where API + SQL
+// helpers can both depend on it without an import cycle). It's still
+// the same struct; existing references via `db.ReservationRow` keep
+// working — Go's package-level visibility doesn't care which file in
+// the package declares the type.
 
 // GetReservation is a small helper used by the smoke test / Phase 8
 // verify.sh to read back a row by ID. Returns pgx.ErrNoRows when
-// the row doesn't exist.
+// the row doesn't exist. JOINs events to populate EventName so API
+// callers can render a human-readable title without a second round-trip.
 func GetReservation(ctx context.Context, pool *Pool, reservationID string) (ReservationRow, error) {
 	const q = `
-		SELECT reservation_id, user_id, event_id, status, expires_at, created_at, updated_at
-		FROM reservations
-		WHERE reservation_id = $1
+		SELECT r.reservation_id, r.user_id, r.event_id, e.name AS event_name,
+		       r.status, r.seats, r.expires_at, r.created_at, r.updated_at
+		FROM reservations r
+		LEFT JOIN events e ON e.id = r.event_id
+		WHERE r.reservation_id = $1
 	`
 	var row ReservationRow
 	err := pool.QueryRow(ctx, q, reservationID).Scan(
 		&row.ReservationID,
 		&row.UserID,
 		&row.EventID,
+		&row.EventName,
 		&row.Status,
+		&row.Seats,
 		&row.ExpiresAt,
 		&row.CreatedAt,
 		&row.UpdatedAt,
