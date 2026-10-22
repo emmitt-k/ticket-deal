@@ -2,16 +2,22 @@
 
 > The full story behind Mini-Ticketmaster — what each piece does, why it exists, and what failure it prevents.
 
-This document complements the [README](../README.md). The README is the project landing page; this is the engineering manual. **§1–§14 explain the design**, **§15 is a per-file reference** for when you need to find or modify a specific file.
+This document complements the [README](../README.md). The README is the project landing page; this is the engineering manual. **§1–§13 explain the design**, **§14 is a per-file reference** for when you need to find or modify a specific file.
 
-**Code state reflected:** through Phase 13 (4-pillar observability). Phases 0–9 (the core system) are landed and unchanged; Phases 10–13 layered on a complete observability stack split across 4 stacked feature branches:
+**Code state reflected:** through Layer 1 of [`product-roadmap.md`](./product-roadmap.md) (5/5 items shipped). The core system (original Phases 0–9) and the observability stack (Phases 10–13) are landed and unchanged on top of it. Two milestone commits sit above those:
 
-| Branch | Phase | What |
+| Milestone | Branch | What |
 |---|---|---|
-| `feature/observability` | 10 | Prometheus scrape + Grafana "Ticket Deal — Overview" dashboard |
-| `feature/tracing` | 11 | OTel SDK + Jaeger UI + SQS traceparent propagation (ElasticMQ body-fallback) |
-| `feature/logging` | 12 | `log/slog` migration + custom `ContextHandler` for trace_id/span_id correlation + clear-logs script |
-| `feature/loki` | 13 | Loki + Promtail + Grafana "Ticket Deal — Logs" dashboard (trace_id in label-derived log line → click → Jaeger) |
+| Dockerization | `feature/dockerize-go-services` | All 4 long-running Go services (api, worker, expiration-watcher, dashboard-server) moved from host into Docker. Shared parameterized `Dockerfile` (distroless/static, `SERVICE` build arg → binary at constant path `/app/server`). `docker-compose.yml` grew from 8 → **12 services**. `LOG_FILE` env support added to `internal/logging`. Prometheus scrape targets switched from `host.docker.internal` → service names. `.env.docker.example` + `scripts/setup-docker-env.sh` (idempotent, migrates the host `.env`'s `JWT_SECRET`). |
+| Layer 1 — the product surface | `feature/get-reservations` → `feature/cancel-reservation` → `feature/readyz` → `feature/idempotency-key` | 5 items, one branch each (linear chain): typed state-machine helper + read endpoints + cancel endpoint + `/readyz` + `Idempotency-Key` on `/reserve`. Layer 1 is what turns the core reservation machinery into something a user can actually operate. See [`product-roadmap.md`](./product-roadmap.md) for the item-by-item breakdown. |
+
+**What Layer 1 added at a glance:**
+
+- `internal/db/transition.go` — `TransitionStatus(ctx, pool, id, from, to) (changed, err)`, a CAS UPDATE backed by a `validTransitions` map. The single gateway for every status change in the system.
+- `GET /api/reservations/{id}` and `GET /api/me/reservations` — users can look up their own tickets (JWT-scoped, paginated, status-filterable).
+- `POST /api/reservations/{id}/cancel` — user-initiated cancel; CAS-safe against the watcher's EXPIRED sweep; releases the seat back to Redis; best-effort hold-key cleanup.
+- `GET /readyz` — three parallel dependency checks (Redis / Postgres / SQS) with 500ms per-check budgets. `200` if all green, `503` otherwise. Distinct from `/healthz` (process-alive only).
+- `Idempotency-Key` on `POST /reserve` — safe retries. 24h cached response replay + a short-TTL SETNX in-flight lock so parallel retries don't double-book.
 
 The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) still produces exactly 100 × 200 + 900 × 409 — and now every one of those requests shows up in all three observability sinks, joined by `trace_id`. See §14 for the story.
 
@@ -525,9 +531,9 @@ Phase 7 closes the asymmetry: Postgres's truth can *correct* Redis's truth (swee
 stateDiagram-v2
     [*] --> PENDING_PAYMENT: Lua reserves seat<br/>+ API publishes SQS message<br/>(worker INSERTs row)
 
-    PENDING_PAYMENT --> CONFIRMED: Payment webhook<br/>(Stripe, future)
+    PENDING_PAYMENT --> CONFIRMED: Payment webhook<br/>(Stripe, future — Layer 2)
     PENDING_PAYMENT --> EXPIRED: Hold key TTL fires<br/>(watcher OR sweep,<br/>within 60s)
-    PENDING_PAYMENT --> CANCELLED: User cancels<br/>(future feature)
+    PENDING_PAYMENT --> CANCELLED: POST /cancel<br/>(internal/api/cancel_<br/>reservation_handler.go)
 
     CONFIRMED --> [*]: Order complete
     EXPIRED --> [*]: Seat released<br/>via INCRBY inventory
@@ -538,7 +544,12 @@ stateDiagram-v2
 
 The `status` column has a `CHECK` constraint enforcing this set (`migrations/001_init.sql`), and `internal/db/reservations.go` exposes the four values as typed constants (`StatusPendingPayment`, etc.) so a typo at a call site fails to compile.
 
-Phase 7 owns `PENDING_PAYMENT → EXPIRED` (with two redundant paths — see §9).
+**The `CHECK` constraint guards the *values*. The `validTransitions` table in `internal/db/transition.go` guards the *edges*.** These are different concerns and both are needed:
+
+- `CHECK (status IN (...))` catches a typo'd status string 100ms after the bad `UPDATE` lands.
+- `TransitionStatus` refuses to even *attempt* an impossible transition (`EXPIRED → CONFIRMED`, say) and returns `ErrInvalidTransition` before touching the DB. It encodes the directed graph as data, so "which moves are legal" is a single table rather than a rule scattered across call sites.
+
+Every status change in the system now flows through `TransitionStatus(ctx, pool, id, from, to) (changed bool, err error)` — a compare-and-set `UPDATE ... WHERE reservation_id = $id AND status = $from`. Two callers racing the same row (a user's cancel vs the watcher's expiry sweep, or two parallel cancels) cannot both win: the first gets `(true, nil)`, the second gets `(false, nil)` and re-reads to learn what actually happened. Layer 1's cancel endpoint is the first production consumer; §14 documents the helper in full.
 
 ---
 
@@ -715,6 +726,12 @@ graph TB
 | 17 | Promtail / Loki down | Logs still write to `logs/<service>.log`; only Grafana search breaks | Local file buffer is durable. Run `make clear-logs` to inspect offline. Promtail resumes shipping from the last read offset when it restarts (it does NOT replay missed lines from earlier). |
 | 18 | `trace_id` made a Loki label | Loki starts 429-ing after ~5k unique values | The label cardinality rule (§13.5): only `service_name` and `detected_level` are labels. `trace_id` is a body field, queried via LogQL `\|= "<id>"`. If you ever see `429` from Loki, suspect a new label. |
 | 19 | `make build` not used; raw `go build ./cmd/...` | Stray binaries (`./api`, `./worker`, …) in repo root | Use `make build` (or `go build -o bin/<name> ./cmd/<name>`). The Makefile rule enforces `-o`; raw `go build` doesn't. See AGENTS.md §Important Conventions #8. |
+| 20 | Idempotency cache entry corrupt (schema drift / manual tampering) | Retry can't replay; gets a fresh reserve | `Lookup` returns `ErrIdempotencyCacheCorrupt`; the handler logs `WARN` and treats it as a miss. The bad entry self-heals via its 24h TTL. Never surfaces a 5xx to the user for a cache problem. |
+| 21 | Idempotency cache `Store` fails after a successful reserve | The reservation succeeded but future retries can't replay — they'll mint a *second* reservation | Non-fatal by design: `slog.WarnContext` only, still `200` to the client. The user has their seat. Worst case is at-most-once instead of exactly-once for a retry, which is strictly better than the pre-Layer-1 behaviour (every retry double-booked). |
+| 22 | In-flight idempotency lock not released (process killed mid-request) | Future retries see `409 in_flight` for up to 5 s | The SETNX lock carries a 5 s TTL, so it self-heals without operator action. Every *terminal* code path also issues an explicit `DEL` (`releaseLockIfHeld`), so the 5 s window only applies to a hard crash. |
+| 23 | Cancel: Redis INCRBY fails after the DB transition succeeded | DB says CANCELLED, Redis still counts the seat as sold — "phantom seat" | `slog.WarnContext` + still `200` to the client. Deliberate: DB is the system-of-record for *intent*; returning 5xx would make the client retry into `409 already_cancelled` and confuse the user. Operator reconciles inventory via a manual INCRBY (same runbook as row 13). The divergence window is the Redis outage duration. |
+| 24 | Cancel: hold-key `DEL` fails | User is briefly `409 already_holding` on their next `/reserve` | Best-effort by design — the key has a TTL, so it self-heals. Never a 5xx; the user's cancellation already succeeded. |
+| 25 | Postgres unreachable, API alive | `/readyz` returns `503`; the Layer 1 read endpoints (`GET /api/reservations/:id`, `/me/reservations`, `POST /cancel`) all fail | `/readyz` surfaces it so a load balancer stops routing traffic here. `/reserve` itself is **unaffected** — the hot path is Redis-only by design (the asymmetry is the point; see §7). A failed readiness check pulls the pod from rotation without triggering a restart loop, which is why `/readyz` is separate from `/healthz`. |
 
 ---
 
@@ -846,7 +863,7 @@ graph LR
 | Worker | `http://localhost:8081/metrics` (dedicated tiny HTTP server, env `METRICS_ADDR`) |
 | Expiration-watcher | `http://localhost:8083/metrics` (env `METRICS_ADDR`) |
 
-The Go services run on the host (not in Docker); Prometheus runs in a container and scrapes them via `host.docker.internal`. See `monitoring/prometheus.yml` for the scrape config.
+All 4 Go services run in Docker alongside Prometheus; they're on the same user-defined Docker network, so Prometheus scrapes them by **service name** (`api:8080`, `worker:8081`, `expiration-watcher:8083`). See `monitoring/prometheus.yml` for the scrape config.
 
 **The metric catalog** (`internal/metrics/metrics.go`): every metric name, label set, and histogram bucket is defined in **one file** so all services use identical semantics. Highlights:
 
@@ -859,6 +876,8 @@ The Go services run on the host (not in Docker); Prometheus runs in a container 
 | `reservations_already_holding_total` | counter | — | Idempotency: same user retried |
 | `redis_seats_available` | gauge | `event_id` | Live inventory (periodically sampled) |
 | `waiting_room_queue_length` | gauge | `event_id` | Live queue depth |
+| `idempotency_replays_total` | counter | — | Retries served from the 24h cache instead of a fresh reserve |
+| `idempotency_body_mismatch_total` | counter | — | Same `Idempotency-Key`, different body → `409`. **Rising trend = a client bug** (they're retrying with a changed request without rotating the key) |
 | `http_requests_total` | counter | `service, path, method, status` | Per-route, per-status traffic |
 | `http_request_duration_seconds` | histogram | `service, path` | Latency p50/p90/p99 |
 
@@ -1017,15 +1036,34 @@ Project landing page. Current Status table (Phases 0–9), Tech Stack table, Pro
 
 #### `.env.example`
 
-Template for `.env` (gitignored). Every env var consumed by the project lives here: API_PORT, JWT_SECRET, REDIS_ADDR, IP/WAIT_ROOM limits, RESERVE_HOLD_TTL, DATABASE_URL, SQS_* (ElasticMQ URL + queue name + URL), SWEEP_INTERVAL_SECONDS, AWS_* (region + dummy creds for ElasticMQ). Comments explain each value.
+Template for `.env` (gitignored). Every env var consumed by the project lives here: API_PORT, JWT_SECRET, REDIS_ADDR, IP/WAIT_ROOM limits, RESERVE_HOLD_TTL, DATABASE_URL (or the `POSTGRES_*` family, which `config.Load()` composes into a DSN), SQS_* (ElasticMQ URL + queue name + URL), SWEEP_INTERVAL_SECONDS, AWS_* (region + dummy creds for ElasticMQ). Comments explain each value.
+
+Host-mode `.env` — used by `make api-bg` / `make worker-bg` and by the k6 wrappers. Values point at `localhost`.
+
+#### `.env.docker.example`
+
+The **container-mode** twin of `.env.example`, committed as a template. Same variable set, but hostnames resolve on the Docker network: `REDIS_ADDR=redis:6379`, `DATABASE_URL=postgres://…@postgres:5432/…`, `SQS_ENDPOINT_URL=http://elasticmq:9324`, `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317`. Because these embed DNS names, they can't be shared with host mode — hence a separate file rather than an override layer.
+
+`scripts/setup-docker-env.sh` generates `.env.docker` from it (gitignored, idempotent, re-runnable). On first run it copies the host `.env`'s `JWT_SECRET` across if one exists, so the JWTs minted by `bin/mintjwt` on the host still verify inside the container — that's what lets you smoke-test a `POST /reserve` from curl against the containerised API.
 
 #### `.gitignore`
 
-Standard Go ignores (`*.test`, `coverage.out`), editor cruft (`.vscode/`, `.idea/`, `.DS_Store`), vendoring (`/vendor/`), secrets (`.env`, `.env.*`), runtime logs, k8 `loadtest/results/` and `summary.html`. Doesn't currently ignore `scripts/*.go` — that's the untracked smoke-test artifact.
+Standard Go ignores (`*.test`, `coverage.out`), editor cruft (`.vscode/`, `.idea/`, `.DS_Store`), vendoring (`/vendor/`), secrets (`.env`, `.env.*` — which covers both `.env` and `.env.docker`), runtime logs, k8 `loadtest/results/` and `summary.html`. Doesn't currently ignore `scripts/*.go` — that's the untracked smoke-test artifact.
+
+#### `Dockerfile`
+
+One shared multi-stage Dockerfile, parameterised by a `SERVICE` build arg. Building any of the 4 Go services is `docker build --build-arg SERVICE=api .` (same for `worker`, `expiration-watcher`, `dashboard-server`).
+
+- **Stage 1** — `golang:1.27-alpine`, compiles `cmd/$SERVICE` with CGO disabled (static binary, no libc dependency at runtime).
+- **Stage 2** — `gcr.io/distroless/static-debian12:nonroot`. Binary copied to the constant path `/app/server` for every service, so the compose `command:` is identical across all four (`["/app/server"]`) regardless of which service was built.
+
+The constant-path trick is what lets one Dockerfile serve four services without per-service paths leaking into compose. The `SERVICE` arg only ever affects the *build*; at runtime the container just runs `/app/server`.
+
+`.dockerignore` keeps the build context lean (excludes `.git/`, `logs/`, `bin/`, `loadtest/results/`) so a rebuild doesn't invalidate the layer cache on every log line.
 
 #### `docker-compose.yml`
 
-**Eight services**, all with healthchecks wired into `depends_on: condition: service_healthy` (where applicable):
+**Twelve services** — 8 infrastructure + 4 Go services. All with healthchecks wired into `depends_on: condition: service_healthy` (where applicable):
 
 | Service | Image | Port(s) | Purpose |
 |---|---|---|---|
@@ -1037,16 +1075,21 @@ Standard Go ignores (`*.test`, `coverage.out`), editor cruft (`.vscode/`, `.idea
 | `jaeger` | `jaegertracing/all-in-one:1.76.0` | 16686, 4317-4318, 14268 | OTLP collector + UI |
 | `loki` | `grafana/loki:3.3.0` | 3100 | Log storage (HTTP API, no UI) |
 | `promtail` | `grafana/promtail:3.3.0` | 9080 | Log shipper (binds host `./logs`) |
+| `api` | built from `Dockerfile` (`SERVICE=api`) | 8080 | HTTP API (`/healthz`, `/readyz`, `/metrics`, `/api/tickets/*`, `/api/reservations/*`, `/api/me/reservations`) |
+| `worker` | built from `Dockerfile` (`SERVICE=worker`) | 8081 | SQS consumer + 60s expiry sweep |
+| `expiration-watcher` | built from `Dockerfile` (`SERVICE=expiration-watcher`) | 8083 | Redis keyspace subscriber |
+| `dashboard-server` | built from `Dockerfile` (`SERVICE=dashboard-server`) | 8082 | k6 live-dashboard proxy |
 
 Volumes: `redis-data`, `postgres-data`, `prometheus-data`, `grafana-data`, `jaeger-data`, `loki-data`. Configs are bind-mounted from `monitoring/{prometheus,grafana,jaeger,loki,promtail}/`.
 
 Notes:
+- **All 4 Go services run in Docker.** This was the whole point of the dockerization milestone — `host.docker.internal` scrape targets are gone, Prometheus now scrapes by service name (`api:8080`, `worker:8081`, …) on the same Docker network. Host mode still works (`make api-bg`, `make worker-bg`) for fast `go run`-style iteration, and reads the same `.env`, so a JWT minted by host-side `bin/mintjwt` verifies in either place.
+- `./logs` is bind-mounted **read-write** into each Go service (so each writes to `logs/<service>.log` via the `LOG_FILE` env var) and **read-only** into promtail. One path, two mounts, one log file per service.
 - `redis` is started with `--notify-keyspace-events Ex` (Phase 7) + `--appendonly yes` (durability) + `--maxmemory 512mb` + `--maxmemory-policy allkeys-lru`.
 - `postgres` env from `POSTGRES_USER/PASSWORD/DB` (default `tickets/tickets/tickets`).
 - `elasticmq` mounts `./docker/elasticmq.conf` so the `reservations` queue is auto-created with 30 s visibility + 20 s long-poll.
-- `prometheus` scrapes the Go services via `host.docker.internal` (services run on the host, not in Docker).
 - `jaeger` accepts OTLP/gRPC on `:4317` and OTLP/HTTP on `:4318`.
-- `promtail` reads the host's `./logs` directory and ships to `loki` on `:3100`.
+- `promtail` uses `restart: always` rather than `unless-stopped` — a compose v5.5.1 / engine 29.8.2 quirk that rejects the latter policy for this service specifically. Left with a `TODO(investigate)` comment to re-test once upstream sorts it out.
 
 #### `docker/elasticmq.conf`
 
@@ -1060,7 +1103,7 @@ All observability side-channel configs. Bind-mounted into the corresponding Dock
 
 #### `monitoring/prometheus.yml`
 
-Scrape config. Three targets (`api:8080`, `worker:8081`, `expiration-watcher:8083` — the Go services run on the host and Prometheus reaches them via `host.docker.internal`). 10s scrape interval. Used as Prometheus's `--config.file` flag.
+Scrape config. Three targets (`api:8080`, `worker:8081`, `expiration-watcher:8083`) — all resolved as Docker **service names** on the shared user-defined network, which is what lets Prometheus reach them now that the Go services are containerised. 10s scrape interval. Used as Prometheus's `--config.file` flag.
 
 #### `monitoring/grafana/provisioning/`
 
@@ -1073,7 +1116,7 @@ Auto-provisioned datasource + dashboard configs so Grafana is "ready" the moment
 
 **"Ticket Deal — Overview"** dashboard (uid `ticket-deal-overview`). 7 panels, dark "control room" aesthetic, Prometheus-backed. The headline panel is `reservations_oversold_total` (top-left, single-stat, must always read 0). Other panels: held/completed rate, sold-out rate, HTTP error rate, p50/p90/p99 latency by route, live inventory gauge per event, queue depth per event, status code split.
 
-Designed in `docs/dashboard-redesign-plan.md` and shipped on `feature/observability`.
+Designed during the observability milestone (shipped on `feature/observability`) with a dark "control room" aesthetic: 7 panels, `reservations_oversold_total` pinned top-left in red (the invariant must be the first thing the eye lands on), per-route latency line-graphed over a 5m window rather than stat'd, status codes as a stacked area.
 
 #### `monitoring/grafana/dashboards/ticket-deal-logs.json`
 
@@ -1173,9 +1216,52 @@ Defines the `ReservationPublisher` interface (`Publish(ctx, []byte) error`) — 
   - On any non-200 outcome, the lock is released but the response is NOT cached — per the spec ("on success, SETEX"), retry-against-transient errors get a fresh attempt.
 Backed by `internal/redis/idempotency.go` (`NewIdempotency`, `Lookup`, `AcquireLock`, `ReleaseLock`, `Store`). Two Prometheus counters: `idempotency_replays_total`, `idempotency_body_mismatch_total`.
 
-#### `internal/api/publisher_test.go` / `internal/api/reserve_handler_test.go`
+#### `internal/api/publisher_test.go` / `internal/api/reserve_handler_test.go` / `internal/api/reserve_handler_idempotency_test.go`
 
 Tests for the handler and publisher interface. Handler tests use `httptest` and mock publishers. Critical coverage: each Lua outcome maps to the right HTTP code; seats_requested validation; publisher failure doesn't roll back.
+
+The idempotency test file is separate because it needs a different `doReserve` helper (`doReserveFull`, which also takes the `*redis.Idempotency` wrapper and an optional `Idempotency-Key` header value). The 6 cases: cached replay returns the *original* `reservation_id` with exactly one inventory decrement and one SQS publish; body mismatch → `409`; invalid key format → `400`; parallel retries → one `200` + one `409 in_flight`; error responses are *not* cached; absent header behaves identically to the pre-feature handler.
+
+#### `internal/api/get_reservation_handler.go`
+
+Layer 1 item 2. Two read-only handlers, both behind `auth.Middleware`:
+
+- `GetReservationHandler(pool)` → `GET /api/reservations/{id}`. `404` if no row matches, `403 not_your_reservation` if `row.UserID != claims.Subject`, `200` + `ReservationRow` otherwise. **403 rather than 404 on purpose:** reservation IDs are UUIDs (infeasible to guess), so a 403 leaks nothing of consequence, and the clearer semantics help the frontend distinguish "wrong account" from "doesn't exist". The code comment notes to swap to 404 if this endpoint ever opens to less-trusted clients.
+- `ListMyReservationsHandler(pool)` → `GET /api/me/reservations?status=&limit=&offset=`. Always scoped to the JWT subject — clients cannot ask for someone else's list. `status` omitted → all four statuses; an unrecognised `status` → `400 invalid_status` (rather than a silently-empty result, which would mask typos). Empty result → `200` + `[]`, never `404`, so the frontend renders one code path.
+
+Both are wrapped in OTel spans (`get_reservation.handle`, `list_my_reservations.handle`) and use the PII-safe `hashUserID` pattern on the cross-user branch.
+
+#### `internal/api/cancel_reservation_handler.go`
+
+Layer 1 item 3 — `POST /api/reservations/{id}/cancel`, behind `auth.Middleware`. Takes both `*db.Pool` and `*redis.Client`; both are mandatory (the DB is the record of intent, Redis is where the seat count lives).
+
+Five steps, in the order the spec mandates:
+
+1. JWT subject must equal `row.user_id` → `403` otherwise.
+2. Status pre-check. `CANCELLED` short-circuits **idempotently** (`200` + the row — a second cancel is a no-op, and critically does *not* `INCRBY` twice). `CONFIRMED` → `409 already_paid` (refund, not cancel — that's Layer 2). `EXPIRED` → `409 already_expired`.
+3. `db.TransitionStatus(ctx, pool, id, StatusPendingPayment, StatusCancelled)` — the CAS. If it returns `(false, nil)` the handler re-reads the row to work out who won: `EXPIRED` → `409`, `CANCELLED` → `200` (a concurrent duplicate), anything else → generic `409 cancel_race`.
+4. `INCRBY inventory:event:<id> <seats>` — release the seat back to Redis.
+5. Best-effort `DEL hold:event:<id>:user:<user>` — so the user's next `/reserve` doesn't `409 already_holding`.
+
+Steps 4 and 5 log `WARN` on failure and **still return `200`**. The reasoning is documented in the package comment: DB is the system-of-record for the user's *intent*; an inventory discrepancy is a reconcilable operator problem, not a user-facing one. Returning `5xx` would make the client retry into `409 already_cancelled`, which is strictly worse UX than a countable phantom seat (failure-mode row 23 in §11).
+
+Key construction goes through `redis.InventoryKey(eventID)` / `redis.HoldKey(eventID, userID)` — no stringly-typed keys anywhere in the handler.
+
+#### `internal/api/readyz_handler.go`
+
+Layer 1 item 4 — `GET /readyz`, no auth (a readiness probe can't carry credentials). Takes a `ReadinessChecks` struct of three `func(ctx) error` fields; each is run in its own goroutine with a 500 ms `context.WithTimeout`, fanning in through a buffered channel. **Parallel by construction** — a slow Postgres cannot delay the Redis result.
+
+Response shape matches the spec example verbatim:
+
+```json
+{"redis":"ok","postgres":"ok","sqs":"timeout after 500ms","ready":false}
+```
+
+`200` when every check is `"ok"` or `"not_configured"`; `503` otherwise. Four per-check states are rendered by one `formatStatus` helper: `"ok"`, `"not_configured"`, `"timeout after 500ms"` (detected via `errors.Is(err, context.DeadlineExceeded)`), `"error: <msg>"`.
+
+A `nil` SQS check means "not configured" — the dev-mode `LogPublisher` case — and counts as healthy, so a local process without a queue reports `ready:true` rather than a permanent `503`. `safeCheck` wraps each check in a `recover()` so a transient SDK nil-deref can't take the readiness endpoint down. A `503` also emits `slog.WarnContext` with the per-check detail, so Loki has a record even when K8s is the only HTTP consumer.
+
+**Why `/readyz` and not just `/healthz`:** the standard K8s split. A failed Postgres should remove the pod from the load balancer's ready set *without* triggering a restart loop — `/readyz` (503 → pull from rotation) and `/healthz` (always 200 → don't kill the process) give you two independent signals.
 
 ---
 
@@ -1243,7 +1329,50 @@ ON CONFLICT (reservation_id) DO NOTHING;
 
 Returns nil whether or not a row was created. `tag.RowsAffected() == 0` is informational only.
 
-`GetReservation(ctx, pool, id)` reads back a row by ID (used by tests + smoke-test verify scripts). Returns `pgx.ErrNoRows` for missing rows; `IsNoRows(err)` wraps that for callers that don't want to import pgx.
+`GetReservation(ctx, pool, id)` reads back a row by ID. Returns `pgx.ErrNoRows` for missing rows; `IsNoRows(err)` wraps that for callers that don't want to import pgx. LEFT-JOINs `events` to populate `EventName`, so API callers render a human-readable title without a second round-trip.
+
+#### `internal/db/types.go`
+
+Layer 1 item 2. `ReservationRow` — the single row shape used by both `GetReservation` and `ListReservationsByUser`, with snake_case JSON tags matching the rest of the API surface (see `reserve_handler.go`'s `"reservation_id"` / `"expires_in"` keys). Lives in its own file rather than `reservations.go` so the SQL helpers and the HTTP handlers can both depend on it without an import cycle; same package either way, so `db.ReservationRow` references are unaffected by the move.
+
+#### `internal/db/transition.go`
+
+Layer 1 item 1 — **the single gateway for every status change in the system.** `TransitionStatus(ctx, pool, id, from, to string) (changed bool, err error)`.
+
+The write is a compare-and-set:
+
+```sql
+UPDATE reservations SET status = $1, updated_at = NOW()
+WHERE reservation_id = $2 AND status = $3
+```
+
+Two callers racing the same row (a user's cancel vs the watcher's expiry sweep, or two parallel cancels) cannot both win. The first gets `(true, nil)`; the second observes `tag.RowsAffected() == 0` and gets `(false, nil)` — **not an error**, just "someone else already handled it." Callers that care re-read the row to learn the actual status. No transaction needed; Postgres row-level locks cover the rest.
+
+The `validTransitions` map encodes the entire directed graph as data:
+
+```go
+var validTransitions = map[string][]string{
+    StatusPendingPayment: {StatusConfirmed, StatusExpired, StatusCancelled},
+    StatusConfirmed:      {StatusCancelled},
+    // StatusExpired, StatusCancelled: terminal — absent from the map
+}
+```
+
+`EXPIRED` and `CANCELLED` are terminal: no outgoing edges, and they're deliberately absent from the map keys so the "nothing leaves a terminal state" rule is visible at a glance. Asking for an edge that isn't in the table returns `(false, ErrInvalidTransition)` — a **programmer** error, distinct from a CAS miss. Detected with `errors.Is`.
+
+Two `Compensate`-adjacent functions (`internal/expire/compensate.go`) were deliberately *not* refactored onto this helper: their CTE-based queries already return the `seats` column in the same statement, so folding them through `TransitionStatus` would mean a second round-trip for no correctness gain.
+
+#### `internal/db/list_reservations.go`
+
+Layer 1 item 2. `ListReservationsByUser(ctx, pool, userID, statusFilter string, limit, offset int) ([]ReservationRow, error)` — powers `GET /api/me/reservations`.
+
+- `statusFilter == ""` → all four statuses (default; the caller opts into filtering)
+- `limit <= 0` → `defaultListLimit` (20, from the spec's example URL); `> 100` → clamped to `hardMaxLimit` (a "give me a million" DoS guard)
+- `offset < 0` → 0
+- `ORDER BY created_at DESC` — newest first
+- Returns `([]ReservationRow{}, nil)` for an empty result. Never an error, so "no tickets yet" and "page 2 has fewer rows than page 1" render through the same client code path.
+
+Two near-identical `const` query strings (with / without the status filter) rather than a runtime SQL builder — for two shapes, the readability wins. The `(user_id, created_at DESC)` composite index added in `004_user_lookup_index.sql` satisfies both the filter and the sort directly from the index, no sort node in the plan.
 
 ---
 
@@ -1310,7 +1439,7 @@ Used only by `waitingroom.EnterHandler`. Not imported by Phase 5/6/7.
 
 ### `internal/logging/` — Phase 12 `log/slog` wrapper
 
-The structured-logging package. Every long-running service calls `logging.Init(...)` first thing in `main()`; one-shot CLIs (`cmd/seed-inventory`, `cmd/mintjwt`) keep stdlib `log.Printf` because they run once and exit (deliberate, documented in `docs/logging-plan.md`).
+The structured-logging package. Every long-running service calls `logging.Init(...)` first thing in `main()`; one-shot CLIs (`cmd/seed-inventory`, `cmd/mintjwt`) keep stdlib `log.Printf` because they run once and exit — deliberately, since structured logs add no value for a process that's already exited by the time anyone looks.
 
 #### `internal/logging/logging.go`
 
@@ -1384,7 +1513,35 @@ Tests both propagation paths. (1) Publisher injects the `traceparent` MessageAtt
 
 #### `internal/redis/reserve.go`
 
-`ReserveSeat(ctx, rdb, eventID, userID, holdTTLSec, seatsRequested) (Result, error)` runs `reserve.lua`. `Result{Status: StatusReserved | StatusRejected | StatusEventNotFound, Reason: ReasonSoldOut | ReasonAlreadyHolding}`. `InventoryKey(eventID)` and `HoldKey(eventID, userID)` are the canonical key formats; both the API handler and the expire package import these.
+`ReserveSeat(ctx, rdb, eventID, userID, holdTTLSec, seatsRequested) (Result, error)` runs `reserve.lua`. `Result{Status: StatusReserved | StatusRejected | StatusEventNotFound, Reason: ReasonSoldOut | ReasonAlreadyHolding}`. `InventoryKey(eventID)` and `HoldKey(eventID, userID)` are the canonical key formats; both the API handler and the expire package import these. The cancel handler imports the same two helpers — no stringly-typed keys anywhere in the API layer.
+
+#### `internal/redis/idempotency.go`
+
+Layer 1 item 5. Backs the `Idempotency-Key` header on `POST /reserve`. Constructed once at process start via `NewIdempotency(rdb, IdempotencyConfig{CacheTTL, LockTTL})`; zero values fall back to the spec defaults (24 h cache, 5 s lock).
+
+Two keys per client key, with the formats exposed as functions so handler code and test cleanup can't drift:
+
+- `CacheKey(k)` → `idempotency:<k>` — the cached response
+- `LockKey(k)` → `idempotency:<k>:inflight` — the short-TTL SETNX lock
+
+Four operations: `Lookup`, `AcquireLock`, `ReleaseLock`, `Store`. Plus `HashBody(body []byte) string` (sha256-hex; an empty body is a valid input with a well-known constant hash, so callers don't need a "no body" sentinel).
+
+**Storage shape** — one Redis STRING per key, so `Lookup` is one round-trip:
+
+```json
+{"body_hash": "<sha256 hex>", "status": 200, "response": { … }}
+```
+
+Co-storing `body_hash` is what makes mismatch detection built-in: `Lookup` returns `(0, nil, false, ErrIdempotencyBodyMismatch)` and the handler doesn't have to compare hashes itself. Co-storing `status` preserves the original HTTP status on replay. One `SET` on store, no half-cached state.
+
+Two sentinels, both detected with `errors.Is`:
+
+- `ErrIdempotencyBodyMismatch` — cached, but this request's body hashes differently → handler renders `409 idempotency_key_mismatch` (Stripe-style; catches clients that retry with a changed request without rotating the key)
+- `ErrIdempotencyCacheCorrupt` — cached value exists but won't unmarshal (manual tampering, schema drift) → handler logs `WARN` and treats it as a **miss**, so a cache problem never surfaces as a user-facing 5xx. The bad entry self-heals via TTL.
+
+**Lock semantics.** `AcquireLock` is a single `SETNX`, so under a retry storm exactly one caller wins and the rest get `409 in_flight` without consuming a seat. The 5 s TTL exists so a hard crash mid-request can't permanently block retries, while still comfortably outlasting a normal reserve+publish (~30 ms). Every terminal code path *also* issues an explicit `ReleaseLock` via the handler's `releaseLockIfHeld` helper, so the 5 s window only applies when the process dies outright.
+
+**Only successes are cached**, per the spec's wording ("on success, `SETEX`"). `4xx`/`5xx` responses release the lock but aren't stored, so a retry against a transient `sold_out` gets a fresh attempt rather than being pinned to a stale failure.
 
 #### `internal/redis/waitingroom.go`
 
@@ -1472,37 +1629,31 @@ Idempotent (`ON CONFLICT DO NOTHING`). Inserts event id=1 with name "Dev Test Ev
 
 Phase 7's schema change. Adds `seats INTEGER NOT NULL DEFAULT 1 CHECK (seats >= 1 AND seats <= 10)` to `reservations`. The `DEFAULT 1` backfills existing rows; the CHECK mirrors the API handler's `1 ≤ seats_requested ≤ 10` validation. Without this, the watcher/sweep wouldn't know how many to INCRBY on expiry.
 
+#### `migrations/004_user_lookup_index.sql`
+
+Layer 1 item 2. `CREATE INDEX IF NOT EXISTS idx_reservations_user_created ON reservations(user_id, created_at DESC)`.
+
+Composite, and in that order on purpose: the index ordering matches `ListReservationsByUser`'s `WHERE user_id = $1 ORDER BY created_at DESC` exactly, so Postgres satisfies both the filter and the sort from the index in one pass — no sort node in the plan. A single-column `user_id` index would still need a separate sort. Cheap to add now while the table is small; retrofitting it later on a large table means an online `CONCURRENTLY` rebuild.
+
 ---
 
 ### `docs/`
 
 #### `docs/architecture.md`
 
-**This file.** The engineering manual — design rationale + per-file reference. Updated with each phase's docs commit.
+**This file.** The engineering manual — design rationale + per-file reference. Updated with each milestone's docs commit.
 
-#### `docs/implementation-plan.md`
+#### `docs/product-roadmap.md`
 
-The phased checklist. Each phase has its goal, files created, wiring steps, and verification commands. The single source of truth for "what's next." Companion to this file.
+**The current source of truth for "what's next."** Lays out the remaining work as numbered layers, each with a per-item spec (endpoint shapes, status codes, JSON bodies, effort estimates). Layer 1 is shipped 5/5; Layer 2+ is unstarted. Also carries a "what's not there at all" gap list — the fastest way to see what's missing at a glance.
 
-#### `docs/observability-plan.md`
+Each Layer 1 item cites the branch that shipped it, so the git history and the roadmap cross-reference each other rather than drifting apart.
 
-Phase 10 plan. The argument for Prometheus + Grafana over SaaS alternatives (Datadog, New Relic), the metric catalog (what to measure, why, what buckets), the "Ticket Deal — Overview" dashboard layout, and the "control-room" design rationale. ~4.9KB.
-
-#### `docs/tracing-plan.md`
-
-Phase 11 plan. Why OpenTelemetry (not vendor-specific), the W3C TraceContext choice, manual span strategy in the reserve flow, SQS context propagation strategy, OTLP/gRPC vs HTTP trade-offs, and the sample waterfall walkthrough. ~8.7KB.
+> Historical note: the individual phase plans (`implementation-plan.md`, `observability-plan.md`, `tracing-plan.md`, `logging-plan.md`, `dashboard-redesign-plan.md`) were removed once their phases landed — a plan document for completed work is just a stale document. Their durable conclusions (metric catalog, span strategy, `ContextHandler` design, dashboard rationale) were folded into §13 of this file, which is where they live now.
 
 #### `docs/tracing-crashcourse.md`
 
-A 3-page "learn tracing fast" — covers spans, contexts, propagation, sampling, and the bag of vocabulary. Written for someone who has never used OTel before. Companion to `tracing-plan.md` (which is the project-specific application). ~11KB.
-
-#### `docs/logging-plan.md`
-
-Phase 12 plan. Why `log/slog` (stdlib, no dep churn) over zap/zerolog/logrus, the `ContextHandler` design (the 30-LOC wrapper that joins traces and logs), the chi access log migration, the `LOG_FORMAT=text|json` convention, the convention for `*Context` variants, the one-shot-CLI exception, and the Phase 13 addendum (Loki). ~16KB.
-
-#### `docs/dashboard-redesign-plan.md`
-
-The design rationale for the "control room" aesthetic of `ticket-deal-overview.json`: why dark theme, why the 7-panel layout, why `reservations_oversold_total` is top-left and red, why per-route latency is line-graphed instead of stat'd. ~7.8KB.
+A 3-page "learn tracing fast" — covers spans, contexts, propagation, sampling, and the bag of vocabulary. Written for someone who has never used OTel before. Generic rather than project-specific; §13.4 of this file is the project-specific application. ~11KB.
 
 #### `docs/comprehensive-go.md`
 
@@ -1512,7 +1663,13 @@ Background reading on the Go patterns used here (Lua EVAL wrappers, pool managem
 
 Background reading on Redis primitives used (Lua atomicity, keyspace notifications, ZSET semantics, stream consumer patterns). Not load-bearing.
 
----### `scripts/` — Phase 9 bg-service helpers + Phase 12 log cleanup
+---
+
+### `scripts/` — bg-service helpers + docker env bootstrap + log cleanup
+
+#### `scripts/setup-docker-env.sh`
+
+Dockerization. One-time per clone. `cp .env.docker.example .env.docker`, then migrate the host `.env`'s `JWT_SECRET` across if one exists — which is what lets a JWT minted by host-side `bin/mintjwt` verify inside the containerised API. Idempotent: re-running it won't clobber an existing `.env.docker`. `.env.docker` is gitignored (matched by the `.env.*` rule in `.gitignore`), so the template is the only committed copy.
 
 #### `scripts/start-bg.sh`
 
@@ -1589,11 +1746,7 @@ The two load-test targets pre-flight a `curl -sf -m 2 http://localhost:8080/heal
 
 - [README](../README.md) — project landing page (status table, tech stack, quick start)
 - [AGENTS.md](../AGENTS.md) — canonical AI-assistant context (project layout, conventions, env vars)
-- [`/docs/implementation-plan.md`](implementation-plan.md) — phased checklist (what's next)
-- [`/docs/observability-plan.md`](observability-plan.md) — Phase 10: metrics design
-- [`/docs/tracing-plan.md`](tracing-plan.md) — Phase 11: tracing design + SQS propagation
-- [`/docs/tracing-crashcourse.md`](tracing-crashcourse.md) — learn OTel from scratch (companion to `tracing-plan.md`)
-- [`/docs/logging-plan.md`](logging-plan.md) — Phase 12/13: slog + Loki
-- [`/docs/dashboard-redesign-plan.md`](dashboard-redesign-plan.md) — "Ticket Deal — Overview" dashboard design rationale
+- [`/docs/product-roadmap.md`](product-roadmap.md) — **what's next**: numbered layers, per-item specs, gap list
+- [`/docs/tracing-crashcourse.md`](tracing-crashcourse.md) — learn OTel from scratch
 - [`/docs/comprehensive-redis.md`](comprehensive-redis.md) — Redis deep-dive (Lua atomicity, keyspace notifications)
 - [`/docs/comprehensive-go.md`](comprehensive-go.md) — Go patterns used in this codebase
