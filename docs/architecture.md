@@ -1123,10 +1123,11 @@ The whole HTTP server bootstrap. **Order of init matters** (later depends on ear
 5. The chi router is wrapped in `otelhttp.NewHandler(router, "api")` — every HTTP request becomes a parent span automatically.
 6. `slogmw.NewSlogAccessLog()` replaces `chi/middleware.Logger` — every request gets an access log line with the OTel `trace_id` auto-injected by the `ContextHandler`.
 7. Mounts `/healthz` + `/api/tickets/{enter,queue,reserve}` (the reserve route is behind `auth.Middleware()`).
-8. Layer 1 (product-roadmap.md): mounts the two read-only lookup routes under a new top-level `/api` group, both behind `auth.Middleware()`:
+8. Layer 1 (product-roadmap.md): mounts three reservation routes under a new top-level `/api` group, all behind `auth.Middleware()`:
    - `GET /api/reservations/{id}` — returns the caller's reservation row by UUID (403 if it belongs to someone else, 404 if no row matches).
    - `GET /api/me/reservations` — caller's own list, newest first; query params `?status=` (optional filter), `?limit=` (default 20, max 100), `?offset=`. Returns a JSON array (possibly empty).
-8. `http.Server` with graceful shutdown on `SIGINT`/`SIGTERM` (5-second grace). The shutdown sequence: HTTP server (stop accepting) → drainer goroutine (cancel) → tracing shutdown (flush pending spans, ~5s budget).
+   - `POST /api/reservations/{id}/cancel` — user-initiated cancel. CAS-safe against the watcher's EXPIRED sweep (CAS via `db.TransitionStatus`); atomically `INCRBY inventory:event:<id> <seats>` to release the seat back; best-effort `DEL hold:event:<id>:user:<user>` so the user can re-reserve without `409 already_holding`. Idempotent — repeated cancels return 200 + the row. Partial-failure policy: if Redis is briefly down after the DB transition succeeded, the handler logs WARN and still returns 200 (DB is the system-of-record for intent; operator reconciles inventory).
+9. `http.Server` with graceful shutdown on `SIGINT`/`SIGTERM` (5-second grace). The shutdown sequence: HTTP server (stop accepting) → drainer goroutine (cancel) → tracing shutdown (flush pending spans, ~5s budget).
 
 `buildPublisher()` is the key wiring function: if `SQS_QUEUE_URL` is set, constructs `ReservationAPIPublisher(SQSPublisher(sqsClient))`; otherwise falls back to `LogPublisher` so the API stays runnable for handler work without a worker. Returns a `config.Config` value (not pointer) — handlers read it once at handler-construction time.
 

@@ -181,13 +181,13 @@ func run() error {
 				time.Duration(cfg.ReserveHoldTTL)*time.Second))
 	})
 
-	// Layer 1 (product-roadmap.md) — read-only reservation lookups.
-	// Both routes require JWT auth (auth.Middleware). The pool is
-	// the worker's *db.Pool; we pass the same instance so /api/me
-	// reads the same row writes the worker just committed (no
-	// eventual-consistency gap for the user). Both endpoints are
-	// backed by the new internal/db.ListReservationsByUser + the
-	// composite index in migrations/004.
+	// Layer 1 (product-roadmap.md) — reservation lookup + cancel.
+	// All routes require JWT auth (auth.Middleware). The pool is the
+	// worker's *db.Pool; we pass the same instance so /api/me reads
+	// the same row writes the worker just committed (no eventual-
+	// consistency gap for the user). The rdb is the shared Redis
+	// client used by /reserve — cancel reads/seats to release seats
+	// back and clear the hold key.
 	r.Route("/api", func(r chi.Router) {
 		// GET /api/reservations/{id}  — single reservation by UUID
 		r.With(auth.Middleware(cfg.JWTSecret)).Get("/reservations/{id}",
@@ -197,6 +197,13 @@ func run() error {
 		// Optional ?status=, ?limit= (default 20, max 100), ?offset=
 		r.With(auth.Middleware(cfg.JWTSecret)).Get("/me/reservations",
 			api.ListMyReservationsHandler(pool))
+
+		// POST /api/reservations/{id}/cancel  — Layer 1 item 3
+		// (item 2 of the cancel flow itself). See
+		// internal/api/cancel_reservation_handler.go for the full
+		// status-machine flow + partial-failure policy.
+		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reservations/{id}/cancel",
+			api.CancelReservationHandler(pool, rdb))
 	})
 
 	// ── HTTP server ────────────────────────────────────────────────
