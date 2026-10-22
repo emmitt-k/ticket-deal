@@ -50,12 +50,20 @@ Client → API (:8080) → Redis (rate-limit + waiting-room queue)
                             → Worker (:8081) consumes SQS → writes to Postgres
                             → Expiration-Watcher (keyspace notifications) → auto-expires holds
 
+Everything (infra + the 4 long-running Go services) runs as Docker
+containers from `docker-compose.yml`. One command brings up the full
+stack:
+
+  docker compose --env-file .env.docker up -d   # see "Run (Docker mode)" below
+
 Observability:
   All services expose /metrics → Prometheus (:9090) → Grafana (:3000)
+  All services emit structured logs → ./logs/*.log → Promtail → Loki → Grafana
+  All services trace via OTLP/gRPC → Jaeger (:16686)
 ```
 
 **Key correctness invariants:**
-- 100 tickets per event (hardcoded seed in `scripts/start-bg.sh`)
+- 100 tickets per event (hardcoded seed in `migrations/002_seed.sql`)
 - 200ms HTTP timeout on /reserve
 - Redis atomic Lua scripts for seat locking (no oversell)
 - Waiting room: VUs queued in Redis, released in FIFO order
@@ -69,16 +77,31 @@ Run `make` or `make help` to see all targets with descriptions.
 
 ### Development
 
+**Docker mode (recommended):** all 4 long-running Go services run as containers
+under `docker-compose.yml`. The full stack comes up with one command:
+
+```bash
+scripts/setup-docker-env.sh          # one-time per clone: create .env.docker
+docker compose --env-file .env.docker up -d --build   # bring everything up
+docker compose --env-file .env.docker down            # bring everything down
+docker compose --env-file .env.docker logs -f api worker  # tail service logs
+docker compose --env-file .env.docker restart api        # rebuild + restart one
+```
+
+**Host mode (legacy, still works):** Go services run on the host via `make`,
+infra stays in Docker. Useful for fast `go run`-style iteration; uses the same
+`.env` so JWTs minted by host-side `mintjwt` verify either way.
+
 ```bash
 make all-services     # Start API + worker + expiration-watcher + dashboard-server in background
-make api             # Run API in foreground (ctrl-c to stop)
-make api-bg          # Start API in background (logs/logs/api.log)
-make worker-bg       # Start queue worker in background
-make watcher-bg      # Start expiration-watcher in background
-make dashboard-bg    # Start live dashboard (http://localhost:8082/)
-make down            # Stop all docker compose services
-make status          # Show running processes, container state, DB/Redis counts
-make clean-logs      # Delete all log files (logs/*.log + logs/burst/* + logs/ramp/*)
+make api              # Run API in foreground (ctrl-c to stop)
+make api-bg           # Start API in background (logs/logs/api.log)
+make worker-bg        # Start queue worker in background
+make watcher-bg       # Start expiration-watcher in background
+make dashboard-bg     # Start live dashboard (http://localhost:8082/)
+make down             # Stop all docker compose services
+make status           # Show running processes, container state, DB/Redis counts
+make clean-logs       # Delete all log files (logs/*.log + logs/burst/* + logs/ramp/*)
 make clean-logs-truncate  # Truncate (don't delete) all log files; safe in-flight
 ```
 
@@ -103,7 +126,10 @@ make stop-loadtest         # Kill any running k6 process (burst or ramp)
 #### Metrics (Prometheus + Grafana)
 
 ```bash
-# After `make all-services` + `docker compose up -d prometheus grafana`:
+# Brought up automatically by `docker compose --env-file .env.docker up -d`.
+# To verify observability services are up:
+docker compose --env-file .env.docker ps | grep -E 'prometheus|grafana'
+
 #   Prometheus: http://localhost:9090
 #   Grafana:    http://localhost:3000  (admin / admin123, anonymous Viewer enabled)
 #   Dashboard:  "Ticket Deal" folder → "Ticket Deal — Overview"
@@ -114,14 +140,18 @@ All Go services expose `/metrics` (Prometheus format) on their own ports:
 - Worker: `:8081/metrics` (dedicated tiny HTTP server, set `METRICS_ADDR` to change)
 - Expiration-watcher: `:8083/metrics` (set `METRICS_ADDR` to change)
 
-Prometheus scrapes via `host.docker.internal` — the Go services run on the host, not in Docker.
-
 **Most important metric:** `reservations_oversold_total` — should ALWAYS be 0. Alert if > 0.
+
+All these services run inside Docker; scrape targets are service names (e.g. `api:8080`, `worker:8081`), not `host.docker.internal`. The `host.docker.internal` entries in compose are kept for parity but unused now that nothing runs on the host.
 
 #### Tracing (OpenTelemetry + Jaeger)
 
 ```bash
-# After `docker compose up -d jaeger` + `make all-services`:
+# Brought up automatically by `docker compose --env-file .env.docker up -d`.
+# The Go services export OTLP/gRPC to http://jaeger:4317 (the compose
+# service name, not localhost — the network is the same Docker user-defined
+# network for every container in the compose file).
+
 #   Jaeger UI:  http://localhost:16686
 #   Search by service (api / worker / expiration-watcher) or trace_id
 #   OTLP/gRPC:  localhost:4317 (services export to this)
@@ -194,10 +224,15 @@ Conventions:
 - Functions with a `ctx` in scope use `*Context` variants so trace correlation works
 - `service=` and `service_version=` are prepended to every record by Init — drop the `"api: "` / `"worker: "` prefix from message text
 - `log.Fatalf` is replaced with `slog.Error + os.Exit(1)` so deferred shutdown funcs (tracing flush, DB pool close) still run
-- One-shot CLIs (`cmd/seed-inventory`, `cmd/mintjwt`) keep stdlib `log.Printf` — they run once and exit, so structured logs add no value (documented in `docs/logging-plan.md` §Decision 4)
+- One-shot CLIs (`cmd/seed-inventory`, `cmd/mintjwt`) keep stdlib `log.Printf` — they run once and exit, so structured logs add no value
 
 Env vars:
 - `LOG_LEVEL` (default `info`) — debug/info/warn/error
+- `LOG_FILE` (default empty) — if set, the logger writes to this path
+  instead of stdout. Used by the dockerised Go services so they can
+  write directly into the bind-mounted `./logs/<svc>.log` (Promtail then
+  ships those files to Loki). On host mode, leave unset — `start-bg.sh`
+  redirects stdout to `logs/<svc>.log` instead.
 - `LOG_FORMAT` (default `text`) — text (dev) / json (prod, Loki-ready)
 - `SERVICE_VERSION` (default `dev`) — set by build via `-ldflags` in CI
 
@@ -214,7 +249,7 @@ Same line in JSON format (`LOG_FORMAT=json`):
 #### Logs (Grafana Loki + Promtail)
 
 ```bash
-# After `make all-services` + `docker compose up -d loki promtail`:
+# After `docker compose --env-file .env.docker up -d` (loki + promtail included):
 #   Loki HTTP API:  http://localhost:3100
 #   Promtail:       http://localhost:9080  (its own /metrics, rarely used directly)
 #   Grafana:        http://localhost:3000  → "Ticket Deal" folder → "Ticket Deal — Logs"
@@ -222,14 +257,18 @@ Same line in JSON format (`LOG_FORMAT=json`):
 
 **Architecture:**
 ```
-Go services (host) → logs/*.log → Promtail (in docker) → Loki (in docker) → Grafana
+Go services (in docker) ──./logs:/app/logs bind mount──> logs/*.log (host)
+   ▲
+   └──./logs:/var/log/ticket-deal:ro bind mount──> Promtail (in docker) ──> Loki (in docker) ──> Grafana
 ```
 
-The Go services write to `logs/<service>.log` on the host (via `nohup` from
-`scripts/start-bg.sh`). Promtail runs in a container, bind-mounts the host's
-`logs/` directory, tails the files, parses `service` (from filename) +
-`trace_id` (from line body, both text and json formats) as Loki labels, and
-pushes them as streams. Loki stores them on disk (`loki-data` volume).
+Even with the Go services in Docker, log shipping uses the same `./logs/`
+bind mount pattern as before — `./logs` is bind-mounted RW into each Go
+service (so each service writes to `logs/<service>.log`) and bind-mounted RO
+into Promtail (so it tails the same files). Promtail parses `service`
+(from filename) + `trace_id` (from line body, both text and json formats) as
+Loki labels, and pushes them as streams. Loki stores them on disk
+(`loki-data` volume).
 
 **Config files:**
 - `monitoring/loki/loki-config.yml` — filesystem backend, single replica, 7-day retention
@@ -307,10 +346,9 @@ make purge        # clean + docker compose down (keeps volumes)
 │   ├── run-burst.sh           # Run burst — auto-resets state + mints JWTs; timestamped log → logs/burst/
 │   └── run-ramp.sh            # Run ramp — auto-resets state + mints JWTs; timestamped log → logs/ramp/
 ├── scripts/
-│   ├── start-bg.sh            # Generic background process starter (pid + log)
-│   ├── stop-bg.sh             # Generic background process stopper (pid-based)
-│   ├── start-all.sh           # Start all services (used by make all-services)
-│   ├── stop-all.sh            # Stop all services
+│   ├── start-bg.sh            # Generic background process starter (pid + log) — host mode only
+│   ├── stop-bg.sh             # Generic background process stopper (pid-based) — host mode only
+│   ├── setup-docker-env.sh    # One-time setup: create .env.docker from example + host .env JWT_SECRET
 │   └── clear-logs.sh          # Delete (or truncate) logs/*.log + logs/burst/* + logs/ramp/*; safe in-flight
 ├── docs/
 │   ├── architecture.md        # Full architecture deep-dive
@@ -396,9 +434,20 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 
 ## Common Task Sequences
 
-### Full local dev loop
+### Full local dev loop (Docker mode — recommended)
 ```bash
-make all-services   # Start everything
+scripts/setup-docker-env.sh                                # one-time per clone
+docker compose --env-file .env.docker up -d --build        # bring full stack up
+make loadtest-state && make loadtest-jwts                  # Reset + seed JWTs
+make loadtest-burst                                        # Smoke test
+make loadtest-ramp                                         # Full stress test
+# ...iterate code...
+docker compose --env-file .env.docker restart api worker   # Rebuild + restart Go services
+```
+
+### Full local dev loop (host mode — legacy)
+```bash
+make all-services   # Start everything (Go on host, infra in Docker)
 make loadtest-state && make loadtest-jwts   # Reset + seed JWTs
 make loadtest-burst  # Smoke test
 make loadtest-ramp   # Full stress test

@@ -1,6 +1,15 @@
 name: ticket-deal
 
-# All three services for Phase 0.
+# Ticket-Deal full stack — brings up infra (DB / queue / observability) AND the
+# 4 Go services together.
+#
+# First-time setup (one-shot, results are gitignored):
+#   ./scripts/setup-docker-env.sh
+#
+# Then:
+#   docker compose --env-file .env.docker up -d
+#   docker compose --env-file .env.docker down   # stop everything
+#
 # Healthchecks are wired into `depends_on: condition: service_healthy`
 # so anything depending on them waits until they're actually ready.
 
@@ -185,6 +194,111 @@ services:
     command: -config.file=/etc/promtail/config.yml
     depends_on:
       - loki
+    restart: always
+
+  # ─── Go services (built from the shared Dockerfile) ────────
+  #
+  # The 4 long-running Go services. Each is built with a different
+  # SERVICE build arg so the same Dockerfile produces 4 binaries:
+  #   - api                  → POST /reserve (Phase 5 hot path)
+  #   - worker               → SQS → Postgres reservations writer
+  #   - expiration-watcher   → Redis keyspace-notification → seat release
+  #   - dashboard-server     → k6 REST + serve loadtest/dashboard.html
+  #
+  # All 4 share the bind mount `./logs:/app/logs` so Promtail can ship
+  # their structured logs exactly the same way as when they ran on the
+  # host. The bind mount is the same path; no Promtail config changes.
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: api
+    image: ticket-deal-api:dev
+    container_name: ticket-api
+    environment:
+      LOG_FILE: /app/logs/api.log        # bind mount + per-service file (see volumes:)
+    env_file: .env.docker
+    ports:
+      - "8080:8080"     # public: curl /reserve, browser dashboard users
+    volumes:
+      - ./logs:/app/logs                # Promtail sidecar reads the same dir
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_healthy
+      jaeger:
+        condition: service_started     # jaeger has no healthcheck defined
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # macOS/Windows host escape
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: worker
+    image: ticket-deal-worker:dev
+    container_name: ticket-worker
+    environment:
+      LOG_FILE: /app/logs/worker.log
+    env_file: .env.docker
+    ports:
+      - "8081:8081"     # Prometheus scrapes /metrics; user can curl for debug
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  expiration-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: expiration-watcher
+    image: ticket-deal-watcher:dev
+    container_name: ticket-expiration-watcher
+    environment:
+      LOG_FILE: /app/logs/expiration-watcher.log
+    env_file: .env.docker
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: dashboard-server
+    image: ticket-deal-dashboard:dev
+    container_name: ticket-dashboard
+    environment:
+      LOG_FILE: /app/logs/dashboard-server.log
+    env_file: .env.docker
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./logs:/app/logs
+      - ./loadtest:/app/loadtest:ro     # serves dashboard.html live from host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # talks to k6 running on host
     restart: unless-stopped
 
 # Named volumes so data survives `docker compose down`

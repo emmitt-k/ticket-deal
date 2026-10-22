@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+!.env.docker.example
+# .env.docker stays gitignored — it's created from .env.docker.example by
+# scripts/setup-docker-env.sh and contains the real JWT_SECRET.
 
 # ─── Go build artifacts ───────────────────────────────────────
 *.exe
