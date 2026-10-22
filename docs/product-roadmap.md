@@ -69,7 +69,7 @@ transitions is Layer 1, item 1.
 - No admin/ops API — no way for support to look up / cancel / refund
 - No `/readyz` — only bare `/healthz`, no deep dep checks *(Layer 1 item 4 — done; see branch `feature/readyz`)*
 - No anti-bot/CAPTCHA — only IP rate-limit via waiting room
-- No idempotency keys — relies on UUID-on-every-request (fails on network retry)
+- No idempotency keys on POST /reserve — network retries could double-charge. *(Layer 1 item 5 — done; see branch `feature/idempotency-key`)*
 - No audit log — `who did what when` is unanswerable
 
 ---
@@ -160,7 +160,7 @@ body showing which check failed for ops debugging:
 {"redis":"ok","postgres":"ok","sqs":"timeout after 500ms","ready":false}
 ```
 
-### 5. Idempotency-Key on POST /reserve
+### 5. Idempotency-Key on POST /reserve ✅ Done
 
 **Effort:** ~half a day. **Why:** network retries shouldn't double-charge the user.
 
@@ -186,7 +186,7 @@ After this layer, the system has:
 - ✅ Look-up their own tickets  *(Layer 1 item 2 — done)*
 - ✅ Cancel them  *(Layer 1 item 3 — done; branch `feature/cancel-reservation`)*
 - ✅ Tell ops "I'm healthy and all my deps are reachable"  *(Layer 1 item 4 — done; branch `feature/readyz`)*
-- Network-retry safely
+- ✅ Network-retry safely  *(Layer 1 item 5 — done; branch `feature/idempotency-key`)*
 
 About 1 weekend of focused work. Small commits. Each item is independent.
 

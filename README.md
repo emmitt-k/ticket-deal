@@ -53,6 +53,70 @@ The three phases, in one line each:
 
 ---
 
+## API Surface
+
+Nine routes. Everything under `/api/reservations` and `/api/me` requires a JWT from
+`/enter`; the waiting-room and health routes are open.
+
+| Method | Route | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/healthz` | — | Process-alive. Never checks dependencies |
+| `GET` | `/readyz` | — | Readiness. Checks Redis + Postgres + SQS in parallel. `503` if any is down |
+| `GET` | `/metrics` | — | Prometheus exposition |
+| `POST` | `/api/tickets/enter` | — | Waiting-room admission. Returns a JWT if admitted, a queue position if not |
+| `GET` | `/api/tickets/queue` | — | SSE stream of your queue position |
+| `POST` | `/api/tickets/reserve` | JWT | **Reserve a seat.** Honours `Idempotency-Key` |
+| `GET` | `/api/reservations/{id}` | JWT | Fetch one reservation |
+| `GET` | `/api/me/reservations` | JWT | List your reservations |
+| `POST` | `/api/reservations/{id}/cancel` | JWT | Cancel a `PENDING_PAYMENT` reservation |
+
+### Try the whole flow
+
+```bash
+make env                                              # host-side .env for mintjwt
+JWT=$(USER_ID=demo EVENT_ID=1 make -s mintjwt)
+
+# 1. Reserve a seat
+RES=$(curl -sS -X POST http://localhost:8080/api/tickets/reserve \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $JWT" \
+  -d '{"seats_requested":1}')
+ID=$(echo "$RES" | jq -r .reservation_id)
+
+# 2. Read it back
+curl -sS http://localhost:8080/api/reservations/$ID -H "Authorization: Bearer $JWT"
+
+# 3. List everything you own (filter by status)
+curl -sS "http://localhost:8080/api/me/reservations?status=PENDING_PAYMENT" \
+  -H "Authorization: Bearer $JWT"
+
+# 4. Cancel it — idempotent, so calling twice is safe
+curl -sS -X POST http://localhost:8080/api/reservations/$ID/cancel \
+  -H "Authorization: Bearer $JWT"
+
+# 5. Health + readiness
+curl -sS http://localhost:8080/healthz
+curl -sS http://localhost:8080/readyz
+# → {"redis":"ok","postgres":"ok","sqs":"ok","ready":true}
+```
+
+### Safe retries
+
+`POST /reserve` accepts an `Idempotency-Key`. Send the same key twice and you get the
+**same reservation back** — no second seat consumed, no second queue message:
+
+```bash
+curl -sS -X POST http://localhost:8080/api/tickets/reserve \
+  -H "Authorization: Bearer $JWT" -H "Idempotency-Key: my-unique-request-42" \
+  -d '{"seats_requested":1}' -D- | grep -i 'replayed\|HTTP/'
+# 2nd call → "Idempotency-Replayed: true"
+```
+
+If you rotate nothing and change the *body*, you get `409 idempotency_key_mismatch` —
+that's the signal you reused a key for a different request. Two genuinely parallel
+requests with one key: the second gets `409 in_flight` and does not reserve.
+
+---
+
 ## Current Status
 
 | #   | Phase                       | Status      | What landed                                                                                              |
@@ -68,7 +132,21 @@ The three phases, in one line each:
 | 8   | Load test + invariants      | ✅ Done      | `loadtest/burst.js` (1000 VUs, 1 iter — pure shock) + `loadtest/ramp.js` (7-stage 0→50→200→1000 VUs, ~90s); live dashboard on http://localhost:8082 (polls k6 REST); 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
 | 9   | Polish                      | ✅ Done      | `Makefile` (30+ targets, `make help`); all services (infra + the 4 long-running Go services) brought up by one `docker compose --env-file .env.docker up -d`; legacy host-mode `make all-services` kept for fast `go run` iteration; structured logging + Loki/Promtail log shipping; 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
 
-> Full phased plan with file layout, code snippets, verification steps, and the lite-auth design → [`/docs/architecture.md`](docs/architecture.md)
+### Layer 1 — the product surface (all 5 shipped)
+
+The core system above is a reservation *engine*. Layer 1 is what turns it into
+something a user can actually operate — read their tickets, cancel one, see whether the
+service is healthy, and retry safely.
+
+| # | Item | Status | What landed |
+|---|---|---|---|
+| 1 | **State-machine gateway** | ✅ Done | `internal/db/transition.go` — `TransitionStatus` does a compare-and-set UPDATE guarded by a `validTransitions` table. Every status change in the system goes through it; an impossible transition is refused before the DB is touched |
+| 2 | **Read endpoints** | ✅ Done | `GET /api/reservations/{id}` + `GET /api/me/reservations?status=&limit=&offset=` — JWT-scoped, paginated, filterable, backed by a composite index that satisfies filter and sort in one pass |
+| 3 | **Cancel** | ✅ Done | `POST /api/reservations/{id}/cancel` — CAS-safe against the expiry watcher, releases the seat back to Redis, idempotent on a second cancel (and does not double-release) |
+| 4 | **Readiness probe** | ✅ Done | `GET /readyz` — 3 parallel dependency checks (Redis / Postgres / SQS) with 500ms budgets. Deliberately separate from `/healthz` so a dead Postgres pulls the container from load-balancer rotation *without* triggering a restart loop |
+| 5 | **Idempotent retries** | ✅ Done | `Idempotency-Key` on `POST /reserve` — 24h cached-response replay plus a short-TTL SETNX in-flight lock, so a retry storm can't double-book. Stripe-style `409` if the same key arrives with a different body |
+
+> Layer-by-layer specs, and what's next → [`/docs/product-roadmap.md`](docs/product-roadmap.md) · Design rationale and per-file reference → [`/docs/architecture.md`](docs/architecture.md)
 
 ---
 
@@ -76,6 +154,7 @@ The three phases, in one line each:
 
 | Layer          | Technology                                                                                          | Why                                                                                                                       |
 | -------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Language       | **Go 1.27.1**                                                                                       | Goroutines make the hot path cheap; single static binaries; one language across API, worker, watcher, dashboard               |
 | API server     | **Go** + [`chi`](https://github.com/go-chi/chi)                                                     | Goroutines handle 10k+ connections per process; single static binary                                                      |
 | Hot-path       | **Redis 7**                                                                                         | Single-threaded execution makes Lua atomic; microsecond reads; native TTL; keyspace notifications built in               |
 | Queue          | **AWS SQS Standard**                                                                                | Unlimited throughput (Standard, not FIFO). At-least-once + idempotent workers = reliable enough                           |
@@ -100,41 +179,59 @@ The three phases, in one line each:
 
 ```
 .
-├── cmd/
-│   ├── api/                  # Go API server (chi router, SSE handler) [✅ Phase 3]
-│   ├── worker/               # Go SQS consumer → Postgres writer + 60s expiry sweep goroutine [✅ Phase 6,7]
-│   └── expiration-watcher/   # Redis keyspace listener → marks expirations in Postgres [✅ Phase 7]
+├── cmd/                      # 6 binaries
+│   ├── api/                  # HTTP server (chi router, SSE, reserve/get/list/cancel, readyz)
+│   ├── worker/               # SQS consumer → Postgres writer + 60s expiry sweep goroutine
+│   ├── expiration-watcher/   # Redis keyspace listener → marks expirations in Postgres
+│   ├── dashboard-server/     # Serves the live k6 dashboard (:8082)
+│   ├── mintjwt/              # Mint a JWT by hand (used by load tests + curl)
+│   └── seed-inventory/       # Seeds Postgres with an event + 100 seats
 ├── internal/
-│   ├── api/                  # chi router, handlers [✅ Phase 5]
-│   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret [✅ Phase 3]
-│   ├── config/               # env loading (godotenv) + fail-fast validation
-│   ├── apiutil/              # JSON helpers + ErrorBody shape (uniform error envelope)
-│   ├── iplimit/              # Per-IP token bucket (rate limit at /enter) [✅ Phase 4]
-│   ├── waitingroom/          # Per-event token bucket + ZSET queue + SSE handler + drainer [✅ Phase 4]
-│   ├── redis/                # Lua scripts + Go wrappers [✅ Phase 2]
-│   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2) [✅ Phase 6]
-│   ├── db/                   # pgx pool + InsertIfAbsent (idempotent) [✅ Phase 6]
-│   └── expire/               # Compensate (DB+INCRBY) shared by watcher + sweep [✅ Phase 7]
+│   ├── api/                  # HTTP handlers + the publisher seam
+│   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret
+│   ├── config/               # env loading + fail-fast validation (incl. Postgres DSN)
+│   ├── apiutil/              # JSON helpers + ErrorBody shape + slog access-log middleware
+│   ├── iplimit/              # Per-IP token bucket (rate limit at /enter)
+│   ├── waitingroom/          # Per-event token bucket + ZSET queue + SSE handler + drainer
+│   ├── redis/                # Lua scripts, seat locking, Idempotency-Key store
+│   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2)
+│   ├── db/                   # pgx pool, idempotent writes, TransitionStatus, list queries
+│   ├── expire/               # Compensate (DB+INCRBY) shared by watcher + sweep
+│   ├── logging/              # slog init + OTel trace correlation handler
+│   ├── tracing/              # OpenTelemetry init + shutdown flush
+│   └── metrics/              # Prometheus catalog
 ├── migrations/
 │   ├── 001_init.sql          # events, reservations, idempotency PK, partial index
 │   ├── 002_seed.sql          # Dev event id=1 with 100 inventory
-│   └── 003_add_seats.sql     # seats column on reservations (Phase 7 INCRBY sizing)
+│   ├── 003_add_seats.sql     # seats column on reservations (Phase 7 INCRBY sizing)
+│   └── 004_user_lookup_index.sql  # (user_id, created_at DESC) for GET /api/me/reservations
 ├── docker/
 │   └── elasticmq.conf        # Pre-creates 'reservations' queue on boot (2-RTT cheaper than manual aws-cli)
-├── loadtest/                 # k6 scripts (Phase 8)
+├── loadtest/                 # k6 scripts (burst.js, ramp.js, live dashboard)
+├── monitoring/               # Observability configs, bind-mounted into containers
+│   ├── prometheus.yml        # scrape config (api:8080, worker:8081, watcher:8083)
+│   ├── loki/loki-config.yml
+│   ├── promtail/promtail-config.yml
+│   └── grafana/              # provisioned datasources + 2 dashboards (Overview, Logs)
 ├── docs/
-│   ├── architecture.md            # System design + diagrams + failure modes
+│   ├── architecture.md            # System design + diagrams + failure modes + per-file reference
 │   ├── product-roadmap.md         # Where we are, what's next, build order
 │   ├── tracing-crashcourse.md     # Learn OpenTelemetry from scratch (background)
 │   ├── comprehensive-redis.md     # Lua atomicity, keyspace notifications
 │   └── comprehensive-go.md        # Go patterns used in this codebase
-├── docker-compose.yml        # Redis 7 + Postgres 16 + ElasticMQ + observability + the 4 Go services (api, worker, watcher, dashboard-server), all with healthchecks
-├── Dockerfile                # Multi-stage, distroless/static-debian12:nonroot; one file, parameterised by SERVICE build arg
-├── .dockerignore             # Keeps the build context tight (.git, logs, monitoring, etc.)
 ├── scripts/
-│   └── setup-docker-env.sh   # One-time: creates .env.docker from .env.docker.example (reuses host .env JWT_SECRET)
+│   ├── setup-docker-env.sh   # One-time: creates .env.docker from .env.docker.example (reuses host .env JWT_SECRET)
+│   ├── start-bg.sh / stop-bg.sh  # Host-mode background service control
+│   └── clear-logs.sh         # Delete or truncate runtime + k6 logs (safe in-flight)
+├── logs/                     # Runtime logs + timestamped k6 output (bind-mounted into containers)
+├── .github/                  # CI workflow + Dependabot config
+├── docker-compose.yml        # 12 services: 8 infra + the 4 Go services (api, worker, watcher, dashboard-server), all with healthchecks
+├── Dockerfile                # Multi-stage, distroless/static-debian12:nonroot; one file, parameterised by SERVICE build arg
+├── .dockerignore             # Keeps the build context tight (.git, logs, bin, monitoring, etc.)
 ├── .env.example              # Template — copy to .env (NEVER commit .env) — host-mode run config
 ├── .env.docker.example       # Template — copy to .env.docker (NEVER commit .env.docker) — dockerised run config
+├── Makefile                  # Every task: build, test, load tests, service control, log cleanup
+├── AGENTS.md                 # Canonical context for AI coding assistants
 ├── go.mod                    # module github.com/emmitt-k/ticket-deal
 └── README.md
 ```
@@ -192,6 +289,7 @@ curl -sS -X POST http://localhost:8080/api/tickets/reserve \
   -H "Content-Type: application/json" -H "Authorization: Bearer $JWT" \
   -d '{"seats_requested":1}'
 # → {"reservation_id":"...","seats":1,"expires_in":600}
+# Full walkthrough (read back → list → cancel → readiness) in "API Surface" above.
 
 # Load test it (auto-resets state + mints JWTs + runs k6 in background)
 make loadtest-burst  # 1000 VUs, ~1s — pure correctness shock
@@ -237,7 +335,7 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **All Phases 0–9 complete.** Run `make loadtest-burst` or `make loadtest-ramp` (see [Quick Start](#quick-start) above) to prove the core invariant under load.
+> **All Phases 0–9 plus Layer 1 are complete.** Run `make loadtest-burst` or `make loadtest-ramp` (see [Quick Start](#quick-start) above) to prove the core invariant under load.
 
 ### Load testing (k6 + live dashboard)
 
@@ -294,7 +392,9 @@ docker compose --env-file .env.docker up -d
 #   Prometheus:  http://localhost:9090
 #   Grafana:     http://localhost:3000   (admin / admin123)
 #   Dashboard:   "Ticket Deal" folder → "Ticket Deal — Overview"
-```The dashboard shows request rate, p99 latency, reservation outcomes (held vs sold_out vs oversold), worker throughput, DB write latency, and expiration activity. The headline metric is **`reservations_oversold_total`** — should always be `0`. Alert if it ticks.
+```
+
+The dashboard shows request rate, p99 latency, reservation outcomes (held vs sold_out vs oversold), worker throughput, DB write latency, and expiration activity. The headline metric is **`reservations_oversold_total`** — should always be `0`. Alert if it ticks.
 
 For the full metrics inventory and how to add a new one → [`/docs/architecture.md`](docs/architecture.md) §Observability.
 
@@ -398,6 +498,8 @@ The reverse (log → trace) is also wired up: the Loki datasource in `monitoring
 ## Project Roadmap
 
 Done items are crossed off; remaining items are aspirational roadmap (not phase progression).
+Full layer-by-layer specs live in [`/docs/product-roadmap.md`](docs/product-roadmap.md) —
+that file is the source of truth; this list is the short version.
 
 - [x] **Idempotent worker writes** — `INSERT ... ON CONFLICT DO NOTHING` *(schema ready since Phase 1; writer logic lands in Phase 5)*
 - [ ] **Redis Cluster** — shard seats across nodes for >100k concurrent users
@@ -405,7 +507,9 @@ Done items are crossed off; remaining items are aspirational roadmap (not phase 
 - [x] **Distributed tracing** — OpenTelemetry → Jaeger, end-to-end waterfall across API → SQS → worker (with body-fallback for ElasticMQ in dev)
 - [x] **Structured logging** — `log/slog` across all 4 long-running services, with OTel `trace_id` / `span_id` auto-injected on every line (and HTTP access log via custom chi middleware)
 - [x] **Log aggregation** — Grafana Loki + Promtail, "Ticket Deal — Logs" dashboard with service + trace_id filters, click-through from log line to Jaeger trace
-- [ ] **Payment gateway** — Stripe webhook handler that confirms reservations and releases the hold
+- [x] **Dockerised** — all 4 long-running Go services run in containers; one `docker compose up -d` brings up everything
+- [x] **Read + cancel + retry safety** — Layer 1: state-machine gateway, `GET` endpoints, `POST /cancel`, `/readyz`, `Idempotency-Key`
+- [ ] **Payment gateway** — Stripe webhook handler that confirms reservations (`PENDING_PAYMENT → CONFIRMED`, the one transition with no code path yet) and releases the hold. **This is Layer 2 — the next milestone.**
 - [ ] **Seat-level granularity** — Redis Hash per event instead of a single counter
 - [ ] **Anti-bot** *(intentionally skipped in lite-auth; revisit if slash-traction emerges)* — CAPTCHA + device fingerprinting before JWT issuance
 - [ ] **Replay testing** — deterministic k6 replay against a seeded Redis state

@@ -66,8 +66,23 @@ func (p *testPublisher) Calls() int {
 // recorded response. The middleware is included so claims-injection
 // uses the real production code path — handler tests then verify only
 // the reserve logic.
+//
+// Layer 1 item 5 changed the handler signature (added the
+// idempotency arg). Existing tests pass nil for it (no Idempotency-Key
+// header means the wrapper is a no-op anyway); the dedicated
+// idempotency tests use doReserveFull below.
 func doReserve(t *testing.T, rdb *redis.Client, publisher ReservationPublisher,
 	holdTTL time.Duration, userID string, eventID int64, body string,
+) (*httptest.ResponseRecorder, map[string]any) {
+	return doReserveFull(t, rdb, publisher, nil, holdTTL, userID, eventID, body, "")
+}
+
+// doReserveFull exposes the full set of knobs: idempotency wrapper +
+// optional Idempotency-Key header. Tests that exercise idempotency
+// use this; existing happy-path tests stick with doReserve above.
+func doReserveFull(t *testing.T, rdb *redis.Client, publisher ReservationPublisher,
+	idem *redis.Idempotency, holdTTL time.Duration,
+	userID string, eventID int64, body string, idemKey string,
 ) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 
@@ -75,7 +90,7 @@ func doReserve(t *testing.T, rdb *redis.Client, publisher ReservationPublisher,
 	require.NoError(t, err, "Issue test JWT")
 
 	middleware := auth.Middleware(testSecret)
-	handler := middleware(ReserveHandler(rdb, publisher, holdTTL))
+	handler := middleware(ReserveHandler(rdb, publisher, idem, holdTTL))
 
 	var reqBody *strings.Reader
 	if body != "" {
@@ -86,6 +101,9 @@ func doReserve(t *testing.T, rdb *redis.Client, publisher ReservationPublisher,
 	req := httptest.NewRequest(http.MethodPost, "/api/tickets/reserve", reqBody)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+	if idemKey != "" {
+		req.Header.Set("Idempotency-Key", idemKey)
+	}
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -377,7 +395,7 @@ func TestReserveHandler_PublisherError(t *testing.T) {
 func TestReserveHandler_NoClaims(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	handler := ReserveHandler(rdb, pub, 600*time.Second)
+	handler := ReserveHandler(rdb, pub, nil, 600*time.Second)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/tickets/reserve", nil)
 	rec := httptest.NewRecorder()
