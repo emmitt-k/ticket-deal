@@ -67,7 +67,7 @@ transitions is Layer 1, item 1.
 - No webhook receiver — systems can't be told things changed
 - No notifications service — second consumer on the queue pattern
 - No admin/ops API — no way for support to look up / cancel / refund
-- No `/readyz` — only bare `/healthz`, no deep dep checks
+- No `/readyz` — only bare `/healthz`, no deep dep checks *(Layer 1 item 4 — done; see branch `feature/readyz`)*
 - No anti-bot/CAPTCHA — only IP rate-limit via waiting room
 - No idempotency keys — relies on UUID-on-every-request (fails on network retry)
 - No audit log — `who did what when` is unanswerable
@@ -143,7 +143,7 @@ The handler:
 
 Item 1's transition function makes this safe by construction.
 
-### 4. `/readyz` endpoint with deep dep checks
+### 4. `/readyz` endpoint with deep dep checks ✅ Done
 
 **Effort:** ~1 hour. **Why:** k8s rolling deploys, ALB health checks, monitoring.
 
@@ -185,8 +185,8 @@ After this layer, the system has:
 - ✅ A real state machine users can drive  *(Layer 1 item 1 — done)*
 - ✅ Look-up their own tickets  *(Layer 1 item 2 — done)*
 - ✅ Cancel them  *(Layer 1 item 3 — done; branch `feature/cancel-reservation`)*
+- ✅ Tell ops "I'm healthy and all my deps are reachable"  *(Layer 1 item 4 — done; branch `feature/readyz`)*
 - Network-retry safely
-- Tell ops "I'm healthy and all my deps are reachable"
 
 About 1 weekend of focused work. Small commits. Each item is independent.
 

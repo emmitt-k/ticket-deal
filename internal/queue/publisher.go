@@ -87,6 +87,25 @@ func (p *SQSPublisher) SendReservation(ctx context.Context, r Reservation) error
 	return nil
 }
 
+// Ping verifies the SQS service is reachable AND the queue this
+// publisher is bound to exists. Lightweight — single GetQueueAttributes
+// call (no SendMessage, no MessageBody, no quota cost beyond the
+// GetQueueAttributes rate which is far higher than SQS publish rates).
+//
+// Used by the API's /readyz endpoint (Layer 1 item 4 of
+// docs/product-roadmap.md). Honours the caller's ctx deadline so
+// the handler can distinguish "slow SQS" (returns ctx.Err()) from
+// "SQS unreachable" (wraps the SDK error).
+func (p *SQSPublisher) Ping(ctx context.Context) error {
+	_, err := p.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl: aws.String(p.queueURL),
+	})
+	if err != nil {
+		return fmt.Errorf("queue: SQS GetQueueAttributes ping: %w", err)
+	}
+	return nil
+}
+
 // traceparentFromCtx returns the W3C traceparent string for the
 // current ctx, or "" if no valid span context is set. Uses a tiny
 // TextMapCarrier so we can read back the value the propagator wrote.
@@ -137,4 +156,16 @@ func (a *ReservationAPIPublisher) Publish(ctx context.Context, body []byte) erro
 		return fmt.Errorf("queue: API publisher unmarshal: %w", err)
 	}
 	return a.inner.SendReservation(ctx, r)
+}
+
+// Ping is the /readyz counterpart of Publish — delegates to the inner
+// SQSPublisher. Satisfies api.ReservationPublisher.Ping so the API's
+// /readyz handler can probe SQS without holding a reference to the
+// raw *sqs.Client (which lives behind buildPublisher in cmd/api).
+//
+// Contract inherited from the inner Ping(ctx): returns ctx.Err() when
+// the caller's deadline elapses, allowing the /readyz handler to
+// distinguish "slow SQS" from "SQS unreachable".
+func (a *ReservationAPIPublisher) Ping(ctx context.Context) error {
+	return a.inner.Ping(ctx)
 }

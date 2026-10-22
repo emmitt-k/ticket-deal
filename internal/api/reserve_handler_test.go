@@ -48,6 +48,13 @@ func (p *testPublisher) Publish(_ context.Context, body []byte) error {
 	return nil
 }
 
+// Ping is the readiness-check counterpart required by
+// api.ReservationPublisher. The reserve-handler tests don't exercise
+// /readyz, so the default is "always healthy". Future /readyz tests
+// that want to simulate SQS outages can extend this with a failNextPing
+// flag (mirror of failNext for Publish).
+func (p *testPublisher) Ping(_ context.Context) error { return nil }
+
 func (p *testPublisher) Calls() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
