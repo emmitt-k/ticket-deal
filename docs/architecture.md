@@ -1676,8 +1676,8 @@ Coverage for handler paths, drainer token calculations, and the in-process chann
 
 Creates the two tables every phase needs:
 
-- `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `created_at TIMESTAMPTZ DEFAULT NOW()`
-- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`
+- `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `created_at TIMESTAMPTZ DEFAULT NOW()` — the two money columns are added by `007_event_price.sql` and are the single source of truth for what a seat costs
+- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `seats INTEGER CHECK (1..10)`, `unit_price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`; `007_event_price.sql` adds the price snapshot (`unit_price_cents` + `currency`), frozen at hold time
 - Indexes: `idx_reservations_event_status (event_id, status)` for "how many PENDING does this event have?" queries; partial `idx_reservations_pending_expiry (expires_at) WHERE status = 'PENDING_PAYMENT'` powers the sweep job's WHERE clause.
 
 #### `migrations/002_seed.sql`

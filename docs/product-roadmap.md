@@ -266,6 +266,9 @@ The audit row has the OTel `trace_id` so an ops person can paste it into Grafana
 
 Adds:
 - New migration: `payment_intents` table (maps reservation_id ↔ stripe payment_intent_id)
+- The PaymentIntent amount comes from the reservation's **price snapshot**
+  (`unit_price_cents × seats`) — already implemented in `007_event_price.sql`,
+  so no price lookup is needed here. The client never names the amount.
 - New env vars: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PUBLISHABLE_KEY`
 - New endpoint: `POST /api/reservations/:id/pay` — creates a Stripe PaymentIntent in
   test mode, returns `client_secret` so a test front-end could confirm it
@@ -273,7 +276,7 @@ Adds:
   switches on event type:
   - `payment_intent.succeeded` → transition PENDING_PAYMENT → CONFIRMED, idempotent
   - `payment_intent.payment_failed` → leave PENDING (user can retry); emit a metric
-  - `charge.refunded` → transition CONFIRMED → CANCELLED (refund = cancel in our model)
+  - `charge.refunded` → transition CONFIRMED → REFUNDED (a refund is not a cancel)
 - Trace everything: webhooks come in without an active span; create a root span
   on receipt using the trace_id from the body's `_traceparent` (we already have
   this pattern in SQS)

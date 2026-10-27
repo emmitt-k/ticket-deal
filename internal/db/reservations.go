@@ -79,23 +79,42 @@ func InsertIfAbsent(ctx context.Context, pool *Pool, r queue.Reservation) error 
 	// every path.
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The price is a SNAPSHOT, taken in the same statement that
+	// creates the row: two scalar subqueries read the event's price
+	// and currency at insert time. A later price change (a different
+	// event, an admin edit) must never retroactively alter a seat
+	// that is already held or already paid — so the reservation row
+	// carries its own frozen copy rather than a live lookup at pay
+	// time.
+	//
+	// COALESCE is deliberate: if the event row does not exist the
+	// subqueries yield NULL, and COALESCE turns that into a valid
+	// price so the INSERT proceeds and fails on the event_id FOREIGN
+	// KEY instead — which reports "event 999 does not exist" rather
+	// than "null value in column unit_price_cents". The COALESCE
+	// values are never stored, because the row never lands.
 	const q = `
-		INSERT INTO reservations (reservation_id, user_id, event_id, status, expires_at, seats)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO reservations (reservation_id, user_id, event_id, status, expires_at, seats, unit_price_cents, currency)
+		VALUES ($1, $2, $3, $4, $5, $6,
+			COALESCE((SELECT price_cents FROM events WHERE id = $3), 0),
+			COALESCE((SELECT currency    FROM events WHERE id = $3), 'usd'))
 		ON CONFLICT (reservation_id) DO NOTHING
+		RETURNING unit_price_cents, currency
 	`
-	tag, err := tx.Exec(ctx, q,
+	// RETURNING (instead of Exec) gives us the exact price that was
+	// written, so the audit row records the price the seat was
+	// actually sold at — not a re-read that might disagree.
+	var unitPriceCents int64
+	var currency string
+	err = tx.QueryRow(ctx, q,
 		parsed.ReservationID,
 		parsed.UserID,
 		parsed.EventID,
 		StatusPendingPayment,
 		parsed.ExpiresAtT,
 		parsed.Seats,
-	)
-	if err != nil {
-		return fmt.Errorf("db: insert reservation: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
+	).Scan(&unitPriceCents, &currency)
+	if errors.Is(err, pgx.ErrNoRows) {
 		// Duplicate. Nothing to do — the row already exists from an
 		// earlier successful delivery. We do NOT want to UPDATE
 		// updated_at, which is why this is ON CONFLICT DO NOTHING
@@ -106,14 +125,19 @@ func InsertIfAbsent(ctx context.Context, pool *Pool, r queue.Reservation) error 
 		// log.Printf("worker: reservation %s already exists, skipping", parsed.ReservationID)
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("db: insert reservation: %w", err)
+	}
 
 	entry := AuditEntry{
 		EventType: AuditEventCreated,
 		Actor:     UserActor(parsed.UserID),
 		NewStatus: StatusPendingPayment,
 		Metadata: map[string]any{
-			"seats":    parsed.Seats,
-			"event_id": parsed.EventID,
+			"seats":            parsed.Seats,
+			"event_id":         parsed.EventID,
+			"unit_price_cents": unitPriceCents,
+			"currency":         currency,
 		},
 	}
 	if err := WriteAuditEvent(ctx, tx, parsed.ReservationID, parsed.UserID, entry); err != nil {
@@ -139,7 +163,9 @@ func InsertIfAbsent(ctx context.Context, pool *Pool, r queue.Reservation) error 
 func GetReservation(ctx context.Context, pool *Pool, reservationID string) (ReservationRow, error) {
 	const q = `
 		SELECT r.reservation_id, r.user_id, r.event_id, e.name AS event_name,
-		       r.status, r.seats, r.expires_at, r.created_at, r.updated_at
+		       r.status, r.seats, r.expires_at, r.created_at, r.updated_at,
+		       r.unit_price_cents, r.currency,
+		       r.unit_price_cents * r.seats AS total_price_cents
 		FROM reservations r
 		LEFT JOIN events e ON e.id = r.event_id
 		WHERE r.reservation_id = $1
@@ -155,6 +181,9 @@ func GetReservation(ctx context.Context, pool *Pool, reservationID string) (Rese
 		&row.ExpiresAt,
 		&row.CreatedAt,
 		&row.UpdatedAt,
+		&row.UnitPriceCents,
+		&row.Currency,
+		&row.TotalPriceCents,
 	)
 	if err != nil {
 		return ReservationRow{}, err

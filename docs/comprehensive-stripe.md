@@ -1200,10 +1200,16 @@ enforced by the database — not by application discipline. This is what makes
 `/pay` safely replayable and is the DB-level guarantee that Stripe's own
 idempotency key can't provide.
 
-`[Locked]` **Seed a price.** The `events` table has no price column, and Stripe
-rejects amounts below $0.50. Either add `price_cents BIGINT` to `events` or
-hardcode a demo price in the seed. Hardcoding is fine for a portfolio project;
-the column is more honest.
+`[Locked]` **The price comes from `events.price_cents`, and the reservation
+carries a snapshot of it.** Resolved in `migrations/007_event_price.sql`:
+`events.price_cents BIGINT` (the price of one seat) + `events.currency`, and
+`reservations.unit_price_cents` + `reservations.currency` as a frozen copy taken
+in the same statement that creates the row. The column is more honest than a
+hardcoded seed price, and the snapshot is what makes the PaymentIntent amount
+trustworthy: the amount is `unit_price_cents × seats`, both frozen at hold time,
+so a mid-drop price change can never retroactively alter what a held seat owes.
+Stripe's "$0.50 minimum" is a Stripe rule, not a schema rule — a zero-priced
+event is representable, and the payment layer is where that gets rejected.
 
 ## 29. The config
 
@@ -1224,7 +1230,10 @@ type StripeConfig struct {
     WebhookSecret string
     // Currency is the charge currency. Two decimals for usd/thb.
     Currency string
-    // PriceCents is the per-seat price used until events have a price column.
+    // PriceCents is a fallback per-seat price for events that have no
+    // price_cents. Events have had a price column since
+    // migrations/007_event_price.sql, and the reservation snapshots it —
+    // so in practice the amount comes from the reservation, not from here.
     PriceCents int64
 }
 ```
@@ -1632,7 +1641,9 @@ Consolidated so these get decided rather than discovered:
 6. **Auto-refund on the cancel-vs-webhook race, or alert for manual handling?**
    (§34 race 2) — leaning alert, because auto-refund on a race condition is
    its own class of bug.
-7. **Price source** — hardcode in seed, or add `price_cents` to `events`? (§28)
+7. ~~**Price source** — hardcode in seed, or add `price_cents` to `events`? (§28)~~
+   **RESOLVED:** `events.price_cents` + `events.currency`, with the reservation
+   snapshotting them at hold time (`007_event_price.sql`).
 8. **Sync webhook or SQS — and if SQS, a new queue or the existing one?**
    (§17) The roadmap reserves `reservations-notifications` for item 8, so a
    third queue `stripe-events` may be warranted.
