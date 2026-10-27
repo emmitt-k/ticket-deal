@@ -596,6 +596,7 @@ about who owns the seat). We alert: `stripe_payment_after_expiry_total` (should 
 │   ├── metrics/                # Prometheus catalog (all counters/gauges/histograms)
 │   ├── payment/                # The Stripe payment state machine (the consumer side)
 │   ├── queue/                  # SQS publisher + consumer (aws-sdk-go-v2)
+│   ├── e2e/                   # the end-to-end test (build tag `e2e`): the whole stack, one reservation
 │   ├── redis/                  # Redis client, Lua scripts, seat locking, Idempotency-Key store
 │   ├── stripe/                 # The Stripe client: create a PaymentIntent, verify a webhook, snapshot an event
 │   ├── tracing/                # OpenTelemetry Init + shutdown flush
@@ -692,15 +693,23 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 
 ### GitHub Actions (`.github/workflows/ci.yml`)
 
-Runs on: push to `main` + all PRs. Two jobs, both on GitHub-hosted runners.
+Runs on: push to `main` + all PRs. **Three** jobs, all on GitHub-hosted runners.
 
-**`Test`** — the gate. It runs against a **real** Postgres and a **real** Redis:
+**`Test`** — the gate. It runs against a **real** Postgres, a **real** Redis and a
+**real** SQS broker:
 
 ```
 services:
-  postgres: postgres:16-alpine  → localhost:5432   (the DSN the tests already default to)
-  redis:    redis:7-alpine      → localhost:6379
+  postgres:  postgres:16-alpine        → localhost:5432  (the DSN the tests already default to)
+  redis:     redis:7-alpine            → localhost:6379
+  elasticmq: softwaremill/elasticmq    → localhost:9324  (the SQS-compatible broker)
 ```
+
+The queues (`reservations`, `stripe-events`) are created in a workflow step, because a
+bare ElasticMQ starts with none. `internal/queue`'s publisher and consumer tests need a
+real broker to be worth anything: the behaviours worth checking — a published message
+arrives, a handled message is deleted, a failed handler's message comes back — are
+**broker** behaviours, and no fake can reproduce them.
 
 | Step | What it does |
 |---|---|
@@ -721,6 +730,23 @@ test-side change was needed.
 
 **`Lint`** — `gofmt -l` (fails on any drift) → `go mod tidy` (fails if `go.mod`/`go.sum`
 are not tidy) → `govulncheck ./...` (known CVEs in the stdlib and the dependencies).
+
+**`E2E`** — the job that proves the SYSTEM works, not the packages. It boots the real
+Docker Compose stack (api + worker + stripe-worker and their dependencies) and drives one
+reservation all the way through:
+
+```
+reserve ──► SQS ──► worker ──► Postgres (PENDING_PAYMENT)
+signed webhook ──► SQS ──► stripe-worker ──► Postgres (CONFIRMED)
+```
+
+then checks the audit trail recorded both transitions with the right actors. The test
+lives in `internal/e2e/` behind the `e2e` build tag, so `go test ./...` does not run it
+and the coverage number is unaffected. It skips (rather than fails) when the stack is not
+there, so `go test -tags=e2e ./...` is safe to run anywhere.
+
+The webhook is signed with the Stripe SDK's own `webhook.ComputeSignature`, so the API's
+verification is exercised for real — not a hand-rolled approximation of the format.
 
 > `govulncheck` earned its place the day it was added: it found **14** vulnerabilities —
 > 12 in the Go standard library (fixed in go1.27.2/1.27.3) and one in

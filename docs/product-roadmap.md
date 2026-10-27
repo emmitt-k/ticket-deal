@@ -505,11 +505,27 @@ job had no Postgres service), and ~24 untouched files carried gofmt drift. A
 reviewer spots both in five seconds.
 
 > **Both are done** (branch `feature/ci-hardening`): the CI job now has a real
-> Postgres and a real Redis, so all 236 tests run instead of 146 skipping — and the
-> coverage it reports went from **15.4%** to **48.5%**. The gofmt drift is gone, and a
-> `gofmt` step now keeps it gone. The same change added a coverage floor and a
-> `govulncheck` gate — which found 14 real CVEs on the way in (12 in the Go standard
-> library, one in `golang.org/x/net`) and is now clean.
+> Postgres, a real Redis and a real SQS broker, so all the tests run instead of
+> 146 skipping — and the coverage it reports went from **15.4%** to **49.3%**. The
+> gofmt drift is gone, and a `gofmt` step now keeps it gone. The same change added a
+> coverage floor and a `govulncheck` gate — which found 14 real CVEs on the way in
+> (12 in the Go standard library, one in `golang.org/x/net`) and is now clean.
+>
+> **And the safety net grew to match the system.** Three more things came out of
+> the same pass:
+>
+> - `internal/config` went from **0% to 100%** — it is where the both-or-neither
+>   Stripe rule lives, and a bug there is a *production crash loop*. It had only
+>   ever been verified by running the binary by hand.
+> - `internal/queue` went from **27% to 90%** — the layer both critical paths
+>   (reserve and payment) depend on. The SQS publisher and consumer now have real
+>   tests against a real broker: a published message arrives, a handled message is
+>   deleted, a failed handler's message comes back.
+> - A third CI job, **E2E**, boots the whole Docker Compose stack and drives one
+>   reservation all the way through — reserve → SQS → worker → Postgres, then a
+>   signed Stripe webhook → SQS → stripe-worker → CONFIRMED — and checks the audit
+>   trail. It is the only thing that can catch "every package passes and the
+>   system does not work".
 >
 > **And it paid for itself on the first run.** The new CI caught a flaky test
 > immediately: `TestReserveHandler_Idempotency_ParallelRetries` asserted that the

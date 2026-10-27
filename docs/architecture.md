@@ -1627,6 +1627,23 @@ Chi middleware that reads `Authorization: Bearer <token>`, calls `Verify`, injec
 
 Single `Load()` function reads env via `godotenv`, validates every value, returns `*Config` with fail-fast behavior. Required: `API_PORT` (1-65535), `JWT_SECRET` (≥32 bytes — HS256 keyspace). Optional with defaults: `REDIS_ADDR`, `REDIS_DB`, `IP_LIMIT_*`, `WAIT_ROOM_*`, `RESERVE_HOLD_TTL_SECONDS`, SQS triple (`AWS_REGION`, `SQS_ENDPOINT_URL`, `SQS_QUEUE_URL`).
 
+**The Stripe rule lives here too** (Layer 2, item 7): both secret values absent → the
+feature is off; both present → the feature is on and the values are validated; exactly
+one present → `Load()` fails. A half-configured Stripe means an API that can create
+PaymentIntents but cannot verify webhooks — exactly the state where payments get
+silently stuck.
+
+#### `internal/config/config_test.go`
+
+19 tests, no dependencies — the package is pure env-var logic, so `t.Setenv` covers it.
+The ones that matter: the both-or-neither Stripe rule (and that breaking it fails the
+test), the JWT-secret length boundary (31 rejected, 32 accepted), the port validation,
+and the Postgres DSN composition.
+
+This package was at **0% coverage** until the CI-hardening pass — which is the point:
+the rule that decides whether the process boots at all was verified only by running the
+binary by hand.
+
 ---
 
 ### `internal/db/` — Postgres pool + reservation writes
@@ -1829,6 +1846,37 @@ Exposed groups (full list in the file):
 - **Go runtime** — wired via `runtime.NewGoCollector()` and `runtime.NewProcessCollector()` in the `Handler()` wrapper. Goroutines, GC pause time, heap, fd count, all free.
 
 `Handler()` returns a `http.Handler` for the chi `/metrics` route. Each service runs this on its own port (api :8080, worker :8081, watcher :8083 — `METRICS_ADDR` env for the latter two).
+
+---
+
+### `internal/e2e/` — the end-to-end test
+
+One test, `TestReserveToConfirmed`, behind the `e2e` build tag. It boots nothing itself —
+the CI job boots the real Docker Compose stack and then runs it.
+
+It drives the whole system through its real HTTP API, its real queue, its real workers
+and its real database:
+
+```
+reserve ──► SQS ──► worker ──► Postgres (PENDING_PAYMENT)
+signed webhook ──► SQS ──► stripe-worker ──► Postgres (CONFIRMED)
+```
+
+and then checks the audit trail recorded both transitions with the right actors (the
+creation by the user, the confirmation by the Stripe event id).
+
+The webhook is signed with the Stripe SDK's own `webhook.ComputeSignature`, so the API's
+signature verification is exercised for real rather than against a hand-rolled
+approximation of the format.
+
+**Why this is not a unit test.** A unit test can only show that each piece works
+ALONE. Only this can show that they are wired TOGETHER — that the API published to the
+queue the worker was actually consuming, that the stripe-worker applied an event it
+received from the queue, and that the audit trail recorded what happened. The failure
+mode it catches is "every package passes, and the system does not work".
+
+The build tag keeps it out of `go test ./...`, so the normal CI coverage number is
+unaffected. A missing stack means SKIP, not fail.
 
 ---
 
