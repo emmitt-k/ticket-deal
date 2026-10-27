@@ -81,6 +81,7 @@ func cleanupReservation(t *testing.T, pool *Pool, reservationID string) {
 //	630xx  internal/db  — list_reservations_test.go
 //	640xx  internal/api  — get_reservation_handler_test.go
 //	650xx  internal/db  — audit_test.go
+//	660xx  internal/db  — price_test.go
 //	710xx  internal/expire — compensate_test.go
 //	720xx  internal/expire — sweep_test.go
 //	730xx  internal/expire — audit_test.go

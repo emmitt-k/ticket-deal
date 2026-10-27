@@ -4,12 +4,13 @@
 
 This document complements the [README](../README.md). The README is the project landing page; this is the engineering manual. **§1–§13 explain the design**, **§14 is a per-file reference** for when you need to find or modify a specific file.
 
-**Code state reflected:** through Layer 1 of [`product-roadmap.md`](./product-roadmap.md) (5/5 items shipped). The core system (original Phases 0–9) and the observability stack (Phases 10–13) are landed and unchanged on top of it. Two milestone commits sit above those:
+**Code state reflected:** through Layer 2 item 6 of [`product-roadmap.md`](./product-roadmap.md) — Layer 1 shipped 5/5, Layer 2 item 6 (the append-only audit log) is landed on `feature/audit-log`, along with the two model fixes that came with it (the `REFUNDED` status, and the seat price). The core system (original Phases 0–9) and the observability stack (Phases 10–13) are landed and unchanged on top of it. Three milestone commits sit above those:
 
 | Milestone | Branch | What |
 |---|---|---|
 | Dockerization | `feature/dockerize-go-services` | All 4 long-running Go services (api, worker, expiration-watcher, dashboard-server) moved from host into Docker. Shared parameterized `Dockerfile` (distroless/static, `SERVICE` build arg → binary at constant path `/app/server`). `docker-compose.yml` grew from 8 → **12 services**. `LOG_FILE` env support added to `internal/logging`. Prometheus scrape targets switched from `host.docker.internal` → service names. `.env.docker.example` + `scripts/setup-docker-env.sh` (idempotent, migrates the host `.env`'s `JWT_SECRET`). |
 | Layer 1 — the product surface | `feature/get-reservations` → `feature/cancel-reservation` → `feature/readyz` → `feature/idempotency-key` | 5 items, one branch each (linear chain): typed state-machine helper + read endpoints + cancel endpoint + `/readyz` + `Idempotency-Key` on `/reserve`. Layer 1 is what turns the core reservation machinery into something a user can actually operate. See [`product-roadmap.md`](./product-roadmap.md) for the item-by-item breakdown. |
+| Layer 2 item 6 — the audit log | `feature/audit-log` | The append-only `reservation_events` table, written in the **same transaction** as every status change. Three model fixes landed with it: `REFUNDED` split out of `CANCELLED` (a refund is not a cancel), the seat price (`events.price_cents` + a frozen snapshot on the reservation), and a double-INCRBY oversell race in the expiry path (§9). |
 
 **What Layer 1 added at a glance:**
 
@@ -19,6 +20,14 @@ This document complements the [README](../README.md). The README is the project 
 - `POST /api/reservations/{id}/cancel` — user-initiated cancel; CAS-safe against the watcher's EXPIRED sweep; releases the seat back to Redis; best-effort hold-key cleanup.
 - `GET /readyz` — three parallel dependency checks (Redis / Postgres / SQS) with 500ms per-check budgets. `200` if all green, `503` otherwise. Distinct from `/healthz` (process-alive only).
 - `Idempotency-Key` on `POST /reserve` — safe retries. 24h cached response replay + a short-TTL SETNX in-flight lock so parallel retries don't double-book.
+
+**What Layer 2 item 6 added at a glance:**
+
+- `internal/db/audit.go` — the trail's types and writers: `Audit` / `AuditActor` / `AuditEntry`, `WriteAuditEvent` (standalone INSERT), `AuditInsertSelect` (the data-modifying-CTE form the expire paths use), `auditEventTypeForEdge` (edge → event type).
+- `migrations/005_audit_log.sql` — `reservation_events` plus a `BEFORE UPDATE OR DELETE` trigger that makes it append-only **in the database**, not by discipline.
+- `migrations/006_refunded_status.sql` — the `REFUNDED` status. `CANCELLED` now means exactly one thing: *"cancelled before payment"*.
+- `migrations/007_event_price.sql` — the price of a seat: `events.price_cents` + `events.currency`, and the frozen snapshot the reservation carries (§8).
+- `db.TransitionStatus` now takes a **mandatory** `db.Audit`. An empty actor is rejected before any SQL runs, so *"a transition happened but nobody recorded it"* is not a state the code can reach.
 
 The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) still produces exactly 100 × 200 + 900 × 409 — and now every one of those requests shows up in all three observability sinks, joined by `trace_id`. See §14 for the story.
 
@@ -554,7 +563,7 @@ top of it.
 
 **Five statuses**, of which three are terminal (`EXPIRED`, `CANCELLED`, `REFUNDED`) — plus the implicit "no row ever written" if the worker never gets the SQS message. `PENDING_PAYMENT` is the only transitional state, and `CONFIRMED` has exactly one way out (the refund edge).
 
-The `status` column has a `CHECK` constraint enforcing this set (`migrations/001_init.sql`), and `internal/db/reservations.go` exposes the four values as typed constants (`StatusPendingPayment`, etc.) so a typo at a call site fails to compile.
+The `status` column has a `CHECK` constraint enforcing this set (`migrations/001_init.sql`, widened by `migrations/006_refunded_status.sql`), and `internal/db/reservations.go` exposes the five values as typed constants (`StatusPendingPayment`, `StatusConfirmed`, `StatusExpired`, `StatusCancelled`, `StatusRefunded`) so a typo at a call site fails to compile.
 
 **The `CHECK` constraint guards the *values*. The `validTransitions` table in `internal/db/transition.go` guards the *edges*.** These are different concerns and both are needed:
 
@@ -605,6 +614,33 @@ The `trace_id` column is the join key into the observability stack: an ops perso
 
 ---
 
+### The price of a seat
+
+A seat is not free. `events.price_cents` (plus `events.currency`) is the single source of truth for what one seat costs — `migrations/007_event_price.sql` adds it.
+
+The reservation row carries a **snapshot** of that price (`unit_price_cents` + `currency`), taken in the *same statement* that creates the row:
+
+```sql
+INSERT INTO reservations (reservation_id, user_id, event_id, status, expires_at, seats, unit_price_cents, currency)
+VALUES ($1, $2, $3, $4, $5, $6,
+        COALESCE((SELECT price_cents FROM events WHERE id = $3), 0),
+        COALESCE((SELECT currency    FROM events WHERE id = $3), 'usd'))
+ON CONFLICT (reservation_id) DO NOTHING
+RETURNING unit_price_cents, currency
+```
+
+Three properties worth naming:
+
+- **Atomic with the row.** The price is read by scalar subqueries *inside* the INSERT, so there is no window where the row and its price could disagree, and no extra round-trip.
+- **Frozen.** A later price change never retroactively alters a seat that is already held or already paid. The organizer can raise the price mid-drop; the seats already held keep the price they were quoted. Postgres stays the source of truth; the reservation is a frozen copy of it.
+- **The total is derived, never stored twice.** `unit_price_cents × seats`, computed in SQL from the two frozen columns — so it can never disagree with them.
+
+`COALESCE` is deliberate. If the event row does not exist, the subqueries yield NULL, and COALESCE turns that into a valid price so the INSERT proceeds and fails on the `event_id` FOREIGN KEY — which reports *"event 999 does not exist"* rather than a baffling *"null value in column unit_price_cents"*.
+
+**No endpoint accepts a price.** The client never names what a seat costs — a client that could send its own price could ask for a free ticket. The price reaches the client on the read endpoints (`GET /api/reservations/{id}`, `GET /api/me/reservations`), which return `unit_price_cents`, `currency`, and the computed `total_price_cents`. It is also recorded in the CREATED audit row's metadata, so the money is in the audit trail and not just in the row.
+
+---
+
 ## 9. Handling Expirations
 
 The lifecycle's `PENDING_PAYMENT → EXPIRED` transition needs two things to happen atomically: the DB row flips to `EXPIRED` and the Redis inventory counter goes back up. Phase 7 ships **two redundant paths** so neither can lose a seat.
@@ -620,7 +656,7 @@ sequenceDiagram
     Note over Hold,Watch: Path A — event-driven, fast
     Hold-->>Watch: PSUBSCRIBE __keyevent@0__:expired
     Watch->>Watch: ParseHoldKey<br/>(event=42, user=abc)
-    Watch->>DB: Compensate():<br/>WITH target AS (...PENDING)<br/>UPDATE ... SET status='EXPIRED'<br/>RETURNING seats
+    Watch->>DB: Compensate():<br/>WITH target AS (...PENDING)<br/>UPDATE ... SET status='EXPIRED'<br/>  AND status='PENDING_PAYMENT'<br/>RETURNING seats + audit row
     alt CAS winner (rows updated)
         DB-->>Watch: seats=2
         Watch->>Inv: INCRBY inventory:event:42 2
@@ -631,7 +667,7 @@ sequenceDiagram
 
     Note over Sweep,DB: Path B — DB-driven, safety net
     loop every 60s
-        Sweep->>DB: UPDATE reservations<br/>SET status='EXPIRED'<br/>WHERE status='PENDING_PAYMENT'<br/>  AND expires_at < NOW()<br/>RETURNING reservation_id, user_id, event_id, seats
+        Sweep->>DB: UPDATE reservations<br/>SET status='EXPIRED'<br/>WHERE status='PENDING_PAYMENT'<br/>  AND expires_at < NOW()<br/>RETURNING ... + audit row<br/>(one statement, one transaction)
         DB-->>Sweep: [row1, row2, ...]
         loop for each row
             Sweep->>Inv: INCRBY inventory:event:<id> <seats>
@@ -643,10 +679,42 @@ sequenceDiagram
 
 Both paths converge on `internal/expire/compensate.go::Compensate(ctx, pool, rdb, eventID, userID)`:
 
-1. **CAS UPDATE** — single CTE that finds the matching `PENDING_PAYMENT` row for `(user_id, event_id)` and flips it to `EXPIRED`, returning the seat count. The `WHERE status='PENDING_PAYMENT'` filter is the compare-and-set: a second concurrent caller sees 0 rows and skips the INCRBY.
+1. **CAS UPDATE + audit row, in one statement.** A data-modifying CTE finds the matching `PENDING_PAYMENT` row for `(user_id, event_id)`, flips it to `EXPIRED`, and appends the `EXPIRED` audit row — all in a single statement, so the two land together or neither does:
+
+   ```sql
+   WITH target AS (
+       SELECT reservation_id, seats FROM reservations
+       WHERE user_id = $1 AND event_id = $2 AND status = 'PENDING_PAYMENT'
+       ORDER BY created_at DESC
+       LIMIT 1
+   ),
+   updated AS (
+       UPDATE reservations
+       SET status = 'EXPIRED', updated_at = NOW()
+       WHERE reservation_id IN (SELECT reservation_id FROM target)
+         AND status = 'PENDING_PAYMENT'      -- ← the guard. See the note below.
+       RETURNING reservation_id, user_id, seats,
+                 jsonb_build_object('seats', seats, 'event_id', $2) AS audit_metadata
+   ),
+   audited AS (
+       /* the audit INSERT, from db.AuditInsertSelect */
+   )
+   SELECT COALESCE((SELECT seats FROM updated), 0)
+   ```
+
+   This path deliberately does **not** go through `db.TransitionStatus`. The expiry logic is race-sensitive and already needs the seat count back in the same statement — routing it through the helper would cost a second round-trip for no correctness gain. The shared piece is `db.AuditInsertSelect`, which builds the CTE insert without duplicating the column list, the trace extraction, or the metadata marshalling. The actor is `db.SystemActor("expiration-watcher")` here, and `db.SystemActor("expiration-sweep")` on Path B — so the audit trail says *which* path expired the seat.
+
 2. **INCRBY inventory** — `INCRBY inventory:event:<id> <seats>` using the row's `seats` value (persisted via migration `003_add_seats.sql`).
 
 This function is the only thing both paths need to share. Putting it in one place means the watcher's event path and the worker's sweep path can never drift.
+
+**The `AND status = 'PENDING_PAYMENT'` inside the UPDATE is not redundant.** Repeating the filter that `target` already applied is the fix for a silent oversell, and it is worth understanding because a single-threaded test cannot see it.
+
+`target` is evaluated against the statement's **snapshot**, and it is *not* re-read when a concurrent transaction commits. So with the guard living only in `target`, a second concurrent transaction could re-flip the row after the first commits: its post-lock re-check finds the id still in `target` (the id never changed), so it updates the row **again** and INCRBYs the seat a second time. Inventory ends up one seat too high — a silent oversell, invisible in the metrics until it matters.
+
+With the guard in the UPDATE's own `WHERE`, the re-check runs against the **new** row version, sees `status='EXPIRED'`, and skips it. Exactly one caller wins. This is the same compare-and-set shape as `db.TransitionStatus` (`WHERE reservation_id = $2 AND status = $3`).
+
+**Any new CAS-shaped UPDATE must carry its guard in the UPDATE, not only in a helper CTE.**
 
 ### Path A: Keyspace watcher (`cmd/expiration-watcher`)
 
@@ -666,14 +734,23 @@ The worker runs `expire.RunSweep(ctx, pool, rdb, interval)` as a goroutine along
 
 Every `interval` (default 60 s; env `SWEEP_INTERVAL_SECONDS`):
 
-1. `FindAndExpireSweptRows` runs the atomic SQL:
+1. `FindAndExpireSweptRows` runs the atomic SQL — the UPDATE and its audit row are one statement, so the row and its history cannot disagree:
    ```sql
-   UPDATE reservations
-   SET status = 'EXPIRED', updated_at = NOW()
-   WHERE status = 'PENDING_PAYMENT' AND expires_at < NOW()
-   RETURNING reservation_id, user_id, event_id, seats;
+   WITH updated AS (
+       UPDATE reservations
+       SET status = 'EXPIRED', updated_at = NOW()
+       WHERE status = 'PENDING_PAYMENT' AND expires_at < NOW()
+       RETURNING reservation_id, user_id, event_id, seats,
+                 jsonb_build_object('seats', seats, 'event_id', event_id) AS audit_metadata
+   ),
+   audited AS (
+       /* the audit INSERT, from db.AuditInsertSelect */
+   )
+   SELECT reservation_id, user_id, event_id, seats FROM updated
    ```
 2. For each returned row, `INCRBY inventory:event:<id> <seats>`.
+
+This path's guard already lives in the UPDATE's own `WHERE` clause (it is a plain UPDATE, not a CTE-sourced one), so it never had the double-INCRBY race described above. The audit actor is `db.SystemActor("expiration-sweep")` — the same status change, a different actor, distinguishable in the trail.
 
 **Idempotent** — the `WHERE` clause limits to currently-`PENDING_PAYMENT` rows, so a second tick finds nothing to do.
 
@@ -686,9 +763,9 @@ If both paths fire for the same `(user, event)`:
 | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | Watcher CAS wins, sweep runs after    | Sweep's UPDATE finds 0 rows (status already EXPIRED). Sweep's INCRBY doesn't run.**Total INCRBY: 1.** ✓                 |
 | Sweep runs first, watcher fires after | Watcher's CAS finds 0 rows (status already EXPIRED). Watcher's INCRBY doesn't run.**Total INCRBY: 1.** ✓                |
-| Both run concurrently                 | Postgres row-locking serializes the UPDATEs. Whichever commits first wins; the other sees 0 rows.**Total INCRBY: 1.** ✓ |
+| Both run concurrently                 | Postgres row-locking serializes the UPDATEs. Whichever commits first wins; the other sees 0 rows — because the guard is in the UPDATE's own `WHERE` clause.**Total INCRBY: 1.** ✓ |
 
-The `WHERE status='PENDING_PAYMENT'` is the entire mechanism. No distributed locks, no coordination protocol.
+The `WHERE status='PENDING_PAYMENT'` — **in the UPDATE's own `WHERE` clause, not only in the CTE that selects the row** — is the entire mechanism. No distributed locks, no coordination protocol. The distinction is not academic: it is the difference between one seat released and two. See the note on the double-INCRBY race above.
 
 ### Configuration
 
@@ -851,6 +928,30 @@ The convention is enforced by the comment in each script:
 `internal/redis/client.go::NewClient` sets `PoolSize: 100`. The justification is in the comment: 1,000 concurrent Lua calls each grab a connection, run EVAL in ~50 µs, and return — so 100 conns × ~20k ops/sec per conn = 2M ops/sec ceiling. Below the 1000-concurrent test ceiling, no connection contention.
 
 If you ever bump the per-process connection count above the Redis server's `maxclients` setting (default 10,000), the client will block waiting for a free connection. Watch for `i/o timeout` errors in `cmd/api` logs as the warning sign.
+
+---
+
+### 6. The audit log's FK makes reservations undeletable — and `psql` fails *silently*
+
+`reservation_events.reservation_id` is a FOREIGN KEY to `reservations`, and `reservation_events` is append-only. Together, those two facts mean a reservation with any history **cannot be deleted at all**: the FK blocks the delete, and the append-only trigger blocks deleting the history that would unblock it.
+
+That is the right production behaviour (Layer 3's GDPR path anonymises rather than deletes) but it breaks dev tooling. `loadtest/reset-state.sh` ran `DELETE FROM reservations WHERE event_id = 1` and got:
+
+```
+ERROR:  update or delete on table "reservations" violates foreign key constraint "reservation_events_reservation_id_fkey" on table "reservation_events"
+```
+
+— and **the script carried on**. `psql` exits 0 on a failed statement unless `ON_ERROR_STOP` is set, so `set -e` never fired, the inventory was re-seeded, and the script printed *"Ready for load test."* over a state it had never reset. The load test then ran against stale rows and looked green.
+
+Two fixes, both now in `loadtest/reset-state.sh`: purge the audit rows first, inside a transaction that sets `SET LOCAL ticket_deal.audit_purge = 'on'` (the documented escape hatch — `SET LOCAL` is transaction-scoped, so it cannot leak to another pooled connection), and pass `-v ON_ERROR_STOP=1` to every `psql` call so a failing statement aborts the script instead of pretending to succeed.
+
+**The general lesson: `psql` exiting 0 does not mean the statement succeeded.** Any script that pipes SQL into `psql` needs `ON_ERROR_STOP=1`, or it is a script that reports success while doing nothing.
+
+### 7. `reservation_events.event_id` is NOT the event id
+
+`reservation_events.event_id` is the audit row's own `BIGSERIAL` — insertion order, which is exactly what makes it the chronological order. `reservations.event_id` is the concert (FK → `events.id`). Two tables, joined by a foreign key, same column name, **two completely different meanings**.
+
+This is easy to get wrong from the audit side: `SELECT event_id FROM reservation_events` returns a sequence number, not a concert. To find which event an audit row belongs to you must join through `reservations`. (Renaming the column to `audit_event_id` would remove the trap — not done yet.)
 
 ---
 
@@ -1279,7 +1380,9 @@ The idempotency test file is separate because it needs a different `doReserve` h
 Layer 1 item 2. Two read-only handlers, both behind `auth.Middleware`:
 
 - `GetReservationHandler(pool)` → `GET /api/reservations/{id}`. `404` if no row matches, `403 not_your_reservation` if `row.UserID != claims.Subject`, `200` + `ReservationRow` otherwise. **403 rather than 404 on purpose:** reservation IDs are UUIDs (infeasible to guess), so a 403 leaks nothing of consequence, and the clearer semantics help the frontend distinguish "wrong account" from "doesn't exist". The code comment notes to swap to 404 if this endpoint ever opens to less-trusted clients.
-- `ListMyReservationsHandler(pool)` → `GET /api/me/reservations?status=&limit=&offset=`. Always scoped to the JWT subject — clients cannot ask for someone else's list. `status` omitted → all four statuses; an unrecognised `status` → `400 invalid_status` (rather than a silently-empty result, which would mask typos). Empty result → `200` + `[]`, never `404`, so the frontend renders one code path.
+- `ListMyReservationsHandler(pool)` → `GET /api/me/reservations?status=&limit=&offset=`. Always scoped to the JWT subject — clients cannot ask for someone else's list. `status` omitted → all five statuses (`PENDING_PAYMENT`, `CONFIRMED`, `EXPIRED`, `CANCELLED`, `REFUNDED`); an unrecognised `status` → `400 invalid_status` (rather than a silently-empty result, which would mask typos). Empty result → `200` + `[]`, never `404`, so the frontend renders one code path.
+
+Both endpoints serialise `db.ReservationRow` directly, so they carry the price fields — `unit_price_cents`, `currency`, and the computed `total_price_cents` — with no extra query.
 
 Both are wrapped in OTel spans (`get_reservation.handle`, `list_my_reservations.handle`) and use the PII-safe `hashUserID` pattern on the cross-user branch.
 
@@ -1290,8 +1393,8 @@ Layer 1 item 3 — `POST /api/reservations/{id}/cancel`, behind `auth.Middleware
 Five steps, in the order the spec mandates:
 
 1. JWT subject must equal `row.user_id` → `403` otherwise.
-2. Status pre-check. `CANCELLED` short-circuits **idempotently** (`200` + the row — a second cancel is a no-op, and critically does *not* `INCRBY` twice). `CONFIRMED` → `409 already_paid` (refund, not cancel — that's Layer 2). `EXPIRED` → `409 already_expired`.
-3. `db.TransitionStatus(ctx, pool, id, StatusPendingPayment, StatusCancelled)` — the CAS. If it returns `(false, nil)` the handler re-reads the row to work out who won: `EXPIRED` → `409`, `CANCELLED` → `200` (a concurrent duplicate), anything else → generic `409 cancel_race`.
+2. Status pre-check. `CANCELLED` short-circuits **idempotently** (`200` + the row — a second cancel is a no-op, and critically does *not* `INCRBY` twice). `CONFIRMED` → `409 already_paid` (refund, not cancel — that's Layer 2). `EXPIRED` → `409 already_expired`. `REFUNDED` → `409 already_refunded` — the money already came back and the seat was already released, so there is nothing left to cancel, and that is a *different fact* from a merely-confirmed reservation.
+3. `db.TransitionStatus(ctx, pool, id, StatusPendingPayment, StatusCancelled, db.Audit{Actor: db.UserActor(claims.Subject)})` — the CAS. The actor is **mandatory**: the transition and its audit row are one transaction, and an empty actor is rejected before any SQL runs. If it returns `(false, nil)` the handler re-reads the row to work out who won: `EXPIRED` → `409`, `CANCELLED` → `200` (a concurrent duplicate), anything else → generic `409 cancel_race`.
 4. `INCRBY inventory:event:<id> <seats>` — release the seat back to Redis.
 5. Best-effort `DEL hold:event:<id>:user:<user>` — so the user's next `/reserve` doesn't `409 already_holding`.
 
@@ -1367,25 +1470,32 @@ Single `Load()` function reads env via `godotenv`, validates every value, return
 
 #### `internal/db/reservations.go`
 
-Status constants (`StatusPendingPayment`, `StatusConfirmed`, `StatusExpired`, `StatusCancelled`) — typed string consts that mirror the SQL `CHECK` constraint, so a typo at a call site fails to compile.
+Status constants (`StatusPendingPayment`, `StatusConfirmed`, `StatusExpired`, `StatusCancelled`, `StatusRefunded`) — typed string consts that mirror the SQL `CHECK` constraint, so a typo at a call site fails to compile. `CANCELLED` and `REFUNDED` are deliberately separate: *"nobody paid"* vs *"paid and then reversed"*.
 
-`InsertIfAbsent(ctx, pool, queue.Reservation)` parses the wire payload's timestamps, runs the idempotent INSERT:
+`InsertIfAbsent(ctx, pool, queue.Reservation)` parses the wire payload's timestamps, runs the idempotent INSERT, and writes the `CREATED` audit row in the same transaction:
 
 ```sql
 INSERT INTO reservations
-    (reservation_id, user_id, event_id, status, expires_at, seats)
+    (reservation_id, user_id, event_id, status, expires_at, seats, unit_price_cents, currency)
 VALUES
-    ($1, $2, $3, 'PENDING_PAYMENT', $4, $5)
-ON CONFLICT (reservation_id) DO NOTHING;
+    ($1, $2, $3, 'PENDING_PAYMENT', $4, $5,
+     COALESCE((SELECT price_cents FROM events WHERE id = $3), 0),
+     COALESCE((SELECT currency    FROM events WHERE id = $3), 'usd'))
+ON CONFLICT (reservation_id) DO NOTHING
+RETURNING unit_price_cents, currency;
 ```
 
-Returns nil whether or not a row was created. `tag.RowsAffected() == 0` is informational only.
+The two scalar subqueries take the **price snapshot** in the same statement that creates the row (§8). `RETURNING` gives back the exact price that was written, so the audit row records the price the seat was *actually* sold at rather than a re-read that might disagree.
+
+Returns nil whether or not a row was created. The duplicate case now shows up as `pgx.ErrNoRows` from the `RETURNING` (an `ON CONFLICT DO NOTHING` insert returns no row), not as `tag.RowsAffected() == 0` — and it is *not* an error: the worker's contract is "eventually at least one row exists for this reservation_id", so a duplicate delivery returns nil and the SQS message gets deleted instead of looping forever.
 
 `GetReservation(ctx, pool, id)` reads back a row by ID. Returns `pgx.ErrNoRows` for missing rows; `IsNoRows(err)` wraps that for callers that don't want to import pgx. LEFT-JOINs `events` to populate `EventName`, so API callers render a human-readable title without a second round-trip.
 
 #### `internal/db/types.go`
 
 Layer 1 item 2. `ReservationRow` — the single row shape used by both `GetReservation` and `ListReservationsByUser`, with snake_case JSON tags matching the rest of the API surface (see `reserve_handler.go`'s `"reservation_id"` / `"expires_in"` keys). Lives in its own file rather than `reservations.go` so the SQL helpers and the HTTP handlers can both depend on it without an import cycle; same package either way, so `db.ReservationRow` references are unaffected by the move.
+
+Layer 2 added three money fields: `unit_price_cents` (the per-seat price frozen at hold time), `currency`, and `total_price_cents` (`unit_price_cents × seats`, computed in SQL from the two frozen columns so the total can never disagree with them). The handlers serialise this struct directly, so the price reaches the client on both read endpoints without a second round-trip.
 
 #### `internal/db/transition.go`
 
@@ -1417,15 +1527,29 @@ Note what is **not** an edge: `CONFIRMED → CANCELLED`. It used to be one
 (`"refund = cancel in our model"`), and splitting it out is what gives
 `CANCELLED` and `REFUNDED` one meaning each.
 
-`EXPIRED` and `CANCELLED` are terminal: no outgoing edges, and they're deliberately absent from the map keys so the "nothing leaves a terminal state" rule is visible at a glance. Asking for an edge that isn't in the table returns `(false, ErrInvalidTransition)` — a **programmer** error, distinct from a CAS miss. Detected with `errors.Is`.
+`EXPIRED`, `CANCELLED` and `REFUNDED` are terminal: no outgoing edges, and they're deliberately absent from the map keys so the "nothing leaves a terminal state" rule is visible at a glance. Asking for an edge that isn't in the table returns `(false, ErrInvalidTransition)` — a **programmer** error, distinct from a CAS miss. Detected with `errors.Is`.
 
 Two `Compensate`-adjacent functions (`internal/expire/compensate.go`) were deliberately *not* refactored onto this helper: their CTE-based queries already return the `seats` column in the same statement, so folding them through `TransitionStatus` would mean a second round-trip for no correctness gain.
+
+#### `internal/db/audit.go`
+
+Layer 2 item 6. The audit trail's types and writers:
+
+- `Audit` (the mandatory actor + metadata), `AuditActor` / `UserActor` / `SystemActor` / `AdminActor` / `StripeWebhookActor` — the actor constructors, one per actor type
+- `AuditEntry` — one event: type, actor, old/new status, metadata
+- `WriteAuditEvent(ctx, q, reservationID, userID, entry)` — a standalone INSERT; `q` is a `Querier` (both `*pgxpool.Pool` and `*pgx.Tx` satisfy it), so the same function writes inside a transaction or standalone
+- `AuditInsertSelect(ctx, source, entry, firstParam)` — returns the SQL and parameters for the **data-modifying-CTE form** the expire paths use, so the column list, the trace extraction and the metadata marshalling are not duplicated
+- `auditEventTypeForEdge(from, to)` — maps a state-machine **edge** to an event type. The edge, not the destination status: `PENDING_PAYMENT → CANCELLED` is a `CANCELLED` event (nothing was paid), `CONFIRMED → REFUNDED` is a `REFUND_INITIATED` event (money moved back). The switch's default case turns a forgotten edge into a loud error rather than a silently mislabeled audit row.
+- `ListAuditEvents(ctx, pool, reservationID)` — the read model, ordered by `event_id` (insertion order = chronological order)
+- `ErrInvalidAudit` — returned when the actor is empty, *before* any SQL runs
+
+**An EVENT and a STATUS are different concepts, and keeping them apart is load-bearing.** The event records the *action* (`REFUND_INITIATED` — the money went back); the status records the *outcome* (`REFUNDED`). That is what lets a **partial** refund be recorded as an event while the status stays `CONFIRMED` — only a full refund becomes a state.
 
 #### `internal/db/list_reservations.go`
 
 Layer 1 item 2. `ListReservationsByUser(ctx, pool, userID, statusFilter string, limit, offset int) ([]ReservationRow, error)` — powers `GET /api/me/reservations`.
 
-- `statusFilter == ""` → all four statuses (default; the caller opts into filtering)
+- `statusFilter == ""` → all five statuses (default; the caller opts into filtering)
 - `limit <= 0` → `defaultListLimit` (20, from the spec's example URL); `> 100` → clamped to `hardMaxLimit` (a "give me a million" DoS guard)
 - `offset < 0` → 0
 - `ORDER BY created_at DESC` — newest first
@@ -1441,9 +1565,11 @@ Two near-identical `const` query strings (with / without the status filter) rath
 
 **The shared compensation function.** `Compensate(ctx, pool, rdb, eventID, userID)`:
 
-1. CTE: `WITH target AS (...PENDING_PAYMENT FOR user,event ORDER BY created_at DESC LIMIT 1) UPDATE ... SET status='EXPIRED' RETURNING seats`
+1. One statement: `WITH target AS (...PENDING_PAYMENT FOR user,event ORDER BY created_at DESC LIMIT 1) UPDATE ... SET status='EXPIRED' **AND status='PENDING_PAYMENT'** RETURNING seats`, plus the `EXPIRED` audit row folded in as a data-modifying CTE (`db.AuditInsertSelect`), actor `db.SystemActor("expiration-watcher")`.
 2. If 0 seats returned → no matching row (orphan hold key) or already non-PENDING → no work, return nil
 3. Else `INCRBY inventory:event:<id> <seats>`. INCRBY failure is logged as `WARN` but doesn't fail the call (DB row is the durable state; surfacing an error would just trigger watcher retries that find 0 rows via the CAS).
+
+**The repeated `status='PENDING_PAYMENT'` guard inside the UPDATE is load-bearing**, not a copy-paste slip: a CTE's `target` is evaluated against the statement's snapshot and is not re-read when a concurrent transaction commits, so a guard that lives only in `target` lets a second transaction re-flip the row and INCRBY the seat twice — a silent oversell. §9 has the full story.
 
 This is the function both watcher and sweep call — the two paths can never drift apart.
 
@@ -1463,8 +1589,10 @@ Wraps the subscribe in reconnect-with-backoff (1s → 30s cap, exponential, rese
 
 `RunSweep(ctx, pool, rdb, dur)` ticker fires, one sweep runs:
 
-1. `FindAndExpireSweptRows` — atomic `UPDATE ... WHERE status='PENDING_PAYMENT' AND expires_at < NOW() RETURNING reservation_id, user_id, event_id, seats`
+1. `FindAndExpireSweptRows` — one statement: `UPDATE ... WHERE status='PENDING_PAYMENT' AND expires_at < NOW() RETURNING reservation_id, user_id, event_id, seats`, plus the `EXPIRED` audit row folded in as a data-modifying CTE (`db.AuditInsertSelect`), actor `db.SystemActor("expiration-sweep")`
 2. For each returned row, `INCRBY inventory:event:<id> <seats>`
+
+The audit actor differs from the watcher's (`expiration-sweep` vs `expiration-watcher`) so the trail says *which* path expired the seat — same status change, different actor.
 
 Runs once immediately on startup, then on every tick. Returns `ctx.Err()` on graceful shutdown.
 
@@ -1676,8 +1804,8 @@ Coverage for handler paths, drainer token calculations, and the in-process chann
 
 Creates the two tables every phase needs:
 
-- `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `created_at TIMESTAMPTZ DEFAULT NOW()`
-- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`
+- `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `created_at TIMESTAMPTZ DEFAULT NOW()` — the two money columns are added by `007_event_price.sql` and are the single source of truth for what a seat costs
+- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `seats INTEGER CHECK (1..10)`, `unit_price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`; `007_event_price.sql` adds the price snapshot (`unit_price_cents` + `currency`), frozen at hold time
 - Indexes: `idx_reservations_event_status (event_id, status)` for "how many PENDING does this event have?" queries; partial `idx_reservations_pending_expiry (expires_at) WHERE status = 'PENDING_PAYMENT'` powers the sweep job's WHERE clause.
 
 #### `migrations/002_seed.sql`
@@ -1710,6 +1838,43 @@ Layer 2 item 6. Creates `reservation_events` — the append-only audit trail (§
 Indexes: `(reservation_id, event_id)` for "the history of this reservation"; `(user_id, event_id)` for the GDPR sweep; a partial index on `trace_id WHERE trace_id IS NOT NULL` for the trace join (most rows have no trace — background sweeps have no span).
 
 Plus `reservation_events_append_only()` — a `BEFORE UPDATE OR DELETE` trigger that refuses `DELETE` outright and refuses every `UPDATE` except rewriting `user_id`. One escape hatch: `SET LOCAL ticket_deal.audit_purge = 'on'`.
+
+#### `migrations/006_refunded_status.sql`
+
+Widens the `reservations_status_check` constraint to include `REFUNDED`:
+
+```sql
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'reservations_status_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%REFUNDED%'
+    ) THEN
+        ALTER TABLE reservations DROP CONSTRAINT reservations_status_check;
+        ALTER TABLE reservations ADD CONSTRAINT reservations_status_check
+            CHECK (status IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED','REFUNDED'));
+    END IF;
+END;
+$$;
+```
+
+A `CHECK` change only — no rows are rewritten. The idempotent `DO` block is what makes it re-runnable (unlike migrations 001–003, which are not): the guard inspects the constraint's *current definition*, so a second run is a no-op.
+
+**Why it exists.** A refund used to be `CONFIRMED → CANCELLED` — *"refund = cancel in our model"*. That collapsed two different facts into one status: *"the customer never paid"* and *"the customer paid and we gave the money back"*. So `WHERE status='CANCELLED'` conflated *"we lost the sale"* with *"we refunded the customer"* — in the DB, in the `?status=` filter, and in every revenue report built on it. The state machine's edge changed with it: `CONFIRMED → CANCELLED` is **not** an edge any more; `CONFIRMED → REFUNDED` is.
+
+#### `migrations/007_event_price.sql`
+
+Layer 2 item 7's prerequisite. Four columns:
+
+- `events.price_cents BIGINT NOT NULL DEFAULT 0 CHECK (price_cents >= 0)` — the price of one seat
+- `events.currency TEXT NOT NULL DEFAULT 'usd' CHECK (currency ~ '^[a-z]{3}$')`
+- `reservations.unit_price_cents BIGINT NOT NULL DEFAULT 0 CHECK (unit_price_cents >= 0)` — the snapshot
+- `reservations.currency TEXT NOT NULL DEFAULT 'usd' CHECK (currency ~ '^[a-z]{3}$')`
+
+Plus a demo price (`2500`) for the dev seed event — because `002_seed.sql` runs *before* this file and therefore cannot reference a column that does not exist yet. The `UPDATE` is guarded by `price_cents = 0`, so a deliberately-priced event keeps its price and a re-run is a no-op.
+
+Cents, not a float — money in binary floating point is a bug waiting for the wrong invoice. §8 covers the snapshot semantics.
 
 ---
 

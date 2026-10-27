@@ -452,3 +452,92 @@ func TestListMyReservations_RefundedIsItsOwnStatus(t *testing.T) {
 	_, all := doListMyReservations(t, pool, owner, "")
 	require.Len(t, all, 2)
 }
+
+// ── The price ──────────────────────────────────────────────────────────
+//
+// The client needs the price to render "3 seats × $25.00 = $75.00",
+// and it needs it to come from the SERVER — never from the request
+// body. A client that could send its own price would be a client that
+// could ask for a free ticket.
+
+// TestGetReservation_IncludesThePrice — the single-reservation read
+// carries the unit price, the currency, and the computed total.
+func TestGetReservation_IncludesThePrice(t *testing.T) {
+	const owner = "u-price-1"
+	pool := apiNewTestPool(t)
+	const eventID = int64(64005)
+	apiSeedEvent(t, pool, eventID)
+
+	_, err := pool.Exec(context.Background(),
+		"UPDATE events SET price_cents = 2500, currency = 'usd' WHERE id = $1", eventID)
+	require.NoError(t, err)
+
+	r := apiValidReservationFor(t, eventID, owner)
+	r.Seats = 3
+	apiCleanupReservation(t, pool, r.ReservationID)
+	require.NoError(t, db.InsertIfAbsent(context.Background(), pool, r))
+
+	rec, body := doGetReservation(t, pool, owner, r.ReservationID)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, float64(2500), body["unit_price_cents"])
+	require.Equal(t, "usd", body["currency"])
+	require.Equal(t, float64(7500), body["total_price_cents"], "3 seats × $25.00")
+}
+
+// TestListMyReservations_IncludesThePrice — the list endpoint carries
+// the same fields. A client that renders "what did I book, and for
+// how much?" should not need a second call per reservation.
+func TestListMyReservations_IncludesThePrice(t *testing.T) {
+	const owner = "u-price-2"
+	pool := apiNewTestPool(t)
+	const eventID = int64(64006)
+	apiSeedEvent(t, pool, eventID)
+
+	_, err := pool.Exec(context.Background(),
+		"UPDATE events SET price_cents = 1500, currency = 'usd' WHERE id = $1", eventID)
+	require.NoError(t, err)
+
+	r := apiValidReservationFor(t, eventID, owner)
+	r.Seats = 2
+	apiCleanupReservation(t, pool, r.ReservationID)
+	require.NoError(t, db.InsertIfAbsent(context.Background(), pool, r))
+
+	rec, rows := doListMyReservations(t, pool, owner, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, rows, 1)
+	require.Equal(t, float64(1500), rows[0]["unit_price_cents"])
+	require.Equal(t, "usd", rows[0]["currency"])
+	require.Equal(t, float64(3000), rows[0]["total_price_cents"], "2 seats × $15.00")
+}
+
+// TestGetReservation_PriceIsServerSide — the price comes from the
+// events table, never from the request. The reserve endpoint takes no
+// price field, and the read endpoint returns the server's number.
+//
+// (This is a documentation test as much as a behavioural one: the
+// invariant is "the client cannot name a price", and the cheapest way
+// to keep it true is to never accept one.)
+func TestGetReservation_PriceIsServerSide(t *testing.T) {
+	const owner = "u-price-3"
+	pool := apiNewTestPool(t)
+	const eventID = int64(64007)
+	apiSeedEvent(t, pool, eventID)
+
+	_, err := pool.Exec(context.Background(),
+		"UPDATE events SET price_cents = 9900, currency = 'usd' WHERE id = $1", eventID)
+	require.NoError(t, err)
+
+	r := apiValidReservationFor(t, eventID, owner)
+	apiCleanupReservation(t, pool, r.ReservationID)
+	require.NoError(t, db.InsertIfAbsent(context.Background(), pool, r))
+
+	// The price changed AFTER the hold. The reservation keeps the
+	// snapshot it was created with.
+	_, err = pool.Exec(context.Background(),
+		"UPDATE events SET price_cents = 100 WHERE id = $1", eventID)
+	require.NoError(t, err)
+
+	_, body := doGetReservation(t, pool, owner, r.ReservationID)
+	require.Equal(t, float64(9900), body["unit_price_cents"],
+		"the quoted price, frozen — not the event's current price")
+}

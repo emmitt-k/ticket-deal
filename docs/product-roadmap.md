@@ -32,18 +32,27 @@ unblock the later ones (state machine → cancel → refund → audit → Stripe
 | Route | Method | Auth | Purpose |
 |---|---|---|---|
 | `/healthz` | GET | none | Bare liveness |
+| `/readyz` | GET | none | Readiness — 3 parallel dep checks (Redis / Postgres / SQS) |
 | `/metrics` | GET | none (host-only) | Prometheus scrape (per service) |
 | `/api/tickets/enter` | POST | none | Returns JWT or queues (Phase 1 waiting room) |
 | `/api/tickets/queue` | GET | queue token | SSE position stream |
 | `/api/tickets/reserve` | POST | JWT | Atomic seat lock → SQS publish |
+| `/api/reservations/{id}` | GET | JWT | One reservation. `403` if it isn't yours |
+| `/api/me/reservations` | GET | JWT | The caller's own list — `?status=`, `?limit=`, `?offset=` |
+| `/api/reservations/{id}/cancel` | POST | JWT | Cancel a `PENDING_PAYMENT` reservation; releases the seat |
 
-That's the **complete public surface**. Five endpoints. Behind the scenes there
-are 8 docker services, 14 internal packages, 5 migrations, and a 4-pillar
-observability stack — but **none of that is exposed to a user**.
+That's the **complete public surface**. Nine endpoints — five from the original
+kernel, four added by Layer 1. Behind the scenes there are 12 docker services,
+13 internal packages, 7 migrations, and a 4-pillar observability stack.
+
+The read endpoints are what make the seat price reachable by a client:
+`GET /api/reservations/{id}` and `GET /api/me/reservations` return
+`unit_price_cents`, `currency` and the computed `total_price_cents` — the
+**server's** number, never a client-supplied one.
 
 ### What's there but unreachable
 
-The `reservations.status` column has a `CHECK` constraint allowing four values:
+The `reservations.status` column has a `CHECK` constraint allowing five values:
 
 ```sql
 CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'EXPIRED', 'CANCELLED', 'REFUNDED'))
@@ -77,9 +86,9 @@ transitions is Layer 2, item 7.
 - No webhook receiver — systems can't be told things changed
 - No notifications service — second consumer on the queue pattern
 - No admin/ops API — no way for support to look up / cancel / refund
-- No `/readyz` — only bare `/healthz`, no deep dep checks *(Layer 1 item 4 — done; see branch `feature/readyz`)*
+- ~~No `/readyz` — only bare `/healthz`, no deep dep checks~~ *(Layer 1 item 4 — done; see branch `feature/readyz`)*
 - No anti-bot/CAPTCHA — only IP rate-limit via waiting room
-- No idempotency keys on POST /reserve — network retries could double-charge. *(Layer 1 item 5 — done; see branch `feature/idempotency-key`)*
+- ~~No idempotency keys on POST /reserve — network retries could double-book~~ *(Layer 1 item 5 — done; see branch `feature/idempotency-key`)*
 - ~~No audit log — `who did what when` is unanswerable~~ *(Layer 2 item 6 — done; see branch `feature/audit-log`)*
 
 ---
@@ -117,6 +126,15 @@ Add `internal/db/transition.go` with `TransitionStatus(ctx, pool, id, from, to)`
 it runs the CAS UPDATE with a `WHERE status = $from` clause so concurrent
 cancellations can't double-flip. Returns `ErrInvalidTransition` if the row is in
 the wrong state.
+
+> **Shipped**, with three differences from the sketch above. The constants are
+> plain `string` consts rather than a named `Status` type, so `validTransitions`
+> is `map[string][]string` — the edge table is *runtime*-enforced, with typed
+> constants catching typos at the call site. `TransitionStatus` takes a
+> **mandatory** `db.Audit` argument, because since Layer 2 item 6 every
+> transition writes an audit row in the same transaction and an empty actor is
+> rejected before any SQL runs. And the refund edge is now
+> `CONFIRMED → REFUNDED`, not `CONFIRMED → CANCELLED` (see item 6).
 
 ### 2. `GET /api/reservations/:id` and `GET /api/me/reservations` ✅ Done
 
@@ -253,19 +271,55 @@ The audit row has the OTel `trace_id` so an ops person can paste it into Grafana
 **Two design decisions worth keeping:**
 
 - **The event type is derived from the EDGE, not the destination status.**
-  `CONFIRMED → CANCELLED` is a `REFUND_INITIATED` (money moved back);
-  `PENDING_PAYMENT → CANCELLED` is a `CANCELLED` (nothing was paid). Same
-  destination status, completely different meaning to an operator.
+  `CONFIRMED → REFUNDED` is a `REFUND_INITIATED` (money moved back);
+  `PENDING_PAYMENT → CANCELLED` is a `CANCELLED` (nothing was paid). Two
+  different facts, completely different meaning to an operator.
+- **An EVENT and a STATUS are different concepts.** The event records the
+  *action* (`REFUND_INITIATED` — the money went back); the status records the
+  *outcome* (`REFUNDED`). That is what lets a **partial** refund be recorded as
+  an event while the status stays `CONFIRMED` — only a full refund becomes a
+  state.
 - **Append-only is enforced by the database.** A `BEFORE UPDATE OR DELETE`
   trigger refuses `DELETE` and refuses every `UPDATE` except rewriting
   `user_id` (the GDPR anonymisation path this very section anticipates).
 
-### 7. Stripe test-mode integration (THE headline feature)
+### 7. Stripe test-mode integration (THE headline feature) ← **NEXT**
 
 **Effort:** ~3-4 days. **Why it's #2 here:** audit log lets you safely debug webhooks.
 
+> **This is the next item.** Layer 1 is 5/5 and item 6 is shipped, so item 7 is
+> the only thing between the current system and a product that takes money.
+>
+> **The decisions are made** — Part 8 of
+> [`comprehensive-stripe.md`](./comprehensive-stripe.md) is now a decision log
+> rather than a list of open questions:
+>
+> - **Async**, on a third SQS queue `stripe-events` — the webhook verifies,
+>   publishes, then returns 200. Consistent with the architecture the project
+>   already uses, and the trace propagation comes free.
+> - **`payment_intents`**, one row per reservation, `reservation_id UNIQUE`,
+>   `stripe_payment_intent_id` **nullable** — and `reservation_id` is Stripe's
+>   own idempotency key, so a crash between our INSERT and Stripe's `Create`
+>   converges on a retry instead of double-charging.
+> - **Stripe is not a `/readyz` dependency** (it would take the API out of
+>   rotation for a third-party outage) — a metric and an alert instead. But
+>   **yes** to a `stripe-listen` Makefile target for local testing.
+> - **The cancel-vs-webhook race alerts for manual handling** — it does not
+>   auto-refund. Money should not move on a path that didn't reason about
+>   idempotency and partial refunds.
+> - **Typed `EventType` constants**, and the price comes from the reservation's
+>   snapshot (already shipped).
+>
+> **Migration numbering:** the Stripe doc sketches `005_stripe_payments.sql`.
+> That number is taken — the audit log is 005, and `006_refunded_status.sql` +
+> `007_event_price.sql` follow it. The payment table's migration is
+> **`008_stripe_payments.sql`**.
+
 Adds:
 - New migration: `payment_intents` table (maps reservation_id ↔ stripe payment_intent_id)
+- The PaymentIntent amount comes from the reservation's **price snapshot**
+  (`unit_price_cents × seats`) — already implemented in `007_event_price.sql`,
+  so no price lookup is needed here. The client never names the amount.
 - New env vars: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PUBLISHABLE_KEY`
 - New endpoint: `POST /api/reservations/:id/pay` — creates a Stripe PaymentIntent in
   test mode, returns `client_secret` so a test front-end could confirm it
@@ -273,7 +327,7 @@ Adds:
   switches on event type:
   - `payment_intent.succeeded` → transition PENDING_PAYMENT → CONFIRMED, idempotent
   - `payment_intent.payment_failed` → leave PENDING (user can retry); emit a metric
-  - `charge.refunded` → transition CONFIRMED → CANCELLED (refund = cancel in our model)
+  - `charge.refunded` → transition CONFIRMED → REFUNDED (a refund is not a cancel)
 - Trace everything: webhooks come in without an active span; create a root span
   on receipt using the trace_id from the body's `_traceparent` (we already have
   this pattern in SQS)
@@ -282,7 +336,7 @@ This is **the single most commercially-impressive feature**. It exercises:
 signature verification, webhook idempotency, race conditions (webhook vs.
 expiry-watcher), payment state, refund-vs-cancel semantics. Recruiters know it.
 
-### 8. Notifications service (email via MailHog, SMS via Twilio test creds)
+### 8. Notifications service (email via MailHog, SMS via Twilio test creds) ⬜ Not started
 
 **Effort:** ~1-2 days. **Why:** tests the design's claim that adding a 2nd
 consumer to the queue is trivial.
@@ -304,7 +358,7 @@ Events to send:
 - `PENDING_PAYMENT → EXPIRED` → "Your hold expired, the seats are back"
 - `PENDING_PAYMENT → CANCELLED` (user-initiated) → "You cancelled your reservation"
 
-### 9. Admin / ops API (gated by HMAC admin key)
+### 9. Admin / ops API (gated by HMAC admin key) ⬜ Not started
 
 **Effort:** ~1 day. **Why:** every real product has "support override."
 
@@ -321,7 +375,7 @@ rejecting timestamps outside the window.
 Every admin call writes to the audit log (`actor_type='admin'`, `actor_id=<key
 fingerprint>`). This is why item 6 (audit log) was sequenced first.
 
-### 10. Anti-bot hardening
+### 10. Anti-bot hardening ⬜ Not started
 
 **Effort:** ~1-2 days. **Why:** ticket scalpers are a real threat to any
 high-demand drop.
@@ -347,7 +401,7 @@ Item 1-10 of Layer 1 + Layer 2 = the system looks like a real product.
 > **Goal:** stands up under real-world failure. Most of these don't show in a
 > demo but absolutely show in a 3am page.
 
-### 11. Graceful degradation (circuit breakers)
+### 11. Graceful degradation (circuit breakers) ⬜ Not started
 
 **Effort:** ~1 day. **Why:** when Redis is degraded, `/reserve` should return
 503 after 100ms, not hang for 30s.
@@ -361,7 +415,7 @@ Use `github.com/sony/gobreaker` (or roll your own in 50 LOC). Wrap:
 
 Each circuit breaker emits metrics: `circuit_breaker_state{name}`, `circuit_breaker_trips_total{name}`.
 
-### 12. Multi-event (bulk load + listing)
+### 12. Multi-event (bulk load + listing) ⬜ Not started
 
 **Effort:** ~1 day. Schema is ready, data is hardcoded.
 
@@ -370,7 +424,7 @@ Each circuit breaker emits metrics: `circuit_breaker_state{name}`, `circuit_brea
 - New endpoint: `GET /api/events` (no auth, public list)
 - A `cmd/seed-events` tool that reads a YAML and bulk-inserts into Postgres + Redis
 
-### 13. Redis Cluster / sharding
+### 13. Redis Cluster / sharding ⬜ Not started
 
 **Effort:** ~2-3 days (mostly design + testing).
 
@@ -379,7 +433,7 @@ what breaks (Lua scripts cross-slot, keyspace notifications are per-node),
 and what the migration plan looks like. You don't have to deploy it — the
 **design document** is the deliverable that proves you think this far ahead.
 
-### 14. GDPR endpoints
+### 14. GDPR endpoints ⬜ Not started
 
 **Effort:** ~half a day.
 
@@ -392,7 +446,7 @@ The audit log can't be deleted (regulators need the trail), so anonymize instead
 `UPDATE reservation_events SET user_id='redacted:<hash>', metadata=metadata - 'pii'
 WHERE user_id = $1`.
 
-### 15. Feature flags (env-keyed, no SaaS)
+### 15. Feature flags (env-keyed, no SaaS) ⬜ Not started
 
 **Effort:** ~half a day.
 
@@ -410,33 +464,37 @@ service for our scale and removes a future "I forgot to clean up" problem.
 
 ## What I'd build first — and why
 
-**If you have one weekend:** Layer 1 in order — 1 → 2 → 3 → 4 → 5. Small,
-focused, every commit ships a working feature. End-state: the system *feels*
-complete.
+**Done:** Layer 1 (1 → 2 → 3 → 4 → 5) and Layer 2 item 6. The system now has
+the whole user-facing spine plus an audit trail behind it.
 
-**If you have two weekends:** add 6 → 7 (audit + Stripe). Now it has payment,
-which is the headline. Recruiters will see it. *(Item 6 is now done — only 7 remains.)*
+**Next: item 7 — Stripe.** It is the only item that turns *"a reservation
+kernel"* into *"a product that takes money"*, and it unblocks items 8, 9 and
+10 (all three need to know what a confirmed reservation is). It also exercises
+every pattern a payments engineer actually solves: signature verification,
+webhook idempotency, out-of-order delivery, and the race between the payment
+webhook and the expiry watcher.
 
-**If you have a month:** full Layer 1 + Layer 2. Notifications + admin + anti-bot
-+ Stripe. This is what a senior backend engineer at Stripe or Ticketmaster
-actually shipped during their first year. The portfolio goes from "I built a
-ticket app" to "I built a payment-grade distributed system with admin tooling."
+**Then:** item 9 (admin API) — it becomes interesting the moment there is money
+to refund — and item 10 (anti-bot), which is the cheapest proof that you think
+like an attacker. Item 8 (notifications) is the best demonstration that the
+queue design scales to a second consumer, but it is the least differentiating.
 
 ## The strategic question
 
 The biggest impact-portfolio item, ranked:
 
-| Rank | Feature | Why it's the differentiator |
-|---|---|---|
-| 1 | **Stripe test mode** (#7) | Forces you to solve every pattern real engineers solve: signature verification, webhook idempotency, payment state, race-vs-expiry. Recruiters recognize it. |
-| 2 | **State machine + cancel** (#1, #3) | The connective tissue. Makes Layer 2 possible. |
-| 3 | **Audit log** (#6) | "Who did this when?" is the SOC2 question. ✅ Shipped |
-| 4 | **Anti-bot** (#10) | Proves you think like an attacker. |
-| 5 | **Notifications** (#8) | Tests the design's flexibility claim. |
-| 6 | **Admin API** (#9) | Every real product has this; usually glossed over. |
+| Rank | Feature | Why it's the differentiator | Status |
+|---|---|---|---|
+| 1 | **Stripe test mode** (#7) | Forces you to solve every pattern real engineers solve: signature verification, webhook idempotency, payment state, race-vs-expiry. Recruiters recognize it. | **← next** |
+| 2 | **State machine + cancel** (#1, #3) | The connective tissue. Makes Layer 2 possible. | ✅ Shipped |
+| 3 | **Audit log** (#6) | "Who did this when?" is the SOC2 question. | ✅ Shipped |
+| 4 | **Anti-bot** (#10) | Proves you think like an attacker. | ⬜ Not started |
+| 5 | **Notifications** (#8) | Tests the design's flexibility claim. | ⬜ Not started |
+| 6 | **Admin API** (#9) | Every real product has this; usually glossed over. | ⬜ Not started |
 
-Stripe is the headline. State machine is the prerequisite. Build #1 → #2 → #3
-→ #6 → #7 in that order. The rest fill in around them.
+Stripe is the headline. The state machine and the audit log were its
+prerequisites — both are shipped, so the path is clear. Build #7 next, then
+the rest fill in around it.
 
 ---
 

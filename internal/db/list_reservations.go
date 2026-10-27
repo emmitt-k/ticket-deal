@@ -84,7 +84,9 @@ func listReservationsByUser(ctx context.Context, pool *Pool,
 ) ([]ReservationRow, error) {
 	const q = `
 		SELECT r.reservation_id, r.user_id, r.event_id, e.name AS event_name,
-		       r.status, r.seats, r.expires_at, r.created_at, r.updated_at
+		       r.status, r.seats, r.expires_at, r.created_at, r.updated_at,
+		       r.unit_price_cents, r.currency,
+		       r.unit_price_cents * r.seats AS total_price_cents
 		FROM reservations r
 		LEFT JOIN events e ON e.id = r.event_id
 		WHERE r.user_id = $1
@@ -99,7 +101,9 @@ func listReservationsByUserAndStatus(ctx context.Context, pool *Pool,
 ) ([]ReservationRow, error) {
 	const q = `
 		SELECT r.reservation_id, r.user_id, r.event_id, e.name AS event_name,
-		       r.status, r.seats, r.expires_at, r.created_at, r.updated_at
+		       r.status, r.seats, r.expires_at, r.created_at, r.updated_at,
+		       r.unit_price_cents, r.currency,
+		       r.unit_price_cents * r.seats AS total_price_cents
 		FROM reservations r
 		LEFT JOIN events e ON e.id = r.event_id
 		WHERE r.user_id = $1 AND r.status = $2
@@ -136,6 +140,9 @@ func scanReservations(ctx context.Context, pool *Pool, q string, args ...any) ([
 			&r.ExpiresAt,
 			&r.CreatedAt,
 			&r.UpdatedAt,
+			&r.UnitPriceCents,
+			&r.Currency,
+			&r.TotalPriceCents,
 		); scanErr != nil {
 			return nil, fmt.Errorf("db: scan reservation row: %w", scanErr)
 		}

@@ -584,7 +584,8 @@ marshalling.
 │   ├── 003_add_seats.sql      # Adds seats column (Phase 7 INCRBY sizing)
 │   ├── 004_user_lookup_index.sql  # Composite (user_id, created_at DESC) for GET /api/me/reservations
 │   ├── 005_audit_log.sql         # Layer 2 item 6: append-only reservation_events + append-only trigger
-│   └── 006_refunded_status.sql   # Adds the REFUNDED status (a refund is not a cancel)
+│   ├── 006_refunded_status.sql   # Adds the REFUNDED status (a refund is not a cancel)
+│   └── 007_event_price.sql       # The price of a seat: events.price_cents + the reservation's snapshot
 ├── docker/
 │   └── elasticmq.conf         # Pre-creates the reservations queue on boot
 ├── docker-compose.yml         # 12 services: 8 infra (redis, postgres, elasticmq, prometheus,
@@ -640,6 +641,8 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 ### Branch Strategy
 - `main`: stable, protected
 - Feature work: branch from main → PR → merge
+- **Major changes get their own branch.** New features and significant refactors: `git checkout -b feature/<short-name>` first, off `main` (or off the previous feature branch — see below). Small edits, bug fixes, doc tweaks and one-off tasks can be done on the current branch.
+- **Always push to the remote when done.** After every commit, push to the remote feature branch immediately — `git push origin feature/<name>`. Never leave commits unpushed: an unpushed branch is work that exists on exactly one machine, and it is invisible to CI, to a reviewer, and to `git fetch`.
 - **Stacked branches are normal here.** When one milestone builds on the previous, branch from the *previous feature branch*, not from `main`. Layer 1 shipped as a linear chain:
   `feature/dockerize-go-services` → `feature/get-reservations` → `feature/cancel-reservation` → `feature/readyz` → `feature/idempotency-key`
 - **Reverse-order merge.** When the stack is finally merged, go tip-first so each PR's base exists before its child: `idempotency-key` → `readyz` → `cancel-reservation` → `get-reservations` → `dockerize-go-services` → `main`.
@@ -648,21 +651,29 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 ### Current Merge State
 
 **Layer 1 is fully merged into `main`** (PRs #11-#15, merged tip-first: dockerize →
-get-reservations → cancel-reservation → readyz → idempotency-key). `main` is at
-`2abc4ce`.
+get-reservations → cancel-reservation → readyz → idempotency-key), and so are the
+four Dependabot PRs (#17-#20).
 
-**Layer 2 item 6 (the audit log) is on `feature/audit-log`**, branched from `main`. It also
-carries three fixes found along the way — see the branch's commit log:
+**Layer 2 item 6 (the audit log) is on `feature/audit-log`** (PR #21) — the
+append-only audit trail, the `REFUNDED` status split, and three bugs the trail
+exposed along the way:
 
-- `fix(db)`: `ListReservationsByUser` returned a nil slice instead of an empty one
+- `fix(db)`: `ListReservationsByUser` returned a nil slice instead of an empty one.
+  This left **`main` red** for anyone with a local Postgres — CI only stayed green
+  because the `internal/db` tests `t.Skip` when Postgres is unreachable, and the CI
+  job has no Postgres service.
 - `test(api)`: the handler tests never mounted on a chi router, so 12 tests asserted against
   a `400 missing_id` instead of the real status. They had never run in CI (they `t.Skip`
   without Postgres/Redis).
 - `fix(expire)`: a **double-INCRBY oversell race** in the watcher's expire path — see
   Convention #13
 
-Before starting new feature work, check whether `feature/audit-log` has landed. If it has,
-branch from `main`; if not, branch from its tip and extend the stack.
+**The seat price is on `feature/seat-price`** (PR #22, stacked on #21) — the price of a
+seat and the frozen snapshot the reservation carries. Merge #21 first; #22's diff
+collapses to its own 5 commits once #21 lands.
+
+Before starting new feature work, check whether those have landed. If they have,
+branch from `main`; if not, branch from the tip and extend the stack.
 
 ---
 
@@ -683,7 +694,8 @@ branch from `main`; if not, branch from its tip and extend the stack.
 13. **The compare-and-set guard must live in the UPDATE's own WHERE clause, not only in a CTE.** This is the expire path's bug (fixed in `fix(expire): close a double-INCRBY oversell race`), and it is worth understanding because it is invisible in a single-threaded test. A CTE like `target` is evaluated against the statement's **snapshot** and is *not* re-read when a concurrent transaction commits. So `WHERE reservation_id IN (SELECT reservation_id FROM target)` — where `target` filtered on `status='PENDING_PAYMENT'` — lets a second concurrent transaction re-flip the row after the first commits: its post-lock re-check finds the id still in `target` (the id never changed), so it updates the row **again** and INCRBYs the seat a second time. That is a silent **oversell**. The fix is to repeat the guard in the UPDATE: `WHERE reservation_id IN (...) AND status = 'PENDING_PAYMENT'`. After the lock is released, the re-check runs against the *new* row version, sees `status='EXPIRED'`, and skips it. This is the same shape as `db.TransitionStatus` (`WHERE reservation_id = $2 AND status = $3`). **Any new CAS-shaped UPDATE must carry its guard in the UPDATE, not in a helper CTE.**
 14. **Every status transition writes an audit row, in the same transaction.** `db.TransitionStatus` takes a mandatory `db.Audit` (actor + metadata) and writes `reservation_events` atomically with the status change. The actor is required — an empty actor type is rejected with `db.ErrInvalidAudit` before any SQL runs. The expire paths are the deliberate exception (their audit `INSERT` is a data-modifying CTE in the same statement — see the Layer 2 section above). **Never write a status change without its audit row, and never write an audit row without the status change.**
 15. **`CANCELLED` and `REFUNDED` are different facts — never merge them.** `CANCELLED` = cancelled before payment; `REFUNDED` = paid, then reversed. The only edge out of `CONFIRMED` is `CONFIRMED → REFUNDED`. If you find yourself wanting to write `status = 'CANCELLED'` on a paid reservation, you want `REFUNDED`. The `?status=` filter, the DB CHECK constraint, and `db.StatusRefunded` all exist for this.
-16. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
+16. **The price of a seat is a server-side SNAPSHOT, and the client never names it.** `events.price_cents` (plus `events.currency`) is the single source of truth for what a seat costs; `reservations.unit_price_cents` + `reservations.currency` are a frozen copy of it, taken in the *same statement* that creates the reservation row (`db.InsertIfAbsent` reads them with scalar subqueries). The total owed is `unit_price_cents × seats` — computed in SQL from the two frozen columns, so it can never disagree with them. Why a snapshot and not a live lookup: an organizer changing the price must never retroactively alter a seat that is already held or already paid. No endpoint accepts a price field — a client that could send one could ask for a free ticket. The price is also recorded in the CREATED audit row's metadata, so the money is in the audit trail.
+17. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
 
 ---
 
