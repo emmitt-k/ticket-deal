@@ -500,9 +500,16 @@ queue design scales to a second consumer, but it is the least differentiating �
 so it goes third, unless the demo needs the MailHog inbox to look busy.
 
 **Before any of them, two chores** that are cheap and make the repo honest:
-CI does not currently run the `internal/db` tests (they skip without a
-Postgres, and the CI job has no Postgres service), and ~15 untouched files
-carry gofmt drift. A reviewer spots both in five seconds.
+CI did not run the `internal/db` tests (they skip without a Postgres, and the CI
+job had no Postgres service), and ~24 untouched files carried gofmt drift. A
+reviewer spots both in five seconds.
+
+> **Both are done** (branch `feature/ci-hardening`): the CI job now has a real
+> Postgres and a real Redis, so all 236 tests run instead of 146 skipping — and the
+> coverage it reports went from **15.4%** to **48.5%**. The gofmt drift is gone, and a
+> `gofmt` step now keeps it gone. The same change added a coverage floor and a
+> `govulncheck` gate — which found 14 real CVEs on the way in (12 in the Go standard
+> library, one in `golang.org/x/net`) and is now clean.
 
 ## The strategic question
 

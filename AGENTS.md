@@ -691,9 +691,45 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 ## CI/CD
 
 ### GitHub Actions (`.github/workflows/ci.yml`)
-- Runs on: push to `main` + all PRs
-- Job: `go vet` → `go test -race -coverprofile` → `go build`
-- Artifact: coverage report (14-day retention)
+
+Runs on: push to `main` + all PRs. Two jobs, both on GitHub-hosted runners.
+
+**`Test`** — the gate. It runs against a **real** Postgres and a **real** Redis:
+
+```
+services:
+  postgres: postgres:16-alpine  → localhost:5432   (the DSN the tests already default to)
+  redis:    redis:7-alpine      → localhost:6379
+```
+
+| Step | What it does |
+|---|---|
+| `go vet` | the static checks |
+| **Apply migrations** | `psql -v ON_ERROR_STOP=1 -f migrations/0*.sql`, in order, on the fresh database — the same order `make migrate` uses. `ON_ERROR_STOP` matters: without it `psql` exits 0 on a failed statement and a broken migration looks like it worked |
+| `go test -race -coverprofile` | the whole suite, with the race detector |
+| **Enforce the coverage floor** | the total must be **≥ 45%**. A coverage number that is printed but never enforced is a number that quietly goes down |
+| `go build` | all five binaries compile |
+| Upload coverage artifact | 14-day retention |
+
+**Why the service containers are not optional.** The state machine's correctness — the
+compare-and-set, the audit row in the same transaction, the seat release on a refund —
+is only provable against a real database. Without these two containers, **146 of the
+236 tests skip themselves** (`t.Skipf("Postgres unavailable: …")`) and the job reports
+**15.4%** coverage while looking green. With them: **236 tests, 48.5%**. The ports are
+mapped to the runner's `localhost`, which is exactly where the tests look, so no
+test-side change was needed.
+
+**`Lint`** — `gofmt -l` (fails on any drift) → `go mod tidy` (fails if `go.mod`/`go.sum`
+are not tidy) → `govulncheck ./...` (known CVEs in the stdlib and the dependencies).
+
+> `govulncheck` earned its place the day it was added: it found **14** vulnerabilities —
+> 12 in the Go standard library (fixed in go1.27.2/1.27.3) and one in
+> `golang.org/x/net` (fixed in v0.60.0). The fix was a toolchain bump in `go.mod` plus
+> `go get golang.org/x/net@v0.60.0`. It is now **clean**, and it stays clean because the
+> step is a gate.
+
+A `concurrency` group cancels the in-flight run for a branch when a new push lands, so a
+rapid series of pushes does not queue up N runners.
 
 ### Dependabot (`.github/dependabot.yml`)
 - Go modules: weekly Monday 09:00 BKK
@@ -701,7 +737,8 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 - Labels: `dependencies`, `go`, `ci`
 
 ### Branch Strategy
-- `main`: stable, protected
+- `main`: stable, **protected** — the `Test` check is a required status check, so a PR
+  cannot merge on a red build
 - Feature work: branch from main → PR → merge
 - **Major changes get their own branch.** New features and significant refactors: `git checkout -b feature/<short-name>` first, off `main` (or off the previous feature branch — see below). Small edits, bug fixes, doc tweaks and one-off tasks can be done on the current branch.
 - **Always push to the remote when done.** After every commit, push to the remote feature branch immediately — `git push origin feature/<name>`. Never leave commits unpushed: an unpushed branch is work that exists on exactly one machine, and it is invisible to CI, to a reviewer, and to `git fetch`.
