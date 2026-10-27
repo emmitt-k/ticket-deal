@@ -651,21 +651,29 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 ### Current Merge State
 
 **Layer 1 is fully merged into `main`** (PRs #11-#15, merged tip-first: dockerize →
-get-reservations → cancel-reservation → readyz → idempotency-key). `main` is at
-`2abc4ce`.
+get-reservations → cancel-reservation → readyz → idempotency-key), and so are the
+four Dependabot PRs (#17-#20).
 
-**Layer 2 item 6 (the audit log) is on `feature/audit-log`**, branched from `main`. It also
-carries three fixes found along the way — see the branch's commit log:
+**Layer 2 item 6 (the audit log) is on `feature/audit-log`** (PR #21) — the
+append-only audit trail, the `REFUNDED` status split, and three bugs the trail
+exposed along the way:
 
-- `fix(db)`: `ListReservationsByUser` returned a nil slice instead of an empty one
+- `fix(db)`: `ListReservationsByUser` returned a nil slice instead of an empty one.
+  This left **`main` red** for anyone with a local Postgres — CI only stayed green
+  because the `internal/db` tests `t.Skip` when Postgres is unreachable, and the CI
+  job has no Postgres service.
 - `test(api)`: the handler tests never mounted on a chi router, so 12 tests asserted against
   a `400 missing_id` instead of the real status. They had never run in CI (they `t.Skip`
   without Postgres/Redis).
 - `fix(expire)`: a **double-INCRBY oversell race** in the watcher's expire path — see
   Convention #13
 
-Before starting new feature work, check whether `feature/audit-log` has landed. If it has,
-branch from `main`; if not, branch from its tip and extend the stack.
+**The seat price is on `feature/seat-price`** (PR #22, stacked on #21) — the price of a
+seat and the frozen snapshot the reservation carries. Merge #21 first; #22's diff
+collapses to its own 5 commits once #21 lands.
+
+Before starting new feature work, check whether those have landed. If they have,
+branch from `main`; if not, branch from the tip and extend the stack.
 
 ---
 
