@@ -64,12 +64,12 @@ But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today*
 |---|---|---|
 | `PENDING_PAYMENT` | Worker `db.InsertIfAbsent` | `internal/db/reservations.go` |
 | `EXPIRED` | Watcher + sweep job | `internal/expire/compensate.go` |
-| `CONFIRMED` | **nothing** — defined but no path | ❌ no handler (Layer 2, item 7 — Stripe webhook) |
+| `CONFIRMED` | Stripe `payment_intent.succeeded` webhook | `internal/payment/handler.go` ✅ |
 | `CANCELLED` | POST /api/reservations/{id}/cancel | `internal/api/cancel_reservation_handler.go` ✅ |
-| `REFUNDED` | **nothing** — defined but no path | ❌ no handler (Layer 2, item 7 — Stripe webhook) |
+| `REFUNDED` | Stripe `charge.refunded` webhook (full refund only) | `internal/payment/handler.go` ✅ |
 
-This is the single biggest "code-defined-but-unwired" gap. Adding the missing
-transitions is Layer 2, item 7.
+Both of those gaps are now closed: Layer 2 item 6 wired the transitions and item 7
+gave them a way to be reached.
 
 > **Note:** the refund edge *is* wired (`CONFIRMED → REFUNDED` — it was
 > specified into the state machine in Layer 1, and the audit log records
@@ -82,8 +82,8 @@ transitions is Layer 2, item 7.
 
 ### What's not there at all (not even a stub)
 
-- No payment integration — `CONFIRMED` is unreachable (see above)
-- No webhook receiver — systems can't be told things changed
+- ~~No payment integration — `CONFIRMED` is unreachable~~ *(Layer 2 item 7 — done; see branch `feature/stripe-integration`)*
+- ~~No webhook receiver — systems can't be told things changed~~ *(Layer 2 item 7 — done)*
 - No notifications service — second consumer on the queue pattern
 - No admin/ops API — no way for support to look up / cancel / refund
 - ~~No `/readyz` — only bare `/healthz`, no deep dep checks~~ *(Layer 1 item 4 — done; see branch `feature/readyz`)*
@@ -283,12 +283,26 @@ The audit row has the OTel `trace_id` so an ops person can paste it into Grafana
   trigger refuses `DELETE` and refuses every `UPDATE` except rewriting
   `user_id` (the GDPR anonymisation path this very section anticipates).
 
-### 7. Stripe test-mode integration (THE headline feature) ← **NEXT**
+### 7. Stripe test-mode integration (THE headline feature) ✅ Done
 
 **Effort:** ~3-4 days. **Why it's #2 here:** audit log lets you safely debug webhooks.
 
-> **This is the next item.** Layer 1 is 5/5 and item 6 is shipped, so item 7 is
-> the only thing between the current system and a product that takes money.
+> **Shipped** on `feature/stripe-integration`. Notes on what changed vs the sketch
+> below:
+>
+> - The migration is `008_stripe_payments.sql` (005–007 were taken) and the table is
+>   `payment_intents`, with a **nullable** `stripe_payment_intent_id`.
+> - **The webhook is async**, on a third SQS queue `stripe-events`, consumed by a new
+>   `cmd/stripe-worker` binary. The handler verifies the signature, snapshots the event
+>   and queues it — it never touches the database. The publish happens BEFORE the 200,
+>   so "the event was accepted but the publish failed" cannot lose a payment.
+> - **The idempotency key is the `reservation_id`.** That is what makes the crash
+>   window between "we wrote the payment row" and "Stripe answered" a retry rather than
+>   a double-charge.
+> - **Stripe is OPTIONAL.** Both keys absent → the payment routes answer 503 and the
+>   rest of the system is unchanged. Exactly one present → a startup error.
+> - A **partial** refund records the event and leaves the status at `CONFIRMED` — the
+>   payoff of keeping the event and the status as separate concepts.
 >
 > **The decisions are made** — Part 8 of
 > [`comprehensive-stripe.md`](./comprehensive-stripe.md) is now a decision log
