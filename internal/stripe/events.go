@@ -2,10 +2,35 @@ package stripe
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	stripeapi "github.com/stripe/stripe-go/v82"
 )
+
+// ErrUnhandledEventType is the sentinel for "a valid, correctly signed
+// event of a type this app does not act on".
+//
+// It is a sentinel rather than a bare error so the caller can tell it
+// apart from a SIGNATURE FAILURE, which must be answered with a 400.
+// An unhandled type is answered with a 200 — the event was fine, we
+// just have no interest in it, and Stripe should stop sending it.
+var ErrUnhandledEventType = errors.New("stripe: unhandled event type")
+
+// UnhandledEventError carries the id and type of an event this app
+// does not act on. It unwraps to ErrUnhandledEventType.
+type UnhandledEventError struct {
+	EventID string
+	Type    string
+}
+
+// Error implements error.
+func (e *UnhandledEventError) Error() string {
+	return fmt.Sprintf("stripe: unhandled event type %q (event %s)", e.Type, e.EventID)
+}
+
+// Unwrap makes errors.Is(err, ErrUnhandledEventType) work.
+func (e *UnhandledEventError) Unwrap() error { return ErrUnhandledEventType }
 
 // The Stripe event types this app acts on.
 //
@@ -131,6 +156,6 @@ func SnapshotEvent(e *stripeapi.Event) (Event, error) {
 		return ev, nil
 
 	default:
-		return Event{}, fmt.Errorf("stripe: unhandled event type %q", e.Type)
+		return Event{}, &UnhandledEventError{EventID: e.ID, Type: string(e.Type)}
 	}
 }

@@ -40,15 +40,15 @@ func TestVerifyWebhookSignature_ValidSignature(t *testing.T) {
 	payload := []byte(`{"id":"evt_1","type":"payment_intent.succeeded","data":{"object":{"id":"pi_1"}}}`)
 
 	header := signedHeader(t, payload, testWebhookSecret, time.Now())
-	event, err := c.VerifyWebhookSignature(payload, header)
+	snap, err := c.VerifyWebhook(payload, header)
 	require.NoError(t, err)
-	require.Equal(t, "evt_1", event.ID)
+	require.Equal(t, "evt_1", snap.ID)
 }
 
 // TestVerifyWebhookSignature_MissingHeader — no header at all.
 func TestVerifyWebhookSignature_MissingHeader(t *testing.T) {
 	c := NewClient("sk_test_dummy", testWebhookSecret)
-	_, err := c.VerifyWebhookSignature([]byte(`{}`), "")
+	_, err := c.VerifyWebhook([]byte(`{}`), "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "missing Stripe-Signature")
 }
@@ -62,7 +62,7 @@ func TestVerifyWebhookSignature_TamperedPayload(t *testing.T) {
 	tampered := []byte(`{"id":"evt_2","type":"payment_intent.succeeded","data":{"object":{"id":"pi_1"}}}`)
 
 	header := signedHeader(t, original, testWebhookSecret, time.Now())
-	_, err := c.VerifyWebhookSignature(tampered, header)
+	_, err := c.VerifyWebhook(tampered, header)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "signature verification failed")
 }
@@ -74,7 +74,7 @@ func TestVerifyWebhookSignature_WrongSecret(t *testing.T) {
 	payload := []byte(`{"id":"evt_1","type":"payment_intent.succeeded"}`)
 
 	header := signedHeader(t, payload, "whsec_a_different_secret", time.Now())
-	_, err := c.VerifyWebhookSignature(payload, header)
+	_, err := c.VerifyWebhook(payload, header)
 	require.Error(t, err)
 }
 
@@ -87,7 +87,7 @@ func TestVerifyWebhookSignature_StaleTimestamp(t *testing.T) {
 
 	old := time.Now().Add(-1 * time.Hour)
 	header := signedHeader(t, payload, testWebhookSecret, old)
-	_, err := c.VerifyWebhookSignature(payload, header)
+	_, err := c.VerifyWebhook(payload, header)
 	require.Error(t, err)
 }
 
@@ -113,10 +113,9 @@ func TestVerifyWebhookSignature_OldAPIVersionStillVerifies(t *testing.T) {
 	payload := []byte(`{"id":"evt_1","type":"payment_intent.succeeded","api_version":"2020-08-27.dodo","data":{"object":{"id":"pi_1"}}}`)
 
 	header := signedHeader(t, payload, testWebhookSecret, time.Now())
-	event, err := c.VerifyWebhookSignature(payload, header)
+	snap, err := c.VerifyWebhook(payload, header)
 	require.NoError(t, err, "an API-version mismatch must not reject a correctly signed event")
-	require.Equal(t, "evt_1", event.ID)
-	require.Equal(t, "2020-08-27.dodo", event.APIVersion)
+	require.Equal(t, "evt_1", snap.ID)
 }
 
 // ── The event snapshot ────────────────────────────────────────────────
@@ -219,7 +218,26 @@ func TestSnapshotEvent_UnknownType(t *testing.T) {
 
 	_, err := SnapshotEvent(&e)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "unhandled event type")
+	require.ErrorIs(t, err, ErrUnhandledEventType)
+	var unhandled *UnhandledEventError
+	require.ErrorAs(t, err, &unhandled)
+	require.Equal(t, "evt_9", unhandled.EventID)
+	require.Equal(t, "customer.created", unhandled.Type)
+}
+
+// TestVerifyWebhook_UnhandledTypeIsDistinguishable — a valid event of
+// an unhandled type must NOT look like a signature failure. The
+// webhook handler answers 400 for a bad signature and 200 for an
+// unhandled type, and it tells them apart with this sentinel.
+func TestVerifyWebhook_UnhandledTypeIsDistinguishable(t *testing.T) {
+	c := NewClient("sk_test_dummy", testWebhookSecret)
+	payload := []byte(`{"id":"evt_9","type":"customer.created","api_version":"` + stripeapi.APIVersion + `","data":{"object":{"id":"cus_1"}}}`)
+
+	header := signedHeader(t, payload, testWebhookSecret, time.Now())
+	_, err := c.VerifyWebhook(payload, header)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrUnhandledEventType)
+	require.NotContains(t, err.Error(), "signature verification failed")
 }
 
 // TestSnapshotEvent_NilData — a malformed event must not panic.

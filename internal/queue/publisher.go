@@ -55,7 +55,21 @@ func (p *SQSPublisher) SendReservation(ctx context.Context, r Reservation) error
 		// instead of panicking.
 		return fmt.Errorf("queue: marshal reservation: %w", err)
 	}
+	return p.Send(ctx, body)
+}
 
+// Send publishes an arbitrary JSON payload to this publisher's queue.
+//
+// It is the primitive behind SendReservation, and it is what the
+// Stripe webhook handler uses to hand a verified event to the
+// stripe-worker. Both message kinds share the same trace propagation
+// behaviour, so a stripe-worker's span is a child of the API's
+// webhook span rather than a disconnected root.
+//
+// The payload must be a JSON OBJECT, not an array or a bare value:
+// the traceparent fallback below splices a field into the closing
+// brace.
+func (p *SQSPublisher) Send(ctx context.Context, body []byte) error {
 	// Embed the trace context into the message body as `_traceparent`.
 	// This is a belt-and-suspenders fallback: some SQS-compatible
 	// brokers (notably ElasticMQ in dev) don't always preserve
@@ -67,8 +81,10 @@ func (p *SQSPublisher) SendReservation(ctx context.Context, r Reservation) error
 		// Cheap JSON re-shape: replace the trailing "}" with the new
 		// field + "}". Avoids an unmarshal+marshal round-trip.
 		bodyStr := string(body)
-		bodyStr = bodyStr[:len(bodyStr)-1] + `,"_traceparent":"` + traceparent + `"}`
-		body = []byte(bodyStr)
+		if len(bodyStr) > 0 && bodyStr[len(bodyStr)-1] == '}' {
+			bodyStr = bodyStr[:len(bodyStr)-1] + `,"_traceparent":"` + traceparent + `"}`
+			body = []byte(bodyStr)
+		}
 	}
 
 	input := &sqs.SendMessageInput{
@@ -80,8 +96,7 @@ func (p *SQSPublisher) SendReservation(ctx context.Context, r Reservation) error
 	// of the API's reservation span — not a disconnected root.
 	InjectTraceContext(ctx, input)
 
-	_, err = p.client.SendMessage(ctx, input)
-	if err != nil {
+	if _, err := p.client.SendMessage(ctx, input); err != nil {
 		return fmt.Errorf("queue: SQS SendMessage: %w", err)
 	}
 	return nil

@@ -44,17 +44,26 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     stripe_payment_intent_id TEXT UNIQUE,
     amount_cents             BIGINT NOT NULL CHECK (amount_cents > 0),
     currency                 TEXT NOT NULL CHECK (currency ~ '^[a-z]{3}$'),
+    -- status is STRIPE's PaymentIntent status, uppercased so it
+    -- matches the reservation statuses' vocabulary:
+    --
+    --   CREATED                    (ours — Stripe's Create has not
+    --                               returned yet, so there is no
+    --                               Stripe status to record)
+    --   REQUIRES_PAYMENT_METHOD    REQUIRES_CONFIRMATION
+    --   REQUIRES_ACTION            REQUIRES_CAPTURE
+    --   PROCESSING                 SUCCEEDED
+    --   CANCELED
+    --
+    -- The constraint is a PATTERN rather than a list of those values,
+    -- and that is deliberate. Unlike a reservation status — which we
+    -- type ourselves and want constrained to an exact set — this
+    -- value comes from Stripe. Stripe may add a status tomorrow, and
+    -- an exact list would make the webhook reject the event and
+    -- Stripe retry it forever. A pattern accepts any uppercase token
+    -- and still rejects anything malformed.
     status                   TEXT NOT NULL DEFAULT 'CREATED'
-                             CHECK (status IN (
-                                 'CREATED',
-                                 'REQUIRES_PAYMENT_METHOD',
-                                 'REQUIRES_CONFIRMATION',
-                                 'REQUIRES_ACTION',
-                                 'REQUIRES_CAPTURE',
-                                 'PROCESSING',
-                                 'SUCCEEDED',
-                                 'CANCELED'
-                             )),
+                             CHECK (status ~ '^[A-Z][A-Z_]*$'),
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

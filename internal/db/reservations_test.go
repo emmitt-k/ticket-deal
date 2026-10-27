@@ -58,6 +58,13 @@ func cleanupReservation(t *testing.T, pool *Pool, reservationID string) {
 			_, _ = tx.Exec(ctx, "DELETE FROM reservation_events WHERE reservation_id = $1", reservationID)
 			_ = tx.Commit(ctx)
 		}
+		// The payment row references the reservation, so it goes
+		// FIRST — otherwise the FK blocks the reservation delete, the
+		// error is swallowed, and the event row leaks with it (the
+		// event id is globally unique, so the next test run's seed
+		// INSERT would hit a duplicate key).
+		_, _ = pool.Exec(ctx,
+			"DELETE FROM payment_intents WHERE reservation_id = $1", reservationID)
 		_, _ = pool.Exec(ctx,
 			"DELETE FROM reservations WHERE reservation_id = $1", reservationID)
 	})

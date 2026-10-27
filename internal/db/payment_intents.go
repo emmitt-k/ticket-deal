@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -98,7 +99,7 @@ func SetStripePaymentIntentID(ctx context.Context, pool *Pool, reservationID, st
 		    updated_at = NOW()
 		WHERE reservation_id = $1
 	`
-	tag, err := pool.Exec(ctx, q, reservationID, stripeID, status)
+	tag, err := pool.Exec(ctx, q, reservationID, stripeID, NormalizePaymentStatus(status))
 	if err != nil {
 		return fmt.Errorf("db: set stripe payment intent id: %w", err)
 	}
@@ -120,7 +121,7 @@ func UpdatePaymentIntentStatus(ctx context.Context, pool *Pool, stripeID, status
 		SET status = $2, updated_at = NOW()
 		WHERE stripe_payment_intent_id = $1
 	`
-	tag, err := pool.Exec(ctx, q, stripeID, status)
+	tag, err := pool.Exec(ctx, q, stripeID, NormalizePaymentStatus(status))
 	if err != nil {
 		return fmt.Errorf("db: update payment intent status: %w", err)
 	}
@@ -156,6 +157,31 @@ func GetPaymentIntentByStripeID(ctx context.Context, pool *Pool, stripeID string
 		WHERE stripe_payment_intent_id = $1
 	`
 	return scanPaymentIntent(pool.QueryRow(ctx, q, stripeID))
+}
+
+// NormalizePaymentStatus maps a Stripe PaymentIntent status into the
+// vocabulary this system speaks.
+//
+// Stripe speaks lowercase ("requires_payment_method"); we use
+// uppercase, like the reservation statuses. The translation lives
+// HERE, next to the constraint it has to satisfy — so no caller has
+// to remember which vocabulary a given field is in, and the two
+// cannot drift.
+//
+// An empty status means "Stripe has not told us yet" and maps to
+// CREATED, the state where the row exists but Stripe's Create has
+// not returned.
+//
+// It is exported because the API's responses use the same vocabulary
+// as the database — a client should not have to learn that the
+// payment status is lowercase while the reservation status is
+// uppercase.
+func NormalizePaymentStatus(s string) string {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	if t == "" {
+		return PaymentStatusCreated
+	}
+	return t
 }
 
 // scanPaymentIntent maps one row to the struct. Shared by the two

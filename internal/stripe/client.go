@@ -28,6 +28,7 @@ package stripe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -127,13 +128,18 @@ func (c *Client) CreatePaymentIntent(ctx context.Context, amountCents int64, cur
 	}, nil
 }
 
-// VerifyWebhookSignature checks Stripe's signature header against the
-// raw request body and returns the verified event.
+// VerifyWebhook checks Stripe's signature header against the raw
+// request body and returns the SNAPSHOT of the verified event.
 //
 // This is the ONLY way a webhook body becomes a trusted event. An
 // error here means the request did not come from Stripe (or was
 // tampered with, or is older than Stripe's tolerance window) — the
 // caller must reject it.
+//
+// It returns OUR Event struct, not the SDK's — the SDK's types do
+// not cross this package boundary. An event type this app does not
+// handle comes back as an *UnhandledEventError, which the caller
+// recognises with errors.Is(err, ErrUnhandledEventType).
 //
 // Note the signature is computed over the RAW bytes. A body that has
 // been parsed and re-serialised does not sign identically, which is
@@ -157,7 +163,7 @@ func (c *Client) CreatePaymentIntent(ctx context.Context, amountCents int64, cur
 // this app reads — id, amount, currency, status, payment_intent.id —
 // do not change shape across API versions. A mismatch is logged as a
 // warning so it stays visible instead of becoming a silent surprise.
-func (c *Client) VerifyWebhookSignature(payload []byte, header string) (*stripeapi.Event, error) {
+func (c *Client) VerifyWebhook(payload []byte, header string) (*Event, error) {
 	if header == "" {
 		return nil, fmt.Errorf("stripe: missing Stripe-Signature header")
 	}
@@ -172,5 +178,18 @@ func (c *Client) VerifyWebhookSignature(payload []byte, header string) (*stripea
 			"sdk_api_version", stripeapi.APIVersion,
 			"event_id", event.ID)
 	}
-	return &event, nil
+
+	snap, err := SnapshotEvent(&event)
+	if err != nil {
+		// An event type we don't act on is not a failure of the
+		// signature — it is a valid event we have no interest in.
+		// Return it as a distinguishable error so the caller can
+		// answer 200 (and stop Stripe sending it) instead of 400.
+		var unhandled *UnhandledEventError
+		if errors.As(err, &unhandled) {
+			return nil, unhandled
+		}
+		return nil, err
+	}
+	return &snap, nil
 }
