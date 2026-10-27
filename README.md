@@ -146,6 +146,16 @@ service is healthy, and retry safely.
 | 4 | **Readiness probe** | ✅ Done | `GET /readyz` — 3 parallel dependency checks (Redis / Postgres / SQS) with 500ms budgets. Deliberately separate from `/healthz` so a dead Postgres pulls the container from load-balancer rotation *without* triggering a restart loop |
 | 5 | **Idempotent retries** | ✅ Done | `Idempotency-Key` on `POST /reserve` — 24h cached-response replay plus a short-TTL SETNX in-flight lock, so a retry storm can't double-book. Stripe-style `409` if the same key arrives with a different body |
 
+### Layer 2 — the inside of the product
+
+Layer 1 made the product usable from the outside. Layer 2 makes it honest from the
+inside: an audit trail you can defend, and a payment flow that settles.
+
+| # | Item | Status | What landed |
+|---|---|---|---|
+| 6 | **Audit log** | ✅ Done | `reservation_events` — an append-only trail of every transition (`CREATED` / `CONFIRMED` / `EXPIRED` / `CANCELLED` / `REFUND_INITIATED`), written in the **same transaction** as the status change, so a transition can't happen unrecorded. Records *who* did it (`user` / `system` / `admin` / `stripe_webhook`), carries the OTel `trace_id` for the trace↔logs join, and is sealed by a database trigger that refuses `DELETE` and refuses history rewrites |
+| 7 | **Stripe test mode** | 🔜 Next | PaymentIntents + a signature-verified webhook receiver — the last unbuilt transition (`PENDING_PAYMENT → CONFIRMED`) |
+
 > Layer-by-layer specs, and what's next → [`/docs/product-roadmap.md`](docs/product-roadmap.md) · Design rationale and per-file reference → [`/docs/architecture.md`](docs/architecture.md)
 
 ---
@@ -509,7 +519,8 @@ that file is the source of truth; this list is the short version.
 - [x] **Log aggregation** — Grafana Loki + Promtail, "Ticket Deal — Logs" dashboard with service + trace_id filters, click-through from log line to Jaeger trace
 - [x] **Dockerised** — all 4 long-running Go services run in containers; one `docker compose up -d` brings up everything
 - [x] **Read + cancel + retry safety** — Layer 1: state-machine gateway, `GET` endpoints, `POST /cancel`, `/readyz`, `Idempotency-Key`
-- [ ] **Payment gateway** — Stripe webhook handler that confirms reservations (`PENDING_PAYMENT → CONFIRMED`, the one transition with no code path yet) and releases the hold. **This is Layer 2 — the next milestone.**
+- [x] **Audit trail** — Layer 2 item 6: an append-only `reservation_events` log written atomically with every transition, recording who did what and joining to traces via `trace_id`
+- [ ] **Payment gateway** — Stripe webhook handler that confirms reservations (`PENDING_PAYMENT → CONFIRMED`, the one transition with no code path yet) and releases the hold. **This is Layer 2 item 7 — the next milestone.**
 - [ ] **Seat-level granularity** — Redis Hash per event instead of a single counter
 - [ ] **Anti-bot** *(intentionally skipped in lite-auth; revisit if slash-traction emerges)* — CAPTCHA + device fingerprinting before JWT issuance
 - [ ] **Replay testing** — deterministic k6 replay against a seeded Redis state

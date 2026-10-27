@@ -41,9 +41,10 @@
 | Dependabot | Go modules + GitHub Actions (weekly, Mondays 09:00 BKK) |
 
 **Product surface status:** Layer 1 of [`docs/product-roadmap.md`](docs/product-roadmap.md)
-is shipped 5/5. Layer 2 (Stripe payment + webhook receiver) is unstarted. Check the
-roadmap before assuming an endpoint exists — it is the source of truth for what is
-built vs planned.
+is shipped 5/5. Layer 2 item 6 (the append-only audit log) is shipped on
+`feature/audit-log`; items 7-10 (Stripe payment + webhook receiver, notifications, admin
+API, anti-bot) are unstarted. Check the roadmap before assuming an endpoint exists — it is
+the source of truth for what is built vs planned.
 
 ---
 
@@ -429,6 +430,77 @@ are the operational signals.
 
 ---
 
+## Layer 2 — The Product Surface (continued)
+
+> **Layer 2, item 6** landed first because Layer 2 item 7 (Stripe) depends on it — a refund
+> has to be distinguishable from a cancellation in the audit trail.
+
+### Item 6 — The append-only audit log
+
+`internal/db/audit.go` + `migrations/005_audit_log.sql`. The reservations row holds the
+**current** status; the history of how it got there was gone the moment a second transition
+overwrote it. `reservation_events` is the append-only trail.
+
+| Column | Meaning |
+|---|---|
+| `event_id` | `BIGSERIAL` — insertion order, so it *is* the chronological order |
+| `reservation_id` | FK → `reservations` |
+| `user_id` | denormalised — Layer 3's GDPR sweep needs to find a user's rows by `user_id` alone |
+| `event_type` | `CREATED` · `CONFIRMED` · `EXPIRED` · `CANCELLED` · `REFUND_INITIATED` |
+| `actor_type` | `user` · `system` · `admin` · `stripe_webhook` |
+| `actor_id` | the user id, the component name (`expiration-watcher`), the Stripe event id, … |
+| `old_status` / `new_status` | NULL for `CREATED` (there was no previous status) |
+| `trace_id` | the join key into Grafana / Loki / Jaeger |
+| `metadata` | JSONB — seat counts, Stripe charge ids, … |
+
+**The event type is derived from the EDGE, not the destination status.** `CONFIRMED →
+CANCELLED` is a `REFUND_INITIATED` (money moved back); `PENDING_PAYMENT → CANCELLED` is a
+`CANCELLED` (nothing was paid). `auditEventTypeForEdge` is the single source of truth for
+that mapping, and its default case turns a forgotten edge into a loud error rather than a
+silently mislabeled row.
+
+**Who writes what:**
+
+| Path | event_type | actor_type / actor_id |
+|---|---|---|
+| Worker INSERT (`db.InsertIfAbsent`) | `CREATED` | `user` / the user id |
+| Cancel handler | `CANCELLED` | `user` / the JWT subject |
+| Expire watcher (`expire.Compensate`) | `EXPIRED` | `system` / `expiration-watcher` |
+| Expire sweep (`expire.RunSweep`) | `EXPIRED` | `system` / `expiration-sweep` |
+| *Stripe webhook (item 7, not yet written)* | `CONFIRMED`, `REFUND_INITIATED` | `stripe_webhook` / `evt_...` |
+
+**Append-only is enforced by the database,** not by discipline: a `BEFORE UPDATE OR DELETE`
+trigger refuses `DELETE` outright and refuses any `UPDATE` except rewriting `user_id` (the
+GDPR anonymisation path, Layer 3 item 14). The one escape hatch is a session GUC,
+`SET LOCAL ticket_deal.audit_purge = 'on'` — needed by test fixtures and future retention
+policies. `SET LOCAL` scopes it to one transaction, so it can't leak across pooled
+connections.
+
+**`db.TransitionStatus` takes a mandatory `db.Audit`** and writes the audit row in the
+*same transaction* as the status change:
+
+```go
+db.TransitionStatus(ctx, pool, id, db.StatusPendingPayment, db.StatusCancelled,
+    db.Audit{Actor: db.UserActor(claims.Subject)})
+```
+
+The actor is required — an empty actor type is rejected with `db.ErrInvalidAudit` before
+any SQL runs — so "a transition happened but nobody recorded it" is not a state the code can
+reach. The signature change was deliberate: a sibling function without an actor would leave
+a way to transition a row without recording it.
+
+The expire paths are the deliberate exception (see Convention #9): they fold the audit
+`INSERT` into the *same statement* as the status change, via a data-modifying CTE.
+Postgres guarantees a data-modifying CTE runs exactly once and to completion even when the
+outer query never reads its output — so the audit row and the status change commit or roll
+back together, with no extra round-trip.
+
+`db.AuditInsertSelect` is the shared piece that lets the expire paths build that CTE
+insert without duplicating the column list, the trace extraction, or the metadata
+marshalling.
+
+---
+
 ## Key Files & Directories
 
 ```
@@ -444,7 +516,7 @@ are the operational signals.
 │   ├── api/                    # HTTP handlers: reserve, get, list, cancel, readyz, publisher seam
 │   ├── auth/                   # JWT middleware, JWT minting
 │   ├── config/                 # Env var config (incl. PostgresConfig/DSN composition)
-│   ├── db/                     # pgx pool, reservation writes, TransitionStatus, list queries
+│   ├── db/                     # pgx pool, reservation writes, TransitionStatus, list queries, audit log
 │   ├── expire/                 # Expiration watcher, sweep, compensate
 │   ├── iplimit/                # Redis IP rate-limiter (token bucket)
 │   ├── logging/                # slog Init + ContextHandler (trace_id/span_id injection)
@@ -496,7 +568,8 @@ are the operational signals.
 │   ├── 001_init.sql           # events + reservations schema, status CHECK, expiry partial index
 │   ├── 002_seed.sql           # Seed data (event id=1, inventory 100)
 │   ├── 003_add_seats.sql      # Adds seats column (Phase 7 INCRBY sizing)
-│   └── 004_user_lookup_index.sql  # Composite (user_id, created_at DESC) for GET /api/me/reservations
+│   ├── 004_user_lookup_index.sql  # Composite (user_id, created_at DESC) for GET /api/me/reservations
+│   └── 005_audit_log.sql         # Layer 2 item 6: append-only reservation_events + append-only trigger
 ├── docker/
 │   └── elasticmq.conf         # Pre-creates the reservations queue on boot
 ├── docker-compose.yml         # 12 services: 8 infra (redis, postgres, elasticmq, prometheus,
@@ -559,7 +632,22 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 
 ### Current Merge State
 
-As of the last update, **all 5 Layer 1 branches are pushed but unmerged, and no PRs are open.** The working tree sits at the tip of `feature/idempotency-key`. Before starting new feature work, check whether the stack has landed — if it has, branch from `main`; if not, branch from the tip and extend the stack.
+**Layer 1 is fully merged into `main`** (PRs #11-#15, merged tip-first: dockerize →
+get-reservations → cancel-reservation → readyz → idempotency-key). `main` is at
+`2abc4ce`.
+
+**Layer 2 item 6 (the audit log) is on `feature/audit-log`**, branched from `main`. It also
+carries three fixes found along the way — see the branch's commit log:
+
+- `fix(db)`: `ListReservationsByUser` returned a nil slice instead of an empty one
+- `test(api)`: the handler tests never mounted on a chi router, so 12 tests asserted against
+  a `400 missing_id` instead of the real status. They had never run in CI (they `t.Skip`
+  without Postgres/Redis).
+- `fix(expire)`: a **double-INCRBY oversell race** in the watcher's expire path — see
+  Convention #13
+
+Before starting new feature work, check whether `feature/audit-log` has landed. If it has,
+branch from `main`; if not, branch from its tip and extend the stack.
 
 ---
 
@@ -576,7 +664,10 @@ As of the last update, **all 5 Layer 1 branches are pushed but unmerged, and no 
 9. **All status changes go through `db.TransitionStatus`** — never hand-roll `UPDATE reservations SET status = ...`. The helper encodes the legal edges as a `validTransitions` map and does a compare-and-set, so a caller cannot invent an impossible transition or race another writer into a lost update. Distinguish the two failure returns: `(false, nil)` = **lost the CAS race** (re-read the row to see who won; this is normal and expected), `(false, ErrInvalidTransition)` = **programmer error** (the edge doesn't exist). `internal/expire.Compensate` and `FindAndExpireSweptRows` are the deliberate exceptions — their CTEs already return `seats` in the same statement, so routing them through the helper would cost a second round-trip for no correctness gain.
 10. **New Redis keys must use the existing key constructors** — `redis.InventoryKey`, `redis.HoldKey`, `redis.CacheKey`, `redis.LockKey`. No stringly-typed key building in handlers; tests import the same constructors so they can't drift from production.
 11. **A partial Redis failure after a successful DB write is not a 5xx.** `POST /cancel` transitions in Postgres, then INCRBYs Redis; if the INCRBY fails it logs WARN and still returns 200. Returning 5xx would make the client retry into `409 already_cancelled` — strictly worse UX than a countable phantom seat an operator reconciles. Same policy for a failed idempotency cache `Store`: at-most-once beats double-booking.
-12. **Check `docs/product-roadmap.md` before assuming a capability exists.** It is the source of truth for built-vs-planned. Layer 1 is shipped 5/5; Layer 2 (Stripe webhook receiver, payment confirmation) is unstarted — `PENDING_PAYMENT → CONFIRMED` has no code path yet.
+12. **Check `docs/product-roadmap.md` before assuming a capability exists.** It is the source of truth for built-vs-planned. Layer 1 is shipped 5/5; Layer 2 item 6 (audit log) is shipped on `feature/audit-log`; Layer 2 items 7-10 (Stripe, notifications, admin API, anti-bot) are unstarted — `PENDING_PAYMENT → CONFIRMED` has no code path yet.
+13. **The compare-and-set guard must live in the UPDATE's own WHERE clause, not only in a CTE.** This is the expire path's bug (fixed in `fix(expire): close a double-INCRBY oversell race`), and it is worth understanding because it is invisible in a single-threaded test. A CTE like `target` is evaluated against the statement's **snapshot** and is *not* re-read when a concurrent transaction commits. So `WHERE reservation_id IN (SELECT reservation_id FROM target)` — where `target` filtered on `status='PENDING_PAYMENT'` — lets a second concurrent transaction re-flip the row after the first commits: its post-lock re-check finds the id still in `target` (the id never changed), so it updates the row **again** and INCRBYs the seat a second time. That is a silent **oversell**. The fix is to repeat the guard in the UPDATE: `WHERE reservation_id IN (...) AND status = 'PENDING_PAYMENT'`. After the lock is released, the re-check runs against the *new* row version, sees `status='EXPIRED'`, and skips it. This is the same shape as `db.TransitionStatus` (`WHERE reservation_id = $2 AND status = $3`). **Any new CAS-shaped UPDATE must carry its guard in the UPDATE, not in a helper CTE.**
+14. **Every status transition writes an audit row, in the same transaction.** `db.TransitionStatus` takes a mandatory `db.Audit` (actor + metadata) and writes `reservation_events` atomically with the status change. The actor is required — an empty actor type is rejected with `db.ErrInvalidAudit` before any SQL runs. The expire paths are the deliberate exception (their audit `INSERT` is a data-modifying CTE in the same statement — see the Layer 2 section above). **Never write a status change without its audit row, and never write an audit row without the status change.**
+15. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
 
 ---
 
