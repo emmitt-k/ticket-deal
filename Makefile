@@ -25,8 +25,8 @@ DOCKER          := docker
 PSQL            := $(DOCKER) exec -i ticket-postgres psql -U tickets -d tickets
 REDIS           := $(DOCKER) exec -i ticket-redis redis-cli
 
-# All 6 binaries. Order doesn't matter for `build`; keep alphabetical.
-CMDS := api dashboard-server expiration-watcher mintjwt seed-inventory worker
+# All 7 binaries. Order doesn't matter for `build`; keep alphabetical.
+CMDS := api dashboard-server expiration-watcher mintjwt seed-inventory stripe-worker worker
 
 # ─── Phony + default ──────────────────────────────────────────────────
 .PHONY: help
@@ -75,6 +75,24 @@ doctor: ## Check prereqs (go, docker, k6, curl)
 	@command -v redis-cli  >/dev/null 2>&1 && echo "  ✓ redis-cli"     || echo "  ⚠ redis-cli  (optional; for debugging)"
 
 # ─── Build ────────────────────────────────────────────────────────────
+# ─── Stripe ───────────────────────────────────────────────────────────
+#
+# `stripe-listen` forwards Stripe's test-mode webhooks to the local
+# API, so the whole payment flow can be exercised without a public
+# URL. It needs the Stripe CLI:
+#
+#   brew install stripe/stripe-cli/stripe
+#
+# It reads the webhook signing secret from STRIPE_WEBHOOK_SECRET, so
+# the signature the API verifies matches the one the CLI signs with.
+.PHONY: stripe-listen
+stripe-listen: ## Forward Stripe test-mode webhooks to the local API (needs the Stripe CLI)
+	@test -n "$$STRIPE_WEBHOOK_SECRET" || { echo "STRIPE_WEBHOOK_SECRET is not set"; exit 1; }
+	@echo "→ forwarding Stripe webhooks to http://localhost:8080/webhooks/stripe"
+	stripe listen \
+		--forward-to http://localhost:8080/webhooks/stripe \
+		--events payment_intent.succeeded,payment_intent.payment_failed,charge.refunded
+
 .PHONY: build vet test test-race
 build: ## Build all 6 binaries into bin/
 	@mkdir -p $(BIN_DIR)

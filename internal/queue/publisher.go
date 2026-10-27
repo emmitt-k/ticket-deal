@@ -136,9 +136,9 @@ type injectOnlyCarrier struct {
 	attrs map[string]string
 }
 
-func (c injectOnlyCarrier) Get(key string) string         { return c.attrs[key] }
-func (c injectOnlyCarrier) Set(key, value string)         { c.attrs[key] = value }
-func (c injectOnlyCarrier) Keys() []string                { return nil }
+func (c injectOnlyCarrier) Get(key string) string { return c.attrs[key] }
+func (c injectOnlyCarrier) Set(key, value string) { c.attrs[key] = value }
+func (c injectOnlyCarrier) Keys() []string        { return nil }
 
 // ReservationAPIPublisher adapts an SQSPublisher to the smaller
 // api.ReservationPublisher interface (which takes a raw []byte).
@@ -171,6 +171,34 @@ func (a *ReservationAPIPublisher) Publish(ctx context.Context, body []byte) erro
 		return fmt.Errorf("queue: API publisher unmarshal: %w", err)
 	}
 	return a.inner.SendReservation(ctx, r)
+}
+
+// EventAPIPublisher adapts an SQSPublisher to the small
+// api.EventPublisher interface (which takes a raw []byte, like
+// api.ReservationPublisher).
+//
+// It is the same shape as ReservationAPIPublisher, for the same
+// reason: it keeps the queue package free of any dependency on the
+// api package (which would be circular — the api package imports
+// queue for the Reservation type).
+type EventAPIPublisher struct {
+	inner *SQSPublisher
+}
+
+// NewEventAPIPublisher wraps an SQSPublisher so it can be passed to
+// api.StripeWebhookHandler.
+func NewEventAPIPublisher(inner *SQSPublisher) *EventAPIPublisher {
+	return &EventAPIPublisher{inner: inner}
+}
+
+// Publish forwards a pre-serialised payload to the queue.
+//
+// The payload is already JSON — the webhook handler snapshots the
+// event and marshals it — so there is nothing to unmarshal here.
+// The only thing this adds over the inner Send is the trace
+// propagation, which Send already does.
+func (a *EventAPIPublisher) Publish(ctx context.Context, body []byte) error {
+	return a.inner.Send(ctx, body)
 }
 
 // Ping is the /readyz counterpart of Publish — delegates to the inner
