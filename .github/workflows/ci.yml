@@ -9,11 +9,56 @@ on:
 permissions:
   contents: read
 
+# One run per ref: a new push cancels the run still in flight for that
+# branch, so a rapid series of pushes does not queue up N runners.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    # ── The live dependencies ────────────────────────────────────────
+    #
+    # The tests talk to a REAL Postgres and a REAL Redis — the state
+    # machine's correctness (CAS, the audit row, the seat release on a
+    # refund) is only provable against a real database. Without these
+    # two service containers, 146 of the 236 tests skip themselves and
+    # the suite reports 15% coverage while looking green.
+    #
+    # The ports are mapped to the runner's localhost, which is exactly
+    # where the tests look: postgres://tickets:tickets@localhost:5432
+    # and localhost:6379. No test-side change is needed.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tickets
+          POSTGRES_PASSWORD: tickets
+          POSTGRES_DB: tickets
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tickets -d tickets"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable
+      REDIS_ADDR: localhost:6379
 
     steps:
       - uses: actions/checkout@v7
@@ -30,10 +75,36 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # The schema the tests expect. Applied to the fresh database in
+      # order, the same way `make migrate` does it locally. ON_ERROR_STOP
+      # matters: without it psql exits 0 on a failed statement and a
+      # broken migration would look like it worked.
+      - name: Apply migrations
+        run: |
+          for f in migrations/0*.sql; do
+            echo "→ $f"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
       - name: go test (race + coverage)
         run: |
           go test -race -coverprofile=coverage.out -covermode=atomic ./...
           go tool cover -func=coverage.out | tail -1
+
+      # A coverage number that is printed but never enforced is a number
+      # that quietly goes down. The floor is 3 points below today's real
+      # number (48.5%), so an accidental drop is caught and a deliberate
+      # one is a conscious bump of this line.
+      - name: Enforce the coverage floor
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN {
+            if (t + 0 < 45) {
+              printf "::error::coverage %.1f%% is below the 45%% floor\n", t
+              exit 1
+            }
+          }'
 
       - name: go build
         run: go build ./...
@@ -45,3 +116,47 @@ jobs:
           name: coverage
           path: coverage.out
           retention-days: 14
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: true
+          cache-dependency-path: go.sum
+
+      # gofmt is not a style preference — it is the one tool every Go
+      # reviewer expects to be already applied, so an unformatted file in
+      # a diff is noise the reviewer has to read past.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # A go.sum that has drifted from go.mod is a build that breaks on
+      # someone else's machine and not on yours.
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum || {
+            echo "::error::go.mod / go.sum are not tidy — run 'go mod tidy' and commit"
+            exit 1
+          }
+
+      # Known CVEs in the standard library and in the dependencies. This
+      # step found 14 (12 in the stdlib on go1.27.1, plus one in
+      # golang.org/x/net) and is what keeps them from coming back.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
