@@ -1,11 +1,17 @@
 # syntax=docker/dockerfile:1.7
 #
-# Shared multi-stage Dockerfile for all 4 long-running Go services:
-#   api, worker, expiration-watcher, dashboard-server
+# Shared multi-stage Dockerfile for all 5 long-running Go services:
+#   api, worker, stripe-worker, expiration-watcher, dashboard-server
 #
 # Build with:
 #   docker build --build-arg SERVICE=api -t ticket-deal-api .
 #   docker build --build-arg SERVICE=worker -t ticket-deal-worker .
+#
+# GO_VERSION must stay in step with the `go` directive in go.mod — and
+# with a PATCHED release. go1.27.1 carried 12 standard-library CVEs
+# (net/http, net/http2, html/template, crypto/tls, crypto/x509, …) that
+# go1.27.3 fixes. The govulncheck step in CI scans the host toolchain;
+# this ARG is what the IMAGES run on, so it needs the same treatment.
 #
 # Why one shared file:
 #   The 4 binaries differ only in which cmd/<name>/ subdir they live in.
@@ -24,7 +30,7 @@
 #   - Local `docker compose build` on any host just uses the host arch.
 #   - CGO_ENABLED=0 keeps the binary fully static so it runs on any libc.
 
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.3
 
 # ─── Build stage ─────────────────────────────────
 FROM golang:${GO_VERSION}-alpine AS build
