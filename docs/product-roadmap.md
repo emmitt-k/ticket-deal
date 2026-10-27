@@ -40,10 +40,13 @@ unblock the later ones (state machine → cancel → refund → audit → Stripe
 | `/api/reservations/{id}` | GET | JWT | One reservation. `403` if it isn't yours |
 | `/api/me/reservations` | GET | JWT | The caller's own list — `?status=`, `?limit=`, `?offset=` |
 | `/api/reservations/{id}/cancel` | POST | JWT | Cancel a `PENDING_PAYMENT` reservation; releases the seat |
+| `/api/reservations/{id}/pay` | POST | JWT | Create the Stripe PaymentIntent; returns the `client_secret` |
+| `/webhooks/stripe` | POST | Stripe signature | Stripe's callback. Verifies, snapshots, queues — no state change here |
 
-That's the **complete public surface**. Nine endpoints — five from the original
-kernel, four added by Layer 1. Behind the scenes there are 12 docker services,
-13 internal packages, 7 migrations, and a 4-pillar observability stack.
+That's the **complete public surface**. Eleven endpoints — five from the original
+kernel, four added by Layer 1, two added by Layer 2 item 7. Behind the scenes there
+are 13 docker services, 15 internal packages, 8 migrations, and a 4-pillar
+observability stack.
 
 The read endpoints are what make the seat price reachable by a client:
 `GET /api/reservations/{id}` and `GET /api/me/reservations` return
@@ -58,7 +61,7 @@ The `reservations.status` column has a `CHECK` constraint allowing five values:
 CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'EXPIRED', 'CANCELLED', 'REFUNDED'))
 ```
 
-But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today**:
+**All five are reachable in code today**:
 
 | Status | Reached via | Source code |
 |---|---|---|
@@ -71,14 +74,16 @@ But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today*
 Both of those gaps are now closed: Layer 2 item 6 wired the transitions and item 7
 gave them a way to be reached.
 
-> **Note:** the refund edge *is* wired (`CONFIRMED → REFUNDED` — it was
-> specified into the state machine in Layer 1, and the audit log records
-> it as a `REFUND_INITIATED` event), but nothing can reach `CONFIRMED`
-> yet because there's no payment integration. That's item 7.
+> **Note:** `REFUNDED` was split out of `CANCELLED` in
+> `migrations/006_refunded_status.sql`: "the customer never paid" and "the
+> customer paid and we gave the money back" are different facts and were sharing
+> one status.
 >
-> `REFUNDED` was split out of `CANCELLED` in `migrations/006_refunded_status.sql`:
-> "the customer never paid" and "the customer paid and we gave the money
-> back" are different facts and were sharing one status.
+> The refund edge (`CONFIRMED → REFUNDED`) is wired, and the audit log records it
+> as a `REFUND_INITIATED` event — the **event** says what was done (money came
+> back), the **status** says where the reservation ended up. That separation is
+> what lets a *partial* refund be an event while the status stays `CONFIRMED`.
+> Only a full refund becomes a state.
 
 ### What's not there at all (not even a stub)
 
@@ -100,7 +105,7 @@ gave them a way to be reached.
 
 ### 1. Reservation state machine (with typed transitions) ✅ Done
 
-**Effort:** ~half a day. **Blocks:** items 2, 3, 8 (admin), 6 (Stripe).
+**Effort:** ~half a day. **Blocks:** items 2, 3, 9 (admin), 6 (Stripe).
 
 Today, status transitions are implicit (worker INSERT sets PENDING, watcher
 overwrites to EXPIRED). Make them explicit:
@@ -231,8 +236,8 @@ About 1 weekend of focused work. Small commits. Each item is independent.
 **Effort:** ~1 day. **Why first:** refunds without audit = SOC2 fail. Admin
 actions without audit = unanswerable "who did this?"
 
-> **Shipped** on `feature/audit-log`. The table, the append-only trigger, and the
-> atomic write on every transition. Notes on what changed vs the sketch below:
+> **Shipped** — merged into `main` (PRs #21 and #22). The table, the append-only
+> trigger, and the atomic write on every transition. Notes on what changed vs the sketch below:
 > the migration is `005_audit_log.sql` (not `004` — that number was taken), and
 > `user_id` was added to the table because Layer 3's GDPR sweep needs to find a
 > user's rows by `user_id` alone.
@@ -478,20 +483,26 @@ service for our scale and removes a future "I forgot to clean up" problem.
 
 ## What I'd build first — and why
 
-**Done:** Layer 1 (1 → 2 → 3 → 4 → 5) and Layer 2 item 6. The system now has
-the whole user-facing spine plus an audit trail behind it.
+**Done:** Layer 1 (1 → 2 → 3 → 4 → 5) and Layer 2 items 6 and 7. The system
+now has the whole user-facing spine, an audit trail behind it, and it takes
+money. Stripe was the only item that turned *"a reservation kernel"* into
+*"a product that takes money"*, and it exercised every pattern a payments
+engineer actually solves: signature verification, webhook idempotency,
+out-of-order delivery, and the race between the payment webhook and the expiry
+watcher.
 
-**Next: item 7 — Stripe.** It is the only item that turns *"a reservation
-kernel"* into *"a product that takes money"*, and it unblocks items 8, 9 and
-10 (all three need to know what a confirmed reservation is). It also exercises
-every pattern a payments engineer actually solves: signature verification,
-webhook idempotency, out-of-order delivery, and the race between the payment
-webhook and the expiry watcher.
-
-**Then:** item 9 (admin API) — it becomes interesting the moment there is money
-to refund — and item 10 (anti-bot), which is the cheapest proof that you think
+**Next: item 9 (the admin/ops API)** — it became interesting the moment there
+was money to refund. The audit log already has `actor_type = 'admin'` waiting
+for it, so this is the item that makes the audit trail earn its keep rather
+than just exist. **Then item 10 (anti-bot)**, the cheapest proof that you think
 like an attacker. Item 8 (notifications) is the best demonstration that the
-queue design scales to a second consumer, but it is the least differentiating.
+queue design scales to a second consumer, but it is the least differentiating —
+so it goes third, unless the demo needs the MailHog inbox to look busy.
+
+**Before any of them, two chores** that are cheap and make the repo honest:
+CI does not currently run the `internal/db` tests (they skip without a
+Postgres, and the CI job has no Postgres service), and ~15 untouched files
+carry gofmt drift. A reviewer spots both in five seconds.
 
 ## The strategic question
 
@@ -499,16 +510,20 @@ The biggest impact-portfolio item, ranked:
 
 | Rank | Feature | Why it's the differentiator | Status |
 |---|---|---|---|
-| 1 | **Stripe test mode** (#7) | Forces you to solve every pattern real engineers solve: signature verification, webhook idempotency, payment state, race-vs-expiry. Recruiters recognize it. | **← next** |
+| 1 | **Stripe test mode** (#7) | Forces you to solve every pattern real engineers solve: signature verification, webhook idempotency, payment state, race-vs-expiry. Recruiters recognize it. | ✅ Shipped |
 | 2 | **State machine + cancel** (#1, #3) | The connective tissue. Makes Layer 2 possible. | ✅ Shipped |
 | 3 | **Audit log** (#6) | "Who did this when?" is the SOC2 question. | ✅ Shipped |
-| 4 | **Anti-bot** (#10) | Proves you think like an attacker. | ⬜ Not started |
+| 4 | **Anti-bot** (#10) | Proves you think like an attacker. | ⬜ Not started — **← next** |
 | 5 | **Notifications** (#8) | Tests the design's flexibility claim. | ⬜ Not started |
 | 6 | **Admin API** (#9) | Every real product has this; usually glossed over. | ⬜ Not started |
 
-Stripe is the headline. The state machine and the audit log were its
-prerequisites — both are shipped, so the path is clear. Build #7 next, then
-the rest fill in around it.
+The three headline items are shipped, and they were the hard ones — the
+prerequisites (the state machine, the audit log) and the money (Stripe). What
+is left is the layer of polish and support tooling that makes a project look
+like it was *operated*, not just written: the admin override, the bot defence,
+the notifications. That is where the remaining differentiator is, and it is a
+different kind of differentiator — less "impressive endpoint" and more "someone
+ran this in production and thought about what goes wrong".
 
 ---
 
