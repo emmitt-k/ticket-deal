@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
@@ -28,7 +29,11 @@ func doCancelReservation(t *testing.T, pool *db.Pool, rdb *redis.Client,
 ) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 
-	handler := auth.Middleware(testSecret)(CancelReservationHandler(pool, rdb))
+	// Mounted on a real chi router so chi.URLParam(r, "id") resolves
+	// the way it does in production — see testsupport_test.go.
+	handler := apiTestRouter(t, testSecret, func(r chi.Router) {
+		r.Post("/reservations/{id}/cancel", CancelReservationHandler(pool, rdb))
+	})
 	url := "/api/reservations/" + reservationID + "/cancel"
 	req := httptest.NewRequest(http.MethodPost, url, nil)
 	if userID != "" {
@@ -40,8 +45,9 @@ func doCancelReservation(t *testing.T, pool *db.Pool, rdb *redis.Client,
 	handler.ServeHTTP(rec, req)
 
 	var parsed map[string]any
-	if rec.Body.Len() > 0 && rec.Header().Get("Content-Type") != "" {
-		_ = json.NewDecoder(rec.Body).Decode(&parsed)
+	body := apiBodyBytes(t, rec)
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &parsed)
 	}
 	return rec, parsed
 }
@@ -189,7 +195,7 @@ func TestCancel_AlreadyPaid(t *testing.T) {
 
 	// PENDING → CONFIRMED via TransitionStatus (the only legal edge).
 	changed, err := db.TransitionStatus(context.Background(), pool,
-		rid, db.StatusPendingPayment, db.StatusConfirmed)
+		rid, db.StatusPendingPayment, db.StatusConfirmed, db.Audit{Actor: db.UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -207,7 +213,7 @@ func TestCancel_AlreadyExpired(t *testing.T) {
 	cleanupReserveKeys(t, rdb, eventID, owner)
 
 	changed, err := db.TransitionStatus(context.Background(), pool,
-		rid, db.StatusPendingPayment, db.StatusExpired)
+		rid, db.StatusPendingPayment, db.StatusExpired, db.Audit{Actor: db.UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 
