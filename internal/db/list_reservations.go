@@ -118,7 +118,11 @@ func scanReservations(ctx context.Context, pool *Pool, q string, args ...any) ([
 	}
 	defer rows.Close()
 
-	var out []ReservationRow
+	// Start from a non-nil empty slice: the documented contract is
+	// "([]ReservationRow{}, nil) — NOT nil", because a nil slice
+	// serialises to JSON `null` and a client has to handle two shapes
+	// for "no rows". `var out []ReservationRow` would be nil here.
+	out := []ReservationRow{}
 	for rows.Next() {
 		var r ReservationRow
 		if scanErr := rows.Scan(
