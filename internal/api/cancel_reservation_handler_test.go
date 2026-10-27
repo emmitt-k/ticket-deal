@@ -278,3 +278,51 @@ func TestCancel_HoldKeyAlreadyGone(t *testing.T) {
 	require.Equal(t, db.StatusCancelled, body["status"])
 	require.Equal(t, 100, inventoryCount(t, rdb, eventID))
 }
+
+// ── Audit log ──────────────────────────────────────────────────────────
+
+// TestCancel_WritesAuditRow — cancelling appends a CANCELLED row to
+// the audit log, naming the JWT holder as the actor.
+//
+// This is the end-to-end proof of the whole feature: the user-facing
+// action and the audit record land together, and the audit record
+// says WHO did it.
+func TestCancel_WritesAuditRow(t *testing.T) {
+	const owner = "u-cancel-audit-1"
+	pool, _, rid := newGetReservationPool(t, owner)
+	rdb := newTestClient(t)
+	cleanupReserveKeys(t, rdb, 64001, owner)
+
+	rec, _ := doCancelReservation(t, pool, rdb, owner, rid)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	events, err := db.ListAuditEvents(context.Background(), pool, rid)
+	require.NoError(t, err)
+	require.Len(t, events, 2, "CREATED (from the insert) + CANCELLED")
+
+	e := events[1]
+	require.Equal(t, db.AuditEventCancelled, e.EventType)
+	require.Equal(t, db.ActorTypeUser, e.ActorType)
+	require.Equal(t, owner, e.ActorID, "the audit row must name the user who cancelled")
+	require.Equal(t, db.StatusPendingPayment, e.OldStatus)
+	require.Equal(t, db.StatusCancelled, e.NewStatus)
+}
+
+// TestCancel_ForbiddenWritesNoAuditRow — a rejected cancel (not your
+// reservation) must not touch the audit log. The log records what
+// HAPPENED, not what was attempted.
+func TestCancel_ForbiddenWritesNoAuditRow(t *testing.T) {
+	const owner = "u-cancel-audit-owner"
+	const other = "u-cancel-audit-other"
+	pool, _, rid := newGetReservationPool(t, owner)
+	rdb := newTestClient(t)
+	cleanupReserveKeys(t, rdb, 64001, other)
+
+	rec, _ := doCancelReservation(t, pool, rdb, other, rid)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+
+	events, err := db.ListAuditEvents(context.Background(), pool, rid)
+	require.NoError(t, err)
+	require.Len(t, events, 1, "a rejected cancel must not write an audit row")
+	require.Equal(t, db.AuditEventCreated, events[0].EventType)
+}

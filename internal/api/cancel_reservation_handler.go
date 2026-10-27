@@ -6,7 +6,9 @@
 //   1. Verify JWT matches the row's user_id           → 403 if not
 //   2. Verify status == PENDING_PAYMENT               → 409 otherwise
 //   3. db.TransitionStatus(PENDING_PAYMENT → CANCELLED) → CAS-safe against
-//                                                        watcher's EXPIRED sweep
+//                                                        watcher's EXPIRED sweep,
+//                                                        and appends the CANCELLED
+//                                                        audit row in the same tx
 //   4. INCRBY inventory:event:<id> <seats>            → release the seat back to Redis
 //   5. (best-effort) DEL hold:event:<id>:user:<u>     → so the user can re-reserve
 //
@@ -143,8 +145,13 @@ func CancelReservationHandler(pool *db.Pool, rdb *redis.Client) http.HandlerFunc
 		}
 
 		// ── Step 3: CAS transition. Race-safe against watcher's EXPIRED sweep. ──
+		// The transition also appends a CANCELLED audit row, in the same
+		// transaction as the status change. The actor is the user whose
+		// JWT we're holding — "who cancelled this?" is exactly the
+		// question the audit log exists to answer.
 		changed, err := db.TransitionStatus(r.Context(), pool,
-			id, db.StatusPendingPayment, db.StatusCancelled)
+			id, db.StatusPendingPayment, db.StatusCancelled,
+			db.Audit{Actor: db.UserActor(claims.Subject)})
 		if err != nil {
 			slog.ErrorContext(r.Context(), "cancel: transition failed",
 				"reservation_id", id, "error", err)
