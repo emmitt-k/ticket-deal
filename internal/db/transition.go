@@ -7,9 +7,9 @@
 // reasons centralisation matters:
 //
 //  1. Correctness. The actual write is a compare-and-set UPDATE:
-//       UPDATE reservations
-//       SET status = $to, updated_at = NOW()
-//       WHERE reservation_id = $id AND status = $from
+//     UPDATE reservations
+//     SET status = $to, updated_at = NOW()
+//     WHERE reservation_id = $id AND status = $from
 //     So two callers (a user's cancel endpoint racing the watcher's
 //     expiry sweep, or a future Stripe webhook racing a manual cancel)
 //     cannot both flip the same row. The first one wins; the second
@@ -58,10 +58,10 @@ var ErrInvalidTransition = errors.New("db: invalid reservation status transition
 //
 // Edges today:
 //
-//   PENDING_PAYMENT → CONFIRMED   (Stripe webhook later — Layer 2, item 7)
-//   PENDING_PAYMENT → EXPIRED     (keyspace notification OR 60 s sweep)
-//   PENDING_PAYMENT → CANCELLED   (user cancel endpoint — Layer 1, item 3)
-//   CONFIRMED      → CANCELLED   (admin "refund-as-cancel" — Layer 2, item 9)
+//	PENDING_PAYMENT → CONFIRMED   (Stripe webhook later — Layer 2, item 7)
+//	PENDING_PAYMENT → EXPIRED     (keyspace notification OR 60 s sweep)
+//	PENDING_PAYMENT → CANCELLED   (user cancel endpoint — Layer 1, item 3)
+//	CONFIRMED      → CANCELLED   (admin "refund-as-cancel" — Layer 2, item 9)
 //
 // Terminal states (EXPIRED, CANCELLED) have no outgoing edges; once a
 // row lands in a terminal state only the audit log records further
@@ -99,22 +99,22 @@ func isValidTransition(from, to string) bool {
 // audit row describing it. Returns:
 //
 //   - (true,  nil)             CAS succeeded — row was in `from`, now in `to`,
-//                              and the audit row was written.
+//     and the audit row was written.
 //   - (false, nil)             CAS missed — row exists but was already not
-//                              in `from` state, OR the row doesn't exist.
-//                              This is NOT an error: the row is in some
-//                              valid status, just not the expected one.
-//                              Callers can read the row to learn its actual
-//                              status if they care. Same return convention
-//                              as FindAndExpireSweptRows in package expire.
-//                              No audit row is written — nothing changed.
+//     in `from` state, OR the row doesn't exist.
+//     This is NOT an error: the row is in some
+//     valid status, just not the expected one.
+//     Callers can read the row to learn its actual
+//     status if they care. Same return convention
+//     as FindAndExpireSweptRows in package expire.
+//     No audit row is written — nothing changed.
 //   - (false, ErrInvalidTransition)
-//                              Caller asked for a transition that is not
-//                              in validTransitions. Programmer error.
-//                              Should never happen via production code paths.
+//     Caller asked for a transition that is not
+//     in validTransitions. Programmer error.
+//     Should never happen via production code paths.
 //   - (false, ErrInvalidAudit) Caller passed an Audit with no actor type.
-//                              Programmer error — every transition must
-//                              record who caused it.
+//     Programmer error — every transition must
+//     record who caused it.
 //   - (false, other)           DB error etc.
 //
 // `from` and `to` are Status constants (StatusPendingPayment etc.) but

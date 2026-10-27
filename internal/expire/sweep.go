@@ -94,8 +94,9 @@ func FindAndExpireSweptRows(ctx context.Context, pool *db.Pool, audit db.Audit) 
 // RunSweep runs the expiry sweep every interval until ctx is canceled.
 //
 // service: label added to expiration_sweep_cycles_total and
-//          expiration_seats_expired_total metrics. Pass "worker" or
-//          "watcher" to disambiguate when both run sweeps.
+//
+//	expiration_seats_expired_total metrics. Pass "worker" or
+//	"watcher" to disambiguate when both run sweeps.
 //
 // interval: typically 60 s. Lower = faster catch-up but more DB load;
 // higher = seats stuck "held" for longer if the watcher is down.

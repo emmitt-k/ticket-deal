@@ -3,23 +3,23 @@
 // Powers GET /api/me/reservations (Layer 1 item 2 of
 // docs/product-roadmap.md). The query is parameterised:
 //
-//   userID       the JWT subject — required, no default
-//   statusFilter empty → all four statuses returned (terminal + active);
-//                non-empty → only that status. Allows callers to
-//                page through 'just my PENDING_PAYMENT' or 'just my
-//                expired' without post-filtering in Go.
-//   limit        caller-supplied; clamped to [1, 100]. 0 → default 20.
-//   offset       caller-supplied; >= 0. 0 → first page.
+//	userID       the JWT subject — required, no default
+//	statusFilter empty → all four statuses returned (terminal + active);
+//	             non-empty → only that status. Allows callers to
+//	             page through 'just my PENDING_PAYMENT' or 'just my
+//	             expired' without post-filtering in Go.
+//	limit        caller-supplied; clamped to [1, 100]. 0 → default 20.
+//	offset       caller-supplied; >= 0. 0 → first page.
 //
 // The query:
 //
-//   SELECT …
-//   FROM reservations r
-//   LEFT JOIN events e ON e.id = r.event_id
-//   WHERE r.user_id = $1
-//     [AND r.status = $2]
-//   ORDER BY r.created_at DESC
-//   LIMIT $3 OFFSET $4
+//	SELECT …
+//	FROM reservations r
+//	LEFT JOIN events e ON e.id = r.event_id
+//	WHERE r.user_id = $1
+//	  [AND r.status = $2]
+//	ORDER BY r.created_at DESC
+//	LIMIT $3 OFFSET $4
 //
 // Returns:
 //   - ([]ReservationRow, nil) on success — possibly empty if the user
@@ -44,10 +44,11 @@ const hardMaxLimit = 100
 // newest first. See package-level comment for the query plan.
 //
 // Inputs:
-//   userID       required
-//   statusFilter "" → no filter; non-empty → exact match on r.status
-//   limit        if <=0 → defaultListLimit; if >hardMaxLimit → hardMaxLimit
-//   offset       if <0 → 0
+//
+//	userID       required
+//	statusFilter "" → no filter; non-empty → exact match on r.status
+//	limit        if <=0 → defaultListLimit; if >hardMaxLimit → hardMaxLimit
+//	offset       if <0 → 0
 //
 // Output: slice of ReservationRow (possibly empty) + error
 func ListReservationsByUser(ctx context.Context, pool *Pool,

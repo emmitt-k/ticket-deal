@@ -3,14 +3,14 @@
 // This is Layer 1 item 3 of docs/product-roadmap.md — the "user changes their
 // mind" path. Five steps from the spec, in order:
 //
-//   1. Verify JWT matches the row's user_id           → 403 if not
-//   2. Verify status == PENDING_PAYMENT               → 409 otherwise
-//   3. db.TransitionStatus(PENDING_PAYMENT → CANCELLED) → CAS-safe against
-//                                                        watcher's EXPIRED sweep,
-//                                                        and appends the CANCELLED
-//                                                        audit row in the same tx
-//   4. INCRBY inventory:event:<id> <seats>            → release the seat back to Redis
-//   5. (best-effort) DEL hold:event:<id>:user:<u>     → so the user can re-reserve
+//  1. Verify JWT matches the row's user_id           → 403 if not
+//  2. Verify status == PENDING_PAYMENT               → 409 otherwise
+//  3. db.TransitionStatus(PENDING_PAYMENT → CANCELLED) → CAS-safe against
+//     watcher's EXPIRED sweep,
+//     and appends the CANCELLED
+//     audit row in the same tx
+//  4. INCRBY inventory:event:<id> <seats>            → release the seat back to Redis
+//  5. (best-effort) DEL hold:event:<id>:user:<u>     → so the user can re-reserve
 //
 // POST is naturally idempotent in REST; a second cancel on the same row is a
 // 200 with the row (decision from this branch's design discussion). The CAS
