@@ -42,10 +42,23 @@ func newTestPool(t *testing.T) *Pool {
 
 // cleanupReservation registers a t.Cleanup that deletes the test row
 // so each test starts from a clean slate.
+//
+// The audit rows go first, and they need the purge escape hatch:
+// reservation_events is append-only (see migrations/005_audit_log.sql),
+// so a plain DELETE is refused by the trigger. SET LOCAL scopes the
+// override to this transaction only — it can't leak to another pooled
+// connection.
 func cleanupReservation(t *testing.T, pool *Pool, reservationID string) {
 	t.Helper()
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(),
+		ctx := context.Background()
+		tx, err := pool.Begin(ctx)
+		if err == nil {
+			_, _ = tx.Exec(ctx, "SET LOCAL ticket_deal.audit_purge = 'on'")
+			_, _ = tx.Exec(ctx, "DELETE FROM reservation_events WHERE reservation_id = $1", reservationID)
+			_ = tx.Commit(ctx)
+		}
+		_, _ = pool.Exec(ctx,
 			"DELETE FROM reservations WHERE reservation_id = $1", reservationID)
 	})
 }
