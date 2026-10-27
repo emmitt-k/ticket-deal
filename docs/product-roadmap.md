@@ -510,6 +510,17 @@ reviewer spots both in five seconds.
 > `gofmt` step now keeps it gone. The same change added a coverage floor and a
 > `govulncheck` gate — which found 14 real CVEs on the way in (12 in the Go standard
 > library, one in `golang.org/x/net`) and is now clean.
+>
+> **And it paid for itself on the first run.** The new CI caught a flaky test
+> immediately: `TestReserveHandler_Idempotency_ParallelRetries` asserted that the
+> loser of the Idempotency-Key race gets `409 in_flight`, but the handler holds the
+> in-flight lock across publish → cache → respond → release — so if the winner
+> finishes first, the loser correctly gets a 200 with the *cached response* instead.
+> The test was asserting a timing window, not a contract. It had never been executed
+> by anything but a developer sitting in front of the machine, so it stayed invisible
+> for the life of the project. It is now deterministic (the winner is parked inside
+> `Publish` until the loser has reported) and asserts the error *code*, so it fails
+> when the lock is broken.
 
 ## The strategic question
 
