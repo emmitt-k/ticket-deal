@@ -641,6 +641,8 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 ### Branch Strategy
 - `main`: stable, protected
 - Feature work: branch from main → PR → merge
+- **Major changes get their own branch.** New features and significant refactors: `git checkout -b feature/<short-name>` first, off `main` (or off the previous feature branch — see below). Small edits, bug fixes, doc tweaks and one-off tasks can be done on the current branch.
+- **Always push to the remote when done.** After every commit, push to the remote feature branch immediately — `git push origin feature/<name>`. Never leave commits unpushed: an unpushed branch is work that exists on exactly one machine, and it is invisible to CI, to a reviewer, and to `git fetch`.
 - **Stacked branches are normal here.** When one milestone builds on the previous, branch from the *previous feature branch*, not from `main`. Layer 1 shipped as a linear chain:
   `feature/dockerize-go-services` → `feature/get-reservations` → `feature/cancel-reservation` → `feature/readyz` → `feature/idempotency-key`
 - **Reverse-order merge.** When the stack is finally merged, go tip-first so each PR's base exists before its child: `idempotency-key` → `readyz` → `cancel-reservation` → `get-reservations` → `dockerize-go-services` → `main`.
