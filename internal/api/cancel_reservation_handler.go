@@ -132,6 +132,14 @@ func CancelReservationHandler(pool *db.Pool, rdb *redis.Client) http.HandlerFunc
 				"already_expired", "the hold expired before the cancel request landed")
 			span.SetAttributes(attribute.String("cancel.outcome", "already_expired"))
 			return
+		case db.StatusRefunded:
+			// Already refunded: the money came back and the seat was
+			// released. There is nothing left to cancel, and the two are
+			// distinct facts — a refund is not a cancel.
+			apiutil.WriteError(w, http.StatusConflict,
+				"already_refunded", "this reservation was refunded; the seat was already released")
+			span.SetAttributes(attribute.String("cancel.outcome", "already_refunded"))
+			return
 		default:
 			// Defensive: an unknown status would have failed the SQL CHECK
 			// at insert time, so this branch is unreachable in practice.

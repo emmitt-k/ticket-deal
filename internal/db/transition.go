@@ -61,11 +61,16 @@ var ErrInvalidTransition = errors.New("db: invalid reservation status transition
 //	PENDING_PAYMENT → CONFIRMED   (Stripe webhook later — Layer 2, item 7)
 //	PENDING_PAYMENT → EXPIRED     (keyspace notification OR 60 s sweep)
 //	PENDING_PAYMENT → CANCELLED   (user cancel endpoint — Layer 1, item 3)
-//	CONFIRMED      → CANCELLED   (admin "refund-as-cancel" — Layer 2, item 9)
+//	CONFIRMED      → REFUNDED    (money returned — Layer 2, item 7)
 //
-// Terminal states (EXPIRED, CANCELLED) have no outgoing edges; once a
-// row lands in a terminal state only the audit log records further
-// activity.
+// Terminal states (EXPIRED, CANCELLED, REFUNDED) have no outgoing edges;
+// once a row lands in a terminal state only the audit log records
+// further activity.
+//
+// Note what is NOT an edge: CONFIRMED → CANCELLED. It used to be one —
+// "refund = cancel in our model" — but that conflated "never paid" with
+// "paid and then refunded". A refund moves the row to REFUNDED instead
+// (migrations/006_refunded_status.sql).
 //
 // The keys of this map are the only legal `from` values; the values are
 // the legal `to` values reachable from that `from`. To add a new edge,
@@ -73,9 +78,10 @@ var ErrInvalidTransition = errors.New("db: invalid reservation status transition
 // case in transition_test.go.
 var validTransitions = map[string][]string{
 	StatusPendingPayment: {StatusConfirmed, StatusExpired, StatusCancelled},
-	StatusConfirmed:      {StatusCancelled},
-	// StatusExpired, StatusCancelled: terminal — empty slice (and absent
-	// from the map keys to make the "no outgoing edges" rule obvious).
+	StatusConfirmed:      {StatusRefunded},
+	// StatusExpired, StatusCancelled, StatusRefunded: terminal — empty
+	// slice (and absent from the map keys to make the "no outgoing edges"
+	// rule obvious).
 }
 
 // isValidTransition reports whether the (from → to) edge is present in

@@ -262,7 +262,7 @@ From Stripe's docs:
 > PaymentIntent remains succeeded."*
 
 `[Gotcha]` This is a real design trap for us. If you model "refund" as
-`CONFIRMED → CANCELLED` in our database, but Stripe keeps the PaymentIntent
+`CONFIRMED → REFUNDED` in our database, but Stripe keeps the PaymentIntent
 `succeeded`, then a naive reconciliation job that compares the two will see a
 permanent disagreement. Your database's status and Stripe's status are
 **separate state machines**, and it's your job to keep them consistent by hand.
@@ -538,7 +538,7 @@ So — exactly three, plus `metadata`:
 | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `payment_intent.succeeded`      | `PENDING_PAYMENT → CONFIRMED`. Emit metric.                                                                                                               |
 | `payment_intent.payment_failed` | **No transition.** Log `last_payment_error`, increment a failure metric. The status is already back at `requires_payment_method` — the user just retries. |
-| `charge.refunded`               | `CONFIRMED → CANCELLED`. Release the seat. Emit metric.                                                                                                   |
+| `charge.refunded`               | `CONFIRMED → REFUNDED`. Release the seat. Emit metric.                                                                                                    |
 
 Deliberately *not* subscribed, and why:
 
@@ -590,7 +590,7 @@ This has a direct consequence for us. Imagine this ordering:
 
 ```
 payment_intent.succeeded    →  we mark CONFIRMED
-charge.refunded             →  we mark CANCELLED + release seat
+charge.refunded             →  we mark REFUNDED + release seat
 ```
 
 vs. the reverse order. Both are legitimate Stripe deliveries. Our handler
@@ -1386,7 +1386,7 @@ func StripeWebhookHandler(pool *db.Pool, rdb *redis.Client, svc payment.Service)
         case stripe.EventTypePaymentIntentPaymentFailed:
             // → NO transition. Log + metric only.
         case stripe.EventTypeChargeRefunded:
-            // → CONFIRMED → CANCELLED + release seat
+            // → CONFIRMED → REFUNDED + release seat
         default:
             // Unsubscribe in the dashboard; §15 says don't over-subscribe.
         }
@@ -1409,7 +1409,7 @@ correctly stays `PENDING_PAYMENT`, the hold is still alive, and the user retries
 **Do not** transition to a failure state — we don't have one, and adding one
 would break the retry-until-hold-expires UX.
 
-**Why `charge.refunded` → `CONFIRMED → CANCELLED` also releases the seat:**
+**Why `charge.refunded` → `CONFIRMED → REFUNDED` also releases the seat:**
 symmetry with `POST /cancel`. Otherwise a refunded customer keeps their seat.
 
 `[Locked]` **`livemode` is checked before any state change.**
@@ -1468,9 +1468,15 @@ trace→logs workflow already built in Grafana.
 
 ## 33. Refunds
 
-`[Locked]` **`CONFIRMED → CANCELLED` is a refund, not a cancel.** `POST /cancel`
+`[Locked]` **`CONFIRMED → REFUNDED` is a refund, not a cancel.** `POST /cancel`
 already returns `409 already_paid` for a confirmed reservation. That error is
 pointing at this endpoint.
+
+**`[Locked]` **The refund edge lands on `REFUNDED`, not `CANCELLED`.** The audit
+event is `REFUND_INITIATED` (the action); the status is `REFUNDED` (the
+outcome). A partial refund records the event and leaves the status at
+`CONFIRMED` — only a full refund becomes a state. That's the payoff of keeping
+the event and the status as separate concepts.
 
 `[Gotcha]` **We should NOT cancel the PaymentIntent on refund.** Stripe's
 `PaymentIntent.Cancel` only works on intents that haven't succeeded — calling it
@@ -1516,8 +1522,8 @@ Verified current table in `internal/db/transition.go`:
 ```go
 var validTransitions = map[string][]string{
     StatusPendingPayment: {StatusConfirmed, StatusExpired, StatusCancelled},
-    StatusConfirmed:      {StatusCancelled},
-    // EXPIRED and CANCELLED are terminal — absent as keys
+    StatusConfirmed:      {StatusRefunded},
+    // EXPIRED, CANCELLED and REFUNDED are terminal — absent as keys
 }
 ```
 
@@ -1529,11 +1535,19 @@ Layer 2 needs to confirm that this covers Stripe's reality:
 | `PENDING_PAYMENT` | `CONFIRMED` | `payment_intent.succeeded` | ✅ already in the table |
 | `PENDING_PAYMENT` | `EXPIRED`   | hold TTL sweep             | ✅ already in the table |
 | `PENDING_PAYMENT` | `CANCELLED` | `POST /cancel`             | ✅ already in the table |
-| `CONFIRMED`       | `CANCELLED` | `charge.refunded`          | ✅ already in the table |
+| `CONFIRMED`       | `REFUNDED`  | `charge.refunded`          | ✅ already in the table |
 
 **No new edges are needed.** The table is already correct for this integration —
-which is a nice validation of Layer 1 item 1's design. It was specified with
-`CONFIRMED → CANCELLED` present before any payment code existed.
+which is a nice validation of Layer 1 item 1's design.
+
+> **Changed since this doc was first written.** The refund edge was
+> `CONFIRMED → CANCELLED` ("refund = cancel in our model"). It is now
+> `CONFIRMED → REFUNDED`, in its own migration
+> (`migrations/006_refunded_status.sql`). `CANCELLED` and `REFUNDED` are
+> different facts — "never paid" vs "paid and then reversed" — and sharing one
+> status made "we lost the sale" and "we refunded the customer" the same
+> query, in the DB and in the `?status=` filter. See §33 below: the
+> distinction is what makes a **partial** refund representable.
 
 `[Gotcha]` **The two race conditions to think about:**
 
@@ -1559,7 +1573,8 @@ cancelled reservation.
 2. Automatically refund. Aggressive — correct, but only if we're confident the
    webhook is right.
 3. Transition `CANCELLED → CONFIRMED` (resurrect). **Wrong** — CANCELLED is
-   terminal by design, and the seat is already back in inventory.
+   terminal by design, and the seat is already back in inventory. (Same for
+   `REFUNDED` — also terminal.)
 
 `[Open]` Option 1 for v1. It's honest about the edge case, and Layer 3's
 `REFUND_INITIATED` audit event gives us somewhere to record it. Worth writing
@@ -1729,7 +1744,7 @@ is:
 | Bad signature     | `curl -X POST localhost:8080/webhooks/stripe -d '{}'` (no header) → expect `400`                 |
 | Wrong secret      | Set a bogus `STRIPE_WEBHOOK_SECRET` → expect `400` on every event                                |
 | Duplicate         | Trigger the same event twice, or `stripe events resend` the same `evt_` → second must be a no-op |
-| Out-of-order      | Confirm, then refund, then confirm again → must not resurrect `CANCELLED`                        |
+| Out-of-order      | Confirm, then refund, then confirm again → must not resurrect `REFUNDED`                       |
 | livemode mismatch | Send a test event at a prod-configured endpoint → expect `400`                                   |
 | Hold expired      | `POST /pay` after the hold TTL → expect `409 hold_expired`                                       |
 | Card declined     | `4000 0000 0000 0002` → expect `402` + decline code                                              |

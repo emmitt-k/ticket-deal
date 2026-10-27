@@ -26,7 +26,7 @@ func TestAuditEventTypeForEdge(t *testing.T) {
 		{StatusPendingPayment, StatusConfirmed, AuditEventConfirmed},
 		{StatusPendingPayment, StatusExpired, AuditEventExpired},
 		{StatusPendingPayment, StatusCancelled, AuditEventCancelled},
-		{StatusConfirmed, StatusCancelled, AuditEventRefundInitiated},
+		{StatusConfirmed, StatusRefunded, AuditEventRefundInitiated},
 	}
 
 	for _, tc := range cases {
@@ -387,7 +387,7 @@ func TestListAuditEvents_Chronological(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = TransitionStatus(context.Background(), pool,
-		r.ReservationID, StatusConfirmed, StatusCancelled,
+		r.ReservationID, StatusConfirmed, StatusRefunded,
 		Audit{Actor: StripeWebhookActor("evt_2")})
 	require.NoError(t, err)
 
@@ -409,4 +409,55 @@ func TestListAuditEvents_EmptyIsNotNil(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, events, "must return an empty slice, not nil")
 	require.Empty(t, events)
+}
+
+// TestTransitionStatus_RefundIsNotACancel — the refund edge.
+//
+// CONFIRMED → REFUNDED is the only way out of CONFIRMED. It USED to be
+// CONFIRMED → CANCELLED ("refund = cancel in our model"), which made
+// "the customer never paid" and "the customer paid and we gave the
+// money back" the same status — and the same query.
+func TestTransitionStatus_RefundIsNotACancel(t *testing.T) {
+	pool := newTestPool(t)
+	const eventID = int64(65014)
+
+	seedEvent(t, pool, eventID)
+	r := validReservation(t, eventID)
+	cleanupReservation(t, pool, r.ReservationID)
+	require.NoError(t, InsertIfAbsent(context.Background(), pool, r))
+
+	changed, err := TransitionStatus(context.Background(), pool,
+		r.ReservationID, StatusPendingPayment, StatusConfirmed,
+		Audit{Actor: StripeWebhookActor("evt_1")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// The old edge is gone: CONFIRMED → CANCELLED is refused outright.
+	changed, err = TransitionStatus(context.Background(), pool,
+		r.ReservationID, StatusConfirmed, StatusCancelled,
+		Audit{Actor: AdminActor("admin-1")})
+	require.ErrorIs(t, err, ErrInvalidTransition)
+	require.False(t, changed)
+
+	// The new edge works.
+	changed, err = TransitionStatus(context.Background(), pool,
+		r.ReservationID, StatusConfirmed, StatusRefunded,
+		Audit{Actor: StripeWebhookActor("evt_2")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	row, err := GetReservation(context.Background(), pool, r.ReservationID)
+	require.NoError(t, err)
+	require.Equal(t, StatusRefunded, row.Status)
+
+	// And it records the refund as an ACTION (REFUND_INITIATED) while
+	// the status records the OUTCOME (REFUNDED).
+	events, err := ListAuditEvents(context.Background(), pool, r.ReservationID)
+	require.NoError(t, err)
+	require.Len(t, events, 3, "CREATED + CONFIRMED + REFUND")
+	require.Equal(t, AuditEventRefundInitiated, events[2].EventType)
+	require.Equal(t, ActorTypeStripeWebhook, events[2].ActorType)
+	require.Equal(t, "evt_2", events[2].ActorID)
+	require.Equal(t, StatusConfirmed, events[2].OldStatus)
+	require.Equal(t, StatusRefunded, events[2].NewStatus)
 }

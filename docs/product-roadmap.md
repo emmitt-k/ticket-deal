@@ -46,7 +46,7 @@ observability stack — but **none of that is exposed to a user**.
 The `reservations.status` column has a `CHECK` constraint allowing four values:
 
 ```sql
-CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'EXPIRED', 'CANCELLED'))
+CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'EXPIRED', 'CANCELLED', 'REFUNDED'))
 ```
 
 But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today**:
@@ -57,14 +57,19 @@ But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today*
 | `EXPIRED` | Watcher + sweep job | `internal/expire/compensate.go` |
 | `CONFIRMED` | **nothing** — defined but no path | ❌ no handler (Layer 2, item 7 — Stripe webhook) |
 | `CANCELLED` | POST /api/reservations/{id}/cancel | `internal/api/cancel_reservation_handler.go` ✅ |
+| `REFUNDED` | **nothing** — defined but no path | ❌ no handler (Layer 2, item 7 — Stripe webhook) |
 
 This is the single biggest "code-defined-but-unwired" gap. Adding the missing
 transitions is Layer 2, item 7.
 
-> **Note:** `CONFIRMED → CANCELLED` *is* wired (as the refund edge — it was
-> specified into the state machine in Layer 1 and is now recorded as a
-> `REFUND_INITIATED` audit event), but nothing can reach `CONFIRMED` yet
-> because there's no payment integration. That's item 7.
+> **Note:** the refund edge *is* wired (`CONFIRMED → REFUNDED` — it was
+> specified into the state machine in Layer 1, and the audit log records
+> it as a `REFUND_INITIATED` event), but nothing can reach `CONFIRMED`
+> yet because there's no payment integration. That's item 7.
+>
+> `REFUNDED` was split out of `CANCELLED` in `migrations/006_refunded_status.sql`:
+> "the customer never paid" and "the customer paid and we gave the money
+> back" are different facts and were sharing one status.
 
 ### What's not there at all (not even a stub)
 

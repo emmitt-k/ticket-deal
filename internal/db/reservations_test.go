@@ -75,15 +75,16 @@ func cleanupReservation(t *testing.T, pool *Pool, reservationID string) {
 // "duplicate key value violates unique constraint events_pkey").
 //
 // The allocation convention:
-//   610xx  internal/db  — reservations_test.go
-//   620xx  internal/db  — transition_test.go
-//   630xx  internal/db  — list_reservations_test.go
-//   640xx  internal/api  — get_reservation_handler_test.go
-//   650xx  internal/db  — audit_test.go
-//   710xx  internal/expire — compensate_test.go
-//   720xx  internal/expire — sweep_test.go
-//   730xx  internal/expire — audit_test.go
-//   770xx  internal/api  — reserve_handler_test.go
+//
+//	610xx  internal/db  — reservations_test.go
+//	620xx  internal/db  — transition_test.go
+//	630xx  internal/db  — list_reservations_test.go
+//	640xx  internal/api  — get_reservation_handler_test.go
+//	650xx  internal/db  — audit_test.go
+//	710xx  internal/expire — compensate_test.go
+//	720xx  internal/expire — sweep_test.go
+//	730xx  internal/expire — audit_test.go
+//	770xx  internal/api  — reserve_handler_test.go
 //
 // The cleanup deletes the event row (after the reservations
 // cleanup has run, so we don't hit a FK violation in reverse).
@@ -283,6 +284,7 @@ func TestStatusConstants(t *testing.T) {
 	require.Equal(t, "CONFIRMED", StatusConfirmed)
 	require.Equal(t, "EXPIRED", StatusExpired)
 	require.Equal(t, "CANCELLED", StatusCancelled)
+	require.Equal(t, "REFUNDED", StatusRefunded)
 }
 
 // ensure fmt import is used (for any future debug helper)

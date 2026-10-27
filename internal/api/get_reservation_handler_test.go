@@ -397,3 +397,58 @@ func TestListMyReservations_DoesNotLeak(t *testing.T) {
 	require.Len(t, otherRows, 1)
 	require.Equal(t, other, otherRows[0]["user_id"])
 }
+
+// TestListMyReservations_RefundedIsItsOwnStatus — a REFUNDED
+// reservation is NOT a CANCELLED one, and the filter has to keep them
+// apart: `?status=CANCELLED` must not return a refunded reservation,
+// and `?status=REFUNDED` must be a valid filter value at all.
+//
+// This is the user-visible half of the "refund is not a cancel" fix —
+// before it, a customer who was refunded showed up under CANCELLED.
+func TestListMyReservations_RefundedIsItsOwnStatus(t *testing.T) {
+	const owner = "u-refunded-filter-1"
+	pool := apiNewTestPool(t)
+	const eventID = int64(64004)
+	apiSeedEvent(t, pool, eventID)
+
+	// One cancelled (never paid), one refunded (paid, then reversed).
+	cancelled := apiValidReservationFor(t, eventID, owner)
+	apiCleanupReservation(t, pool, cancelled.ReservationID)
+	require.NoError(t, db.InsertIfAbsent(context.Background(), pool, cancelled))
+
+	refunded := apiValidReservationFor(t, eventID, owner)
+	apiCleanupReservation(t, pool, refunded.ReservationID)
+	require.NoError(t, db.InsertIfAbsent(context.Background(), pool, refunded))
+
+	changed, err := db.TransitionStatus(context.Background(), pool,
+		cancelled.ReservationID, db.StatusPendingPayment, db.StatusCancelled, db.Audit{Actor: db.UserActor("test-user")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	changed, err = db.TransitionStatus(context.Background(), pool,
+		refunded.ReservationID, db.StatusPendingPayment, db.StatusConfirmed, db.Audit{Actor: db.UserActor("test-user")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	changed, err = db.TransitionStatus(context.Background(), pool,
+		refunded.ReservationID, db.StatusConfirmed, db.StatusRefunded, db.Audit{Actor: db.StripeWebhookActor("evt_test")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// ?status=REFUNDED is a valid filter → only the refunded row.
+	rec, byRefunded := doListMyReservations(t, pool, owner, "status=REFUNDED")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, byRefunded, 1)
+	require.Equal(t, refunded.ReservationID, byRefunded[0]["reservation_id"])
+
+	// ?status=CANCELLED → only the cancelled row. The refunded one must
+	// NOT leak in here.
+	rec, byCancelled := doListMyReservations(t, pool, owner, "status=CANCELLED")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, byCancelled, 1)
+	require.Equal(t, cancelled.ReservationID, byCancelled[0]["reservation_id"])
+
+	// No filter → both.
+	_, all := doListMyReservations(t, pool, owner, "")
+	require.Len(t, all, 2)
+}

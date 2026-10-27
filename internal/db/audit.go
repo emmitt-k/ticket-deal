@@ -56,8 +56,11 @@ var ErrInvalidAudit = errors.New("db: invalid audit actor")
 //
 // These mirror the CHECK constraint on reservation_events.event_type in
 // migrations/005_audit_log.sql. Each one names a *fact about the
-// reservation*, not a status: REFUND_INITIATED and CANCELLED both end in
-// a CANCELLED row but mean very different things to an operator.
+// reservation*, not a status — and the difference matters: an EVENT
+// records what was DONE, a STATUS records where the reservation ended
+// up. REFUND_INITIATED is an event (money moved back) whose outcome is
+// the REFUNDED status; a partial refund records the event and leaves
+// the status at CONFIRMED.
 const (
 	// AuditEventCreated — the reservation row was first written. Emitted
 	// by the worker, on the user's behalf (the user asked for it via
@@ -78,9 +81,10 @@ const (
 	AuditEventCancelled = "CANCELLED"
 
 	// AuditEventRefundInitiated — a confirmed reservation was refunded.
-	// Same status transition as a cancel (CONFIRMED → CANCELLED) but a
-	// different actor (stripe_webhook / admin) and a different meaning:
-	// money moved back.
+	// The event records the ACTION (money moved back); the status it
+	// moves to, REFUNDED, records the OUTCOME. A partial refund is
+	// recorded here too — it leaves the status at CONFIRMED, because a
+	// partial refund is an event, not a state.
 	AuditEventRefundInitiated = "REFUND_INITIATED"
 )
 
@@ -378,8 +382,16 @@ func ListAuditEvents(ctx context.Context, pool *Pool, reservationID string) ([]A
 // because two different edges can land on the same status and mean
 // different things:
 //
-//	CONFIRMED → CANCELLED  is a REFUND (money moved back)
 //	PENDING_PAYMENT → CANCELLED  is a USER CANCEL (nothing was paid)
+//	PENDING_PAYMENT → CONFIRMED  is a PAYMENT (money came in)
+//
+// And because an EVENT and a STATUS are different concepts:
+//
+//	CONFIRMED → REFUNDED  is the REFUND_INITIATED event — the ACTION
+//	(the money went back), while the status REFUNDED is the OUTCOME
+//	(the reservation is now refunded). Keeping them separate is what
+//	lets a PARTIAL refund be recorded as an event while the status
+//	stays CONFIRMED — only a full refund becomes a state.
 //
 // The edge table (validTransitions) is the single source of truth for
 // which transitions exist; this function is the single source of truth
@@ -388,7 +400,7 @@ func ListAuditEvents(ctx context.Context, pool *Pool, reservationID string) ([]A
 // loud error instead of a silently-mislabeled audit row.
 func auditEventTypeForEdge(from, to string) (string, error) {
 	switch {
-	case from == StatusConfirmed && to == StatusCancelled:
+	case from == StatusConfirmed && to == StatusRefunded:
 		return AuditEventRefundInitiated, nil
 	case to == StatusConfirmed:
 		return AuditEventConfirmed, nil

@@ -536,13 +536,23 @@ stateDiagram-v2
     PENDING_PAYMENT --> CONFIRMED: Payment webhook<br/>(Stripe, future — Layer 2)
     PENDING_PAYMENT --> EXPIRED: Hold key TTL fires<br/>(watcher OR sweep,<br/>within 60s)
     PENDING_PAYMENT --> CANCELLED: POST /cancel<br/>(internal/api/cancel_<br/>reservation_handler.go)
+    CONFIRMED --> REFUNDED: Refund<br/>(Stripe, future — Layer 2)
 
     CONFIRMED --> [*]: Order complete
     EXPIRED --> [*]: Seat released<br/>via INCRBY inventory
     CANCELLED --> [*]: Seat released<br/>via INCRBY inventory
+    REFUNDED --> [*]: Money returned,<br/>seat released
 ```
 
-**Four terminal states** (`CONFIRMED`, `EXPIRED`, `CANCELLED`, plus the implicit "no row ever written" if the worker never gets the SQS message). `PENDING_PAYMENT` is the only transitional state.
+`CANCELLED` and `REFUNDED` are separate on purpose. Both release the seat,
+but they are different facts: **nobody paid** vs **the customer paid and
+we gave the money back**. Before `migrations/006_refunded_status.sql` a
+refund was stored as `CANCELLED` ("refund = cancel in our model"), which
+made "we lost the sale" and "we refunded the customer" the same query —
+in the DB, in the `?status=` filter, and in any revenue report built on
+top of it.
+
+**Five statuses**, of which three are terminal (`EXPIRED`, `CANCELLED`, `REFUNDED`) — plus the implicit "no row ever written" if the worker never gets the SQS message. `PENDING_PAYMENT` is the only transitional state, and `CONFIRMED` has exactly one way out (the refund edge).
 
 The `status` column has a `CHECK` constraint enforcing this set (`migrations/001_init.sql`), and `internal/db/reservations.go` exposes the four values as typed constants (`StatusPendingPayment`, etc.) so a typo at a call site fails to compile.
 
@@ -1397,10 +1407,15 @@ The `validTransitions` map encodes the entire directed graph as data:
 ```go
 var validTransitions = map[string][]string{
     StatusPendingPayment: {StatusConfirmed, StatusExpired, StatusCancelled},
-    StatusConfirmed:      {StatusCancelled},
-    // StatusExpired, StatusCancelled: terminal — absent from the map
+    StatusConfirmed:      {StatusRefunded},
+    // StatusExpired, StatusCancelled, StatusRefunded: terminal — absent
+    // from the map
 }
 ```
+
+Note what is **not** an edge: `CONFIRMED → CANCELLED`. It used to be one
+(`"refund = cancel in our model"`), and splitting it out is what gives
+`CANCELLED` and `REFUNDED` one meaning each.
 
 `EXPIRED` and `CANCELLED` are terminal: no outgoing edges, and they're deliberately absent from the map keys so the "nothing leaves a terminal state" rule is visible at a glance. Asking for an edge that isn't in the table returns `(false, ErrInvalidTransition)` — a **programmer** error, distinct from a CAS miss. Detected with `errors.Is`.
 
@@ -1662,7 +1677,7 @@ Coverage for handler paths, drainer token calculations, and the in-process chann
 Creates the two tables every phase needs:
 
 - `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `created_at TIMESTAMPTZ DEFAULT NOW()`
-- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()`
+- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`
 - Indexes: `idx_reservations_event_status (event_id, status)` for "how many PENDING does this event have?" queries; partial `idx_reservations_pending_expiry (expires_at) WHERE status = 'PENDING_PAYMENT'` powers the sweep job's WHERE clause.
 
 #### `migrations/002_seed.sql`

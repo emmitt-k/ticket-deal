@@ -454,10 +454,24 @@ overwrote it. `reservation_events` is the append-only trail.
 | `metadata` | JSONB — seat counts, Stripe charge ids, … |
 
 **The event type is derived from the EDGE, not the destination status.** `CONFIRMED →
-CANCELLED` is a `REFUND_INITIATED` (money moved back); `PENDING_PAYMENT → CANCELLED` is a
+REFUNDED` is a `REFUND_INITIATED` (money moved back); `PENDING_PAYMENT → CANCELLED` is a
 `CANCELLED` (nothing was paid). `auditEventTypeForEdge` is the single source of truth for
 that mapping, and its default case turns a forgotten edge into a loud error rather than a
 silently mislabeled row.
+
+**An EVENT and a STATUS are different concepts, and keeping them apart is load-bearing.**
+The event records the *action* (`REFUND_INITIATED` — money went back); the status records the
+*outcome* (`REFUNDED` — this reservation is now refunded). That is what lets a **partial**
+refund be recorded as an event while the status stays `CONFIRMED` — only a full refund
+becomes a state. A Charge can be refunded several times and partially, so "is this refunded?"
+is not a boolean (see `docs/comprehensive-stripe.md` §33).
+
+**`CANCELLED` and `REFUNDED` are separate statuses** (`migrations/006_refunded_status.sql`).
+`CANCELLED` means "cancelled before payment"; `REFUNDED` means "paid, then reversed — the
+money came back and the seat went back". They used to be one status ("refund = cancel in our
+model"), which made "we lost the sale" and "we refunded the customer" the same query — in
+the DB, in `?status=CANCELLED`, and in every report built on it. The state machine's edge
+changed with it: `CONFIRMED → CANCELLED` is **not** an edge; `CONFIRMED → REFUNDED` is.
 
 **Who writes what:**
 
@@ -569,7 +583,8 @@ marshalling.
 │   ├── 002_seed.sql           # Seed data (event id=1, inventory 100)
 │   ├── 003_add_seats.sql      # Adds seats column (Phase 7 INCRBY sizing)
 │   ├── 004_user_lookup_index.sql  # Composite (user_id, created_at DESC) for GET /api/me/reservations
-│   └── 005_audit_log.sql         # Layer 2 item 6: append-only reservation_events + append-only trigger
+│   ├── 005_audit_log.sql         # Layer 2 item 6: append-only reservation_events + append-only trigger
+│   └── 006_refunded_status.sql   # Adds the REFUNDED status (a refund is not a cancel)
 ├── docker/
 │   └── elasticmq.conf         # Pre-creates the reservations queue on boot
 ├── docker-compose.yml         # 12 services: 8 infra (redis, postgres, elasticmq, prometheus,
@@ -667,7 +682,8 @@ branch from `main`; if not, branch from its tip and extend the stack.
 12. **Check `docs/product-roadmap.md` before assuming a capability exists.** It is the source of truth for built-vs-planned. Layer 1 is shipped 5/5; Layer 2 item 6 (audit log) is shipped on `feature/audit-log`; Layer 2 items 7-10 (Stripe, notifications, admin API, anti-bot) are unstarted — `PENDING_PAYMENT → CONFIRMED` has no code path yet.
 13. **The compare-and-set guard must live in the UPDATE's own WHERE clause, not only in a CTE.** This is the expire path's bug (fixed in `fix(expire): close a double-INCRBY oversell race`), and it is worth understanding because it is invisible in a single-threaded test. A CTE like `target` is evaluated against the statement's **snapshot** and is *not* re-read when a concurrent transaction commits. So `WHERE reservation_id IN (SELECT reservation_id FROM target)` — where `target` filtered on `status='PENDING_PAYMENT'` — lets a second concurrent transaction re-flip the row after the first commits: its post-lock re-check finds the id still in `target` (the id never changed), so it updates the row **again** and INCRBYs the seat a second time. That is a silent **oversell**. The fix is to repeat the guard in the UPDATE: `WHERE reservation_id IN (...) AND status = 'PENDING_PAYMENT'`. After the lock is released, the re-check runs against the *new* row version, sees `status='EXPIRED'`, and skips it. This is the same shape as `db.TransitionStatus` (`WHERE reservation_id = $2 AND status = $3`). **Any new CAS-shaped UPDATE must carry its guard in the UPDATE, not in a helper CTE.**
 14. **Every status transition writes an audit row, in the same transaction.** `db.TransitionStatus` takes a mandatory `db.Audit` (actor + metadata) and writes `reservation_events` atomically with the status change. The actor is required — an empty actor type is rejected with `db.ErrInvalidAudit` before any SQL runs. The expire paths are the deliberate exception (their audit `INSERT` is a data-modifying CTE in the same statement — see the Layer 2 section above). **Never write a status change without its audit row, and never write an audit row without the status change.**
-15. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
+15. **`CANCELLED` and `REFUNDED` are different facts — never merge them.** `CANCELLED` = cancelled before payment; `REFUNDED` = paid, then reversed. The only edge out of `CONFIRMED` is `CONFIRMED → REFUNDED`. If you find yourself wanting to write `status = 'CANCELLED'` on a paid reservation, you want `REFUNDED`. The `?status=` filter, the DB CHECK constraint, and `db.StatusRefunded` all exist for this.
+16. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
 
 ---
 

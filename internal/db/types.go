@@ -27,8 +27,9 @@ import "time"
 //	                the FK was removed — shouldn't happen in normal flow,
 //	                but defensive JSON shape)
 //	status          one of StatusPendingPayment, StatusConfirmed,
-//	                StatusExpired, StatusCancelled — matches the SQL
-//	                CHECK constraint in migrations/001_init.sql
+//	                StatusExpired, StatusCancelled, StatusRefunded —
+//	                matches the SQL CHECK constraint (migrations/
+//	                001_init.sql, widened by 006_refunded_status.sql)
 //	seats           how many seats this reservation holds (from the SQS
 //	                message; 1 today, up to 10)
 //	expires_at      when the hold auto-releases; meaningful only for

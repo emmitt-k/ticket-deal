@@ -326,3 +326,31 @@ func TestCancel_ForbiddenWritesNoAuditRow(t *testing.T) {
 	require.Len(t, events, 1, "a rejected cancel must not write an audit row")
 	require.Equal(t, db.AuditEventCreated, events[0].EventType)
 }
+
+// TestCancel_AlreadyRefunded — a REFUNDED row → 409 already_refunded.
+//
+// A refund is not a cancel. The money already came back and the seat
+// was already released, so there is nothing left to cancel — and the
+// error is distinct from the 409 already_paid of a merely-CONFIRMED
+// reservation, because those are different facts.
+func TestCancel_AlreadyRefunded(t *testing.T) {
+	const owner = "u-cancel-refunded-1"
+	pool, eventID, rid := newGetReservationPool(t, owner)
+	rdb := newTestClient(t)
+	cleanupReserveKeys(t, rdb, eventID, owner)
+
+	// PENDING → CONFIRMED → REFUNDED (the only legal edges out of CONFIRMED).
+	changed, err := db.TransitionStatus(context.Background(), pool,
+		rid, db.StatusPendingPayment, db.StatusConfirmed, db.Audit{Actor: db.UserActor("test-user")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	changed, err = db.TransitionStatus(context.Background(), pool,
+		rid, db.StatusConfirmed, db.StatusRefunded, db.Audit{Actor: db.StripeWebhookActor("evt_test")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	rec, body := doCancelReservation(t, pool, rdb, owner, rid)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Equal(t, "already_refunded", body["error"])
+}

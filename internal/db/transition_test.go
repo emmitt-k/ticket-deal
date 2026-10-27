@@ -21,7 +21,7 @@ func TestIsValidTransition(t *testing.T) {
 		{StatusPendingPayment, StatusConfirmed, true},
 		{StatusPendingPayment, StatusExpired, true},
 		{StatusPendingPayment, StatusCancelled, true},
-		{StatusConfirmed, StatusCancelled, true},
+		{StatusConfirmed, StatusRefunded, true},
 
 		// No self-loops (would be a no-op transition; not in the spec)
 		{StatusPendingPayment, StatusPendingPayment, false},
@@ -37,9 +37,19 @@ func TestIsValidTransition(t *testing.T) {
 		{StatusCancelled, StatusExpired, false},
 		{StatusCancelled, StatusPendingPayment, false},
 
-		// CONFIRMED can only go to CANCELLED (refund-as-cancel)
+		// CONFIRMED can only go to REFUNDED (the money came back).
 		{StatusConfirmed, StatusPendingPayment, false},
 		{StatusConfirmed, StatusExpired, false},
+
+		// CONFIRMED -> CANCELLED is NOT an edge. It used to be one
+		// ("refund = cancel in our model"), but that conflated "never
+		// paid" with "paid and then refunded" — a refund is REFUNDED.
+		{StatusConfirmed, StatusCancelled, false},
+
+		// REFUNDED is terminal.
+		{StatusRefunded, StatusRefunded, false},
+		{StatusRefunded, StatusConfirmed, false},
+		{StatusRefunded, StatusCancelled, false},
 
 		// Illegal backward edges — no resurrection
 		{StatusConfirmed, StatusPendingPayment, false}, // duplicate assertion above, kept for readability

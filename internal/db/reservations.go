@@ -11,13 +11,30 @@ import (
 )
 
 // ReservationStatus values mirror the CHECK constraint in
-// migrations/001_init.sql. Defining them here (not as inline strings)
-// means a typo at the call site fails to compile.
+// migrations/001_init.sql (widened by 006_refunded_status.sql).
+// Defining them here (not as inline strings) means a typo at the
+// call site fails to compile.
+//
+// The five values, and what each one MEANS:
+//
+//	PENDING_PAYMENT  a hold exists; the seat is spoken for, no money yet
+//	CONFIRMED        the payment succeeded; the seat is the customer's
+//	EXPIRED          the hold timed out before payment; the seat went back
+//	CANCELLED        cancelled BEFORE payment; the seat went back
+//	REFUNDED         paid and then reversed; the money came back and the
+//	                 seat went back
+//
+// CANCELLED and REFUNDED are deliberately separate. Both release the
+// seat, but they are different facts: nobody paid vs the customer paid
+// and we gave the money back. Before 006_refunded_status.sql a refund
+// was stored as CANCELLED, which made "we lost the sale" and "we
+// refunded the customer" the same query.
 const (
 	StatusPendingPayment = "PENDING_PAYMENT"
 	StatusConfirmed      = "CONFIRMED"
 	StatusExpired        = "EXPIRED"
 	StatusCancelled      = "CANCELLED"
+	StatusRefunded       = "REFUNDED"
 )
 
 // InsertIfAbsent writes a reservation row using INSERT ... ON CONFLICT
