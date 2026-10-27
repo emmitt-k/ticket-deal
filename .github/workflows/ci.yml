@@ -59,10 +59,23 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # The SQS-compatible broker. internal/queue's publisher and
+      # consumer tests need a REAL broker to be worth anything — the
+      # behaviours worth checking (a published message arrives, a
+      # handled message is deleted, a failed handler's message comes
+      # back) are broker behaviours.
+      elasticmq:
+        image: softwaremill/elasticmq:latest
+        ports:
+          - 9324:9324
 
     env:
       DATABASE_URL: postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable
       REDIS_ADDR: localhost:6379
+      SQS_ENDPOINT_URL: http://localhost:9324
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
 
     steps:
       - uses: actions/checkout@v7
@@ -85,9 +98,38 @@ jobs:
       # broken migration would look like it worked.
       - name: Apply migrations
         run: |
-          for f in migrations/0*.sql; do
-            echo "→ $f"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          # Idempotent: the service container's database is empty on a
+          # fresh runner, but this step must also survive a re-run on a
+          # runner that already has the schema.
+          if psql "$DATABASE_URL" -tAc \
+               "SELECT 1 FROM information_schema.tables WHERE table_name='reservations'" \
+               | grep -q 1; then
+            echo "schema already present — skipping"
+          else
+            for f in migrations/0*.sql; do
+              echo "→ $f"
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+            done
+          fi
+
+      # ElasticMQ starts with no queues. The queue tests create their
+      # own per-test queues, but the shared ones (reservations,
+      # stripe-events) are created here so the addresses match what
+      # docker/elasticmq.conf pre-creates locally.
+      - name: Wait for ElasticMQ and create the queues
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "$SQS_ENDPOINT_URL/?Action=ListQueues" >/dev/null 2>&1; then
+              break
+            fi
+            echo "waiting for ElasticMQ ($i)…"
+            sleep 2
+          done
+          curl -sf "$SQS_ENDPOINT_URL/?Action=ListQueues" >/dev/null \
+            || { echo "::error::ElasticMQ never became reachable"; exit 1; }
+          for q in reservations stripe-events; do
+            curl -sf "$SQS_ENDPOINT_URL/?Action=CreateQueue&QueueName=$q" >/dev/null
+            echo "✓ queue $q"
           done
 
       - name: go test (race + coverage)
@@ -164,3 +206,117 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
+
+  # ── The end-to-end job ────────────────────────────────────────────
+  #
+  # The Test job proves the PACKAGES work. This one proves the SYSTEM
+  # works — that the API, the queue, the workers, Postgres and Redis
+  # are actually wired together, which no unit test can show.
+  #
+  # It boots the real Docker Compose stack and drives one reservation
+  # all the way through:
+  #
+  #   reserve ──► SQS ──► worker ──► Postgres (PENDING_PAYMENT)
+  #   signed webhook ──► SQS ──► stripe-worker ──► Postgres (CONFIRMED)
+  #
+  # and then checks the audit trail recorded both transitions.
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      API_BASE_URL: http://localhost:8080
+      DATABASE_URL: postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable
+      REDIS_ADDR: localhost:6379
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: true
+          cache-dependency-path: go.sum
+
+      # The stack's env. .env.docker is gitignored, so it has to be
+      # written here. The two Stripe values are FAKE — the e2e signs
+      # its own webhook with the same secret, and never calls Stripe.
+      # They must be present in BOTH, or config.Load() refuses to boot
+      # the API (the both-or-neither rule).
+      - name: Write .env.docker
+        run: |
+          JWT=$(openssl rand -hex 32)
+          echo "JWT_SECRET=$JWT" >> "$GITHUB_ENV"
+          echo "STRIPE_WEBHOOK_SECRET=whsec_test_e2e_fake" >> "$GITHUB_ENV"
+          cp .env.docker.example .env.docker
+          {
+            echo "JWT_SECRET=$JWT"
+            echo "STRIPE_SECRET_KEY=sk_test_e2e_fake"
+            echo "STRIPE_WEBHOOK_SECRET=whsec_test_e2e_fake"
+            # The workers long-poll for 20 seconds by default, so a
+            # message published mid-poll waits for that poll to end.
+            # The e2e does not care about throughput, so it asks for a
+            # 2-second poll and finishes in seconds instead of half a
+            # minute.
+            echo "WORKER_LONG_POLL_SECONDS=2"
+          } >> .env.docker
+
+      # The schema. Applied to the container's Postgres, in order —
+      # the same files `make migrate` uses.
+      - name: Apply migrations
+        run: |
+          docker compose --env-file .env.docker up -d postgres
+          for i in $(seq 1 30); do
+            docker exec ticket-postgres pg_isready -U tickets -d tickets >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
+               "SELECT 1 FROM information_schema.tables WHERE table_name='reservations'" \
+               | grep -q 1; then
+            echo "schema already present — skipping"
+          else
+            for f in migrations/0*.sql; do
+              echo "→ $f"
+              docker exec -i ticket-postgres psql -U tickets -d tickets -v ON_ERROR_STOP=1 -q < "$f"
+            done
+          fi
+
+      # api + worker + stripe-worker, and their dependencies (redis,
+      # postgres, elasticmq, jaeger). The expiration-watcher and the
+      # dashboard are not part of this flow, so they are left out.
+      - name: Build and start the stack
+        run: docker compose --env-file .env.docker up -d --build api worker stripe-worker
+
+      - name: Wait for the API to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/readyz >/dev/null 2>&1; then
+              echo "✓ ready"
+              exit 0
+            fi
+            echo "waiting for the API ($i)…"
+            sleep 2
+          done
+          echo "::error::the API never became ready"
+          docker compose --env-file .env.docker logs --tail 100 api
+          exit 1
+
+      - name: Run the end-to-end test
+        run: go test -tags=e2e -count=1 -v -timeout 180s ./internal/e2e/...
+
+      # When the e2e fails, the service logs are the only way to see
+      # WHY. The API writes to ./logs/*.log inside the container, so
+      # both are dumped.
+      - name: Dump the logs on failure
+        if: failure()
+        run: |
+          docker compose --env-file .env.docker logs --tail 200
+          for f in logs/*.log; do
+            [ -f "$f" ] && echo "─── $f ───" && tail -100 "$f"
+          done
+
+      - name: Tear down
+        if: always()
+        run: docker compose --env-file .env.docker down -v
+
