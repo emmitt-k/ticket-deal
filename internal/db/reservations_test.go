@@ -42,10 +42,23 @@ func newTestPool(t *testing.T) *Pool {
 
 // cleanupReservation registers a t.Cleanup that deletes the test row
 // so each test starts from a clean slate.
+//
+// The audit rows go first, and they need the purge escape hatch:
+// reservation_events is append-only (see migrations/005_audit_log.sql),
+// so a plain DELETE is refused by the trigger. SET LOCAL scopes the
+// override to this transaction only — it can't leak to another pooled
+// connection.
 func cleanupReservation(t *testing.T, pool *Pool, reservationID string) {
 	t.Helper()
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(),
+		ctx := context.Background()
+		tx, err := pool.Begin(ctx)
+		if err == nil {
+			_, _ = tx.Exec(ctx, "SET LOCAL ticket_deal.audit_purge = 'on'")
+			_, _ = tx.Exec(ctx, "DELETE FROM reservation_events WHERE reservation_id = $1", reservationID)
+			_ = tx.Commit(ctx)
+		}
+		_, _ = pool.Exec(ctx,
 			"DELETE FROM reservations WHERE reservation_id = $1", reservationID)
 	})
 }
@@ -53,6 +66,25 @@ func cleanupReservation(t *testing.T, pool *Pool, reservationID string) {
 // seedEvent creates a stub event row so the FK constraint on
 // reservations.event_id is satisfied. Uses a UUID-based name to
 // avoid clashes if multiple tests run in parallel.
+//
+// EVENT IDS MUST BE GLOBALLY UNIQUE ACROSS PACKAGES. Every test
+// package in this repo talks to the SAME Postgres database, and `go
+// test ./...` runs the packages in parallel — so two packages using
+// the same event id collide on the primary key, and the failure shows
+// up in whichever package lost the race (an intermittent
+// "duplicate key value violates unique constraint events_pkey").
+//
+// The allocation convention:
+//
+//	610xx  internal/db  — reservations_test.go
+//	620xx  internal/db  — transition_test.go
+//	630xx  internal/db  — list_reservations_test.go
+//	640xx  internal/api  — get_reservation_handler_test.go
+//	650xx  internal/db  — audit_test.go
+//	710xx  internal/expire — compensate_test.go
+//	720xx  internal/expire — sweep_test.go
+//	730xx  internal/expire — audit_test.go
+//	770xx  internal/api  — reserve_handler_test.go
 //
 // The cleanup deletes the event row (after the reservations
 // cleanup has run, so we don't hit a FK violation in reverse).
@@ -252,6 +284,7 @@ func TestStatusConstants(t *testing.T) {
 	require.Equal(t, "CONFIRMED", StatusConfirmed)
 	require.Equal(t, "EXPIRED", StatusExpired)
 	require.Equal(t, "CANCELLED", StatusCancelled)
+	require.Equal(t, "REFUNDED", StatusRefunded)
 }
 
 // ensure fmt import is used (for any future debug helper)

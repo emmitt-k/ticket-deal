@@ -46,7 +46,7 @@ observability stack — but **none of that is exposed to a user**.
 The `reservations.status` column has a `CHECK` constraint allowing four values:
 
 ```sql
-CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'EXPIRED', 'CANCELLED'))
+CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'EXPIRED', 'CANCELLED', 'REFUNDED'))
 ```
 
 But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today**:
@@ -57,9 +57,19 @@ But **only `PENDING_PAYMENT` and `EXPIRED` are actually reachable in code today*
 | `EXPIRED` | Watcher + sweep job | `internal/expire/compensate.go` |
 | `CONFIRMED` | **nothing** — defined but no path | ❌ no handler (Layer 2, item 7 — Stripe webhook) |
 | `CANCELLED` | POST /api/reservations/{id}/cancel | `internal/api/cancel_reservation_handler.go` ✅ |
+| `REFUNDED` | **nothing** — defined but no path | ❌ no handler (Layer 2, item 7 — Stripe webhook) |
 
 This is the single biggest "code-defined-but-unwired" gap. Adding the missing
-transitions is Layer 1, item 1.
+transitions is Layer 2, item 7.
+
+> **Note:** the refund edge *is* wired (`CONFIRMED → REFUNDED` — it was
+> specified into the state machine in Layer 1, and the audit log records
+> it as a `REFUND_INITIATED` event), but nothing can reach `CONFIRMED`
+> yet because there's no payment integration. That's item 7.
+>
+> `REFUNDED` was split out of `CANCELLED` in `migrations/006_refunded_status.sql`:
+> "the customer never paid" and "the customer paid and we gave the money
+> back" are different facts and were sharing one status.
 
 ### What's not there at all (not even a stub)
 
@@ -70,7 +80,7 @@ transitions is Layer 1, item 1.
 - No `/readyz` — only bare `/healthz`, no deep dep checks *(Layer 1 item 4 — done; see branch `feature/readyz`)*
 - No anti-bot/CAPTCHA — only IP rate-limit via waiting room
 - No idempotency keys on POST /reserve — network retries could double-charge. *(Layer 1 item 5 — done; see branch `feature/idempotency-key`)*
-- No audit log — `who did what when` is unanswerable
+- ~~No audit log — `who did what when` is unanswerable~~ *(Layer 2 item 6 — done; see branch `feature/audit-log`)*
 
 ---
 
@@ -198,16 +208,23 @@ About 1 weekend of focused work. Small commits. Each item is independent.
 > backend" to "scary engineer." Audit log first because it makes everything else
 > safely debuggable.
 
-### 6. Audit log (event-sourced append-only)
+### 6. Audit log (event-sourced append-only) ✅ Done
 
 **Effort:** ~1 day. **Why first:** refunds without audit = SOC2 fail. Admin
 actions without audit = unanswerable "who did this?"
 
+> **Shipped** on `feature/audit-log`. The table, the append-only trigger, and the
+> atomic write on every transition. Notes on what changed vs the sketch below:
+> the migration is `005_audit_log.sql` (not `004` — that number was taken), and
+> `user_id` was added to the table because Layer 3's GDPR sweep needs to find a
+> user's rows by `user_id` alone.
+
 ```sql
--- migrations/004_audit_log.sql
+-- migrations/005_audit_log.sql
 CREATE TABLE reservation_events (
     event_id        BIGSERIAL PRIMARY KEY,
     reservation_id  UUID NOT NULL REFERENCES reservations(reservation_id),
+    user_id         TEXT NOT NULL,   -- denormalised for the GDPR sweep
     event_type      TEXT NOT NULL CHECK (event_type IN (
                         'CREATED','CONFIRMED','EXPIRED','CANCELLED','REFUND_INITIATED'
                     )),
@@ -225,13 +242,23 @@ Every status transition goes through one wrapper that does:
 
 ```sql
 BEGIN;
-  INSERT INTO reservations ...;            -- the actual state change
-  INSERT INTO reservation_events ...;      -- the audit row
+  UPDATE reservations SET status = $to WHERE reservation_id = $id AND status = $from;
+  INSERT INTO reservation_events (...) VALUES (...);
 COMMIT;
 ```
 
 The audit row has the OTel `trace_id` so an ops person can paste it into Grafana
 → "Ticket Deal — Logs" and see every log line for the transition.
+
+**Two design decisions worth keeping:**
+
+- **The event type is derived from the EDGE, not the destination status.**
+  `CONFIRMED → CANCELLED` is a `REFUND_INITIATED` (money moved back);
+  `PENDING_PAYMENT → CANCELLED` is a `CANCELLED` (nothing was paid). Same
+  destination status, completely different meaning to an operator.
+- **Append-only is enforced by the database.** A `BEFORE UPDATE OR DELETE`
+  trigger refuses `DELETE` and refuses every `UPDATE` except rewriting
+  `user_id` (the GDPR anonymisation path this very section anticipates).
 
 ### 7. Stripe test-mode integration (THE headline feature)
 
@@ -388,7 +415,7 @@ focused, every commit ships a working feature. End-state: the system *feels*
 complete.
 
 **If you have two weekends:** add 6 → 7 (audit + Stripe). Now it has payment,
-which is the headline. Recruiters will see it.
+which is the headline. Recruiters will see it. *(Item 6 is now done — only 7 remains.)*
 
 **If you have a month:** full Layer 1 + Layer 2. Notifications + admin + anti-bot
 + Stripe. This is what a senior backend engineer at Stripe or Ticketmaster
@@ -403,7 +430,7 @@ The biggest impact-portfolio item, ranked:
 |---|---|---|
 | 1 | **Stripe test mode** (#7) | Forces you to solve every pattern real engineers solve: signature verification, webhook idempotency, payment state, race-vs-expiry. Recruiters recognize it. |
 | 2 | **State machine + cancel** (#1, #3) | The connective tissue. Makes Layer 2 possible. |
-| 3 | **Audit log** (#6) | "Who did this when?" is the SOC2 question. |
+| 3 | **Audit log** (#6) | "Who did this when?" is the SOC2 question. ✅ Shipped |
 | 4 | **Anti-bot** (#10) | Proves you think like an attacker. |
 | 5 | **Notifications** (#8) | Tests the design's flexibility claim. |
 | 6 | **Admin API** (#9) | Every real product has this; usually glossed over. |

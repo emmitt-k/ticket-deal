@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
@@ -31,7 +32,11 @@ var getReservationTestSecret = []byte("test-secret-not-a-real-secret-1234567890"
 // reserve_handler_test.go.
 func doGetReservation(t *testing.T, pool *db.Pool, userID, reservationID string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
-	handler := auth.Middleware(getReservationTestSecret)(GetReservationHandler(pool))
+	// Mounted on a real chi router so chi.URLParam(r, "id") resolves
+	// the way it does in production — see testsupport_test.go.
+	handler := apiTestRouter(t, getReservationTestSecret, func(r chi.Router) {
+		r.Get("/reservations/{id}", GetReservationHandler(pool))
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/reservations/"+reservationID, nil)
 	if userID != "" {
@@ -43,8 +48,9 @@ func doGetReservation(t *testing.T, pool *db.Pool, userID, reservationID string)
 	handler.ServeHTTP(rec, req)
 
 	var parsed map[string]any
-	if rec.Body.Len() > 0 {
-		_ = json.NewDecoder(rec.Body).Decode(&parsed)
+	body := apiBodyBytes(t, rec)
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &parsed)
 	}
 	return rec, parsed
 }
@@ -54,7 +60,9 @@ func doGetReservation(t *testing.T, pool *db.Pool, userID, reservationID string)
 // /api/me/reservations?{query}. Returns the response + parsed array body.
 func doListMyReservations(t *testing.T, pool *db.Pool, userID, query string) (*httptest.ResponseRecorder, []map[string]any) {
 	t.Helper()
-	handler := auth.Middleware(getReservationTestSecret)(ListMyReservationsHandler(pool))
+	handler := apiTestRouter(t, getReservationTestSecret, func(r chi.Router) {
+		r.Get("/me/reservations", ListMyReservationsHandler(pool))
+	})
 
 	url := "/api/me/reservations"
 	if query != "" {
@@ -70,8 +78,9 @@ func doListMyReservations(t *testing.T, pool *db.Pool, userID, query string) (*h
 	handler.ServeHTTP(rec, req)
 
 	var parsed []map[string]any
-	if rec.Body.Len() > 0 {
-		_ = json.NewDecoder(rec.Body).Decode(&parsed)
+	body := apiBodyBytes(t, rec)
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &parsed)
 	}
 	return rec, parsed
 }
@@ -109,10 +118,25 @@ func apiSeedEvent(t *testing.T, pool *db.Pool, eventID int64) {
 	})
 }
 
+// apiCleanupReservation deletes the test row (and its audit rows) so
+// each test starts from a clean slate.
+//
+// The audit rows go first, and they need the purge escape hatch:
+// reservation_events is append-only (see migrations/005_audit_log.sql),
+// so a plain DELETE is refused by the trigger. SET LOCAL scopes the
+// override to this transaction only — it can't leak to another pooled
+// connection.
 func apiCleanupReservation(t *testing.T, pool *db.Pool, reservationID string) {
 	t.Helper()
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(),
+		ctx := context.Background()
+		tx, err := pool.Begin(ctx)
+		if err == nil {
+			_, _ = tx.Exec(ctx, "SET LOCAL ticket_deal.audit_purge = 'on'")
+			_, _ = tx.Exec(ctx, "DELETE FROM reservation_events WHERE reservation_id = $1", reservationID)
+			_ = tx.Commit(ctx)
+		}
+		_, _ = pool.Exec(ctx,
 			"DELETE FROM reservations WHERE reservation_id = $1", reservationID)
 	})
 }
@@ -268,7 +292,7 @@ func TestListMyReservations_StatusFilter(t *testing.T) {
 
 	// Flip r1 → EXPIRED so we can filter by status.
 	changed, err := db.TransitionStatus(context.Background(), pool,
-		r1.ReservationID, db.StatusPendingPayment, db.StatusExpired)
+		r1.ReservationID, db.StatusPendingPayment, db.StatusExpired, db.Audit{Actor: db.UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -372,4 +396,59 @@ func TestListMyReservations_DoesNotLeak(t *testing.T) {
 	_, otherRows := doListMyReservations(t, pool, other, "")
 	require.Len(t, otherRows, 1)
 	require.Equal(t, other, otherRows[0]["user_id"])
+}
+
+// TestListMyReservations_RefundedIsItsOwnStatus — a REFUNDED
+// reservation is NOT a CANCELLED one, and the filter has to keep them
+// apart: `?status=CANCELLED` must not return a refunded reservation,
+// and `?status=REFUNDED` must be a valid filter value at all.
+//
+// This is the user-visible half of the "refund is not a cancel" fix —
+// before it, a customer who was refunded showed up under CANCELLED.
+func TestListMyReservations_RefundedIsItsOwnStatus(t *testing.T) {
+	const owner = "u-refunded-filter-1"
+	pool := apiNewTestPool(t)
+	const eventID = int64(64004)
+	apiSeedEvent(t, pool, eventID)
+
+	// One cancelled (never paid), one refunded (paid, then reversed).
+	cancelled := apiValidReservationFor(t, eventID, owner)
+	apiCleanupReservation(t, pool, cancelled.ReservationID)
+	require.NoError(t, db.InsertIfAbsent(context.Background(), pool, cancelled))
+
+	refunded := apiValidReservationFor(t, eventID, owner)
+	apiCleanupReservation(t, pool, refunded.ReservationID)
+	require.NoError(t, db.InsertIfAbsent(context.Background(), pool, refunded))
+
+	changed, err := db.TransitionStatus(context.Background(), pool,
+		cancelled.ReservationID, db.StatusPendingPayment, db.StatusCancelled, db.Audit{Actor: db.UserActor("test-user")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	changed, err = db.TransitionStatus(context.Background(), pool,
+		refunded.ReservationID, db.StatusPendingPayment, db.StatusConfirmed, db.Audit{Actor: db.UserActor("test-user")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	changed, err = db.TransitionStatus(context.Background(), pool,
+		refunded.ReservationID, db.StatusConfirmed, db.StatusRefunded, db.Audit{Actor: db.StripeWebhookActor("evt_test")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	// ?status=REFUNDED is a valid filter → only the refunded row.
+	rec, byRefunded := doListMyReservations(t, pool, owner, "status=REFUNDED")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, byRefunded, 1)
+	require.Equal(t, refunded.ReservationID, byRefunded[0]["reservation_id"])
+
+	// ?status=CANCELLED → only the cancelled row. The refunded one must
+	// NOT leak in here.
+	rec, byCancelled := doListMyReservations(t, pool, owner, "status=CANCELLED")
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, byCancelled, 1)
+	require.Equal(t, cancelled.ReservationID, byCancelled[0]["reservation_id"])
+
+	// No filter → both.
+	_, all := doListMyReservations(t, pool, owner, "")
+	require.Len(t, all, 2)
 }

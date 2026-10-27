@@ -3,12 +3,14 @@
 // This is Layer 1 item 3 of docs/product-roadmap.md — the "user changes their
 // mind" path. Five steps from the spec, in order:
 //
-//   1. Verify JWT matches the row's user_id           → 403 if not
-//   2. Verify status == PENDING_PAYMENT               → 409 otherwise
-//   3. db.TransitionStatus(PENDING_PAYMENT → CANCELLED) → CAS-safe against
-//                                                        watcher's EXPIRED sweep
-//   4. INCRBY inventory:event:<id> <seats>            → release the seat back to Redis
-//   5. (best-effort) DEL hold:event:<id>:user:<u>     → so the user can re-reserve
+//  1. Verify JWT matches the row's user_id           → 403 if not
+//  2. Verify status == PENDING_PAYMENT               → 409 otherwise
+//  3. db.TransitionStatus(PENDING_PAYMENT → CANCELLED) → CAS-safe against
+//     watcher's EXPIRED sweep,
+//     and appends the CANCELLED
+//     audit row in the same tx
+//  4. INCRBY inventory:event:<id> <seats>            → release the seat back to Redis
+//  5. (best-effort) DEL hold:event:<id>:user:<u>     → so the user can re-reserve
 //
 // POST is naturally idempotent in REST; a second cancel on the same row is a
 // 200 with the row (decision from this branch's design discussion). The CAS
@@ -130,6 +132,14 @@ func CancelReservationHandler(pool *db.Pool, rdb *redis.Client) http.HandlerFunc
 				"already_expired", "the hold expired before the cancel request landed")
 			span.SetAttributes(attribute.String("cancel.outcome", "already_expired"))
 			return
+		case db.StatusRefunded:
+			// Already refunded: the money came back and the seat was
+			// released. There is nothing left to cancel, and the two are
+			// distinct facts — a refund is not a cancel.
+			apiutil.WriteError(w, http.StatusConflict,
+				"already_refunded", "this reservation was refunded; the seat was already released")
+			span.SetAttributes(attribute.String("cancel.outcome", "already_refunded"))
+			return
 		default:
 			// Defensive: an unknown status would have failed the SQL CHECK
 			// at insert time, so this branch is unreachable in practice.
@@ -143,8 +153,13 @@ func CancelReservationHandler(pool *db.Pool, rdb *redis.Client) http.HandlerFunc
 		}
 
 		// ── Step 3: CAS transition. Race-safe against watcher's EXPIRED sweep. ──
+		// The transition also appends a CANCELLED audit row, in the same
+		// transaction as the status change. The actor is the user whose
+		// JWT we're holding — "who cancelled this?" is exactly the
+		// question the audit log exists to answer.
 		changed, err := db.TransitionStatus(r.Context(), pool,
-			id, db.StatusPendingPayment, db.StatusCancelled)
+			id, db.StatusPendingPayment, db.StatusCancelled,
+			db.Audit{Actor: db.UserActor(claims.Subject)})
 		if err != nil {
 			slog.ErrorContext(r.Context(), "cancel: transition failed",
 				"reservation_id", id, "error", err)

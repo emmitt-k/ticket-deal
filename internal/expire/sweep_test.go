@@ -25,7 +25,7 @@ func TestFindAndExpireSweptRows_PicksUpExpired(t *testing.T) {
 	id := insertPendingReservation(t, pool, eID, uid, 1,
 		time.Now().Add(-1*time.Hour)) // expired an hour ago
 
-	rows, err := FindAndExpireSweptRows(context.Background(), pool)
+	rows, err := FindAndExpireSweptRows(context.Background(), pool, db.Audit{Actor: db.SystemActor(ActorIDSweep)})
 	require.NoError(t, err)
 
 	var found *SweptRow
@@ -57,7 +57,7 @@ func TestFindAndExpireSweptRows_IgnoresNotExpired(t *testing.T) {
 	id := insertPendingReservation(t, pool, eID, uid, 1,
 		time.Now().Add(10*time.Minute))
 
-	rows, err := FindAndExpireSweptRows(context.Background(), pool)
+	rows, err := FindAndExpireSweptRows(context.Background(), pool, db.Audit{Actor: db.SystemActor(ActorIDSweep)})
 	require.NoError(t, err)
 	for _, r := range rows {
 		require.NotEqual(t, id, r.ReservationID,
@@ -86,7 +86,7 @@ func TestFindAndExpireSweptRows_IgnoresNonPending(t *testing.T) {
 		"UPDATE reservations SET status = 'CONFIRMED' WHERE reservation_id = $1", id)
 	require.NoError(t, err)
 
-	rows, err := FindAndExpireSweptRows(context.Background(), pool)
+	rows, err := FindAndExpireSweptRows(context.Background(), pool, db.Audit{Actor: db.SystemActor(ActorIDSweep)})
 	require.NoError(t, err)
 	for _, r := range rows {
 		require.NotEqual(t, id, r.ReservationID,
@@ -111,7 +111,7 @@ func TestFindAndExpireSweptRows_Idempotent(t *testing.T) {
 	id := insertPendingReservation(t, pool, eID, uid, 1,
 		time.Now().Add(-1*time.Hour))
 
-	first, err := FindAndExpireSweptRows(context.Background(), pool)
+	first, err := FindAndExpireSweptRows(context.Background(), pool, db.Audit{Actor: db.SystemActor(ActorIDSweep)})
 	require.NoError(t, err)
 	var foundInFirst bool
 	for _, r := range first {
@@ -121,7 +121,7 @@ func TestFindAndExpireSweptRows_Idempotent(t *testing.T) {
 	}
 	require.True(t, foundInFirst, "first call returns the row")
 
-	second, err := FindAndExpireSweptRows(context.Background(), pool)
+	second, err := FindAndExpireSweptRows(context.Background(), pool, db.Audit{Actor: db.SystemActor(ActorIDSweep)})
 	require.NoError(t, err)
 	for _, r := range second {
 		require.NotEqual(t, id, r.ReservationID,
@@ -140,7 +140,7 @@ func TestFindAndExpireSweptRows_MultiSeat(t *testing.T) {
 	id := insertPendingReservation(t, pool, eID, uid, 3,
 		time.Now().Add(-1*time.Hour))
 
-	rows, err := FindAndExpireSweptRows(context.Background(), pool)
+	rows, err := FindAndExpireSweptRows(context.Background(), pool, db.Audit{Actor: db.SystemActor(ActorIDSweep)})
 	require.NoError(t, err)
 
 	var found *SweptRow

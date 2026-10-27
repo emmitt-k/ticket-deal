@@ -10,9 +10,9 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/db"
-	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 )
 
 // tracerName is the OTel Tracer name for this package's spans.
@@ -117,10 +117,10 @@ func GetReservationHandler(pool *db.Pool) http.HandlerFunc {
 //
 // Query params:
 //
-//   ?status=  one of the 4 status constants. Empty (default) → all 4.
-//             No filter = 'no hidden state' per the design decision.
-//   ?limit=   default 20, hard max 100. 0 or negative → 20.
-//   ?offset=  default 0. Negative → 0.
+//	?status=  one of the 5 status constants. Empty (default) → all 5.
+//	          No filter = 'no hidden state' per the design decision.
+//	?limit=   default 20, hard max 100. 0 or negative → 20.
+//	?offset=  default 0. Negative → 0.
 //
 // Response: 200 + JSON array of ReservationRow, newest first. Empty
 // array if the user has no reservations yet. (NOT 404 — empty list is
@@ -128,9 +128,10 @@ func GetReservationHandler(pool *db.Pool) http.HandlerFunc {
 // 'next page exists' is inferred by `len(response) == limit`.
 //
 // Status codes:
-//   401 missing/invalid JWT              (auth.Middleware)
-//   500 internal_error                  (DB error)
-//   200 + array                         (happy path, possibly empty)
+//
+//	401 missing/invalid JWT              (auth.Middleware)
+//	500 internal_error                  (DB error)
+//	200 + array                         (happy path, possibly empty)
 //
 // Layer 1 item 2 of docs/product-roadmap.md.
 func ListMyReservationsHandler(pool *db.Pool) http.HandlerFunc {
@@ -159,10 +160,11 @@ func ListMyReservationsHandler(pool *db.Pool) http.HandlerFunc {
 			statusFilter != db.StatusPendingPayment &&
 			statusFilter != db.StatusConfirmed &&
 			statusFilter != db.StatusExpired &&
-			statusFilter != db.StatusCancelled {
+			statusFilter != db.StatusCancelled &&
+			statusFilter != db.StatusRefunded {
 			apiutil.WriteError(w, http.StatusBadRequest,
 				"invalid_status",
-				"status must be one of PENDING_PAYMENT, CONFIRMED, EXPIRED, CANCELLED")
+				"status must be one of PENDING_PAYMENT, CONFIRMED, EXPIRED, CANCELLED, REFUNDED")
 			span.SetAttributes(
 				attribute.String("lookup.outcome", "bad_request"),
 				attribute.String("lookup.bad_status", statusFilter),

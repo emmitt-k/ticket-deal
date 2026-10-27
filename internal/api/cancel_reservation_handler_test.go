@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
@@ -28,7 +29,11 @@ func doCancelReservation(t *testing.T, pool *db.Pool, rdb *redis.Client,
 ) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 
-	handler := auth.Middleware(testSecret)(CancelReservationHandler(pool, rdb))
+	// Mounted on a real chi router so chi.URLParam(r, "id") resolves
+	// the way it does in production — see testsupport_test.go.
+	handler := apiTestRouter(t, testSecret, func(r chi.Router) {
+		r.Post("/reservations/{id}/cancel", CancelReservationHandler(pool, rdb))
+	})
 	url := "/api/reservations/" + reservationID + "/cancel"
 	req := httptest.NewRequest(http.MethodPost, url, nil)
 	if userID != "" {
@@ -40,8 +45,9 @@ func doCancelReservation(t *testing.T, pool *db.Pool, rdb *redis.Client,
 	handler.ServeHTTP(rec, req)
 
 	var parsed map[string]any
-	if rec.Body.Len() > 0 && rec.Header().Get("Content-Type") != "" {
-		_ = json.NewDecoder(rec.Body).Decode(&parsed)
+	body := apiBodyBytes(t, rec)
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &parsed)
 	}
 	return rec, parsed
 }
@@ -189,7 +195,7 @@ func TestCancel_AlreadyPaid(t *testing.T) {
 
 	// PENDING → CONFIRMED via TransitionStatus (the only legal edge).
 	changed, err := db.TransitionStatus(context.Background(), pool,
-		rid, db.StatusPendingPayment, db.StatusConfirmed)
+		rid, db.StatusPendingPayment, db.StatusConfirmed, db.Audit{Actor: db.UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -207,7 +213,7 @@ func TestCancel_AlreadyExpired(t *testing.T) {
 	cleanupReserveKeys(t, rdb, eventID, owner)
 
 	changed, err := db.TransitionStatus(context.Background(), pool,
-		rid, db.StatusPendingPayment, db.StatusExpired)
+		rid, db.StatusPendingPayment, db.StatusExpired, db.Audit{Actor: db.UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 
@@ -271,4 +277,80 @@ func TestCancel_HoldKeyAlreadyGone(t *testing.T) {
 		"missing hold key must not 500 the request; got body=%s", rec.Body.String())
 	require.Equal(t, db.StatusCancelled, body["status"])
 	require.Equal(t, 100, inventoryCount(t, rdb, eventID))
+}
+
+// ── Audit log ──────────────────────────────────────────────────────────
+
+// TestCancel_WritesAuditRow — cancelling appends a CANCELLED row to
+// the audit log, naming the JWT holder as the actor.
+//
+// This is the end-to-end proof of the whole feature: the user-facing
+// action and the audit record land together, and the audit record
+// says WHO did it.
+func TestCancel_WritesAuditRow(t *testing.T) {
+	const owner = "u-cancel-audit-1"
+	pool, _, rid := newGetReservationPool(t, owner)
+	rdb := newTestClient(t)
+	cleanupReserveKeys(t, rdb, 64001, owner)
+
+	rec, _ := doCancelReservation(t, pool, rdb, owner, rid)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	events, err := db.ListAuditEvents(context.Background(), pool, rid)
+	require.NoError(t, err)
+	require.Len(t, events, 2, "CREATED (from the insert) + CANCELLED")
+
+	e := events[1]
+	require.Equal(t, db.AuditEventCancelled, e.EventType)
+	require.Equal(t, db.ActorTypeUser, e.ActorType)
+	require.Equal(t, owner, e.ActorID, "the audit row must name the user who cancelled")
+	require.Equal(t, db.StatusPendingPayment, e.OldStatus)
+	require.Equal(t, db.StatusCancelled, e.NewStatus)
+}
+
+// TestCancel_ForbiddenWritesNoAuditRow — a rejected cancel (not your
+// reservation) must not touch the audit log. The log records what
+// HAPPENED, not what was attempted.
+func TestCancel_ForbiddenWritesNoAuditRow(t *testing.T) {
+	const owner = "u-cancel-audit-owner"
+	const other = "u-cancel-audit-other"
+	pool, _, rid := newGetReservationPool(t, owner)
+	rdb := newTestClient(t)
+	cleanupReserveKeys(t, rdb, 64001, other)
+
+	rec, _ := doCancelReservation(t, pool, rdb, other, rid)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+
+	events, err := db.ListAuditEvents(context.Background(), pool, rid)
+	require.NoError(t, err)
+	require.Len(t, events, 1, "a rejected cancel must not write an audit row")
+	require.Equal(t, db.AuditEventCreated, events[0].EventType)
+}
+
+// TestCancel_AlreadyRefunded — a REFUNDED row → 409 already_refunded.
+//
+// A refund is not a cancel. The money already came back and the seat
+// was already released, so there is nothing left to cancel — and the
+// error is distinct from the 409 already_paid of a merely-CONFIRMED
+// reservation, because those are different facts.
+func TestCancel_AlreadyRefunded(t *testing.T) {
+	const owner = "u-cancel-refunded-1"
+	pool, eventID, rid := newGetReservationPool(t, owner)
+	rdb := newTestClient(t)
+	cleanupReserveKeys(t, rdb, eventID, owner)
+
+	// PENDING → CONFIRMED → REFUNDED (the only legal edges out of CONFIRMED).
+	changed, err := db.TransitionStatus(context.Background(), pool,
+		rid, db.StatusPendingPayment, db.StatusConfirmed, db.Audit{Actor: db.UserActor("test-user")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	changed, err = db.TransitionStatus(context.Background(), pool,
+		rid, db.StatusConfirmed, db.StatusRefunded, db.Audit{Actor: db.StripeWebhookActor("evt_test")})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	rec, body := doCancelReservation(t, pool, rdb, owner, rid)
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Equal(t, "already_refunded", body["error"])
 }

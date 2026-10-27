@@ -2,8 +2,13 @@ package expire
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
@@ -21,8 +26,9 @@ type SweptRow struct {
 }
 
 // FindAndExpireSweptRows atomically transitions every PENDING_PAYMENT row
-// whose expires_at has passed to EXPIRED, and returns the swept rows so
-// the caller can run the Redis compensating INCRBY.
+// whose expires_at has passed to EXPIRED, appends an EXPIRED audit row for
+// each of them, and returns the swept rows so the caller can run the
+// Redis compensating INCRBY.
 //
 // Idempotent — the WHERE limits the UPDATE to rows currently PENDING
 // (status='PENDING_PAYMENT' AND expires_at < NOW()), so a re-run finds
@@ -31,14 +37,41 @@ type SweptRow struct {
 // We use UPDATE ... RETURNING instead of SELECT-then-UPDATE so the
 // transition is atomic per row (no race where a row flips between
 // SELECT and UPDATE).
-func FindAndExpireSweptRows(ctx context.Context, pool *db.Pool) ([]SweptRow, error) {
-	const q = `
-		UPDATE reservations
-		SET status = 'EXPIRED', updated_at = NOW()
-		WHERE status = 'PENDING_PAYMENT' AND expires_at < NOW()
-		RETURNING reservation_id, user_id, event_id, seats
+//
+// The audit rows are written by a data-modifying CTE in the SAME
+// statement — see expireRowIfPending in compensate.go for why this path
+// doesn't go through db.TransitionStatus.
+func FindAndExpireSweptRows(ctx context.Context, pool *db.Pool, audit db.Audit) ([]SweptRow, error) {
+	auditSQL, auditParams, err := db.AuditInsertSelect(ctx, "updated", db.AuditEntry{
+		EventType: db.AuditEventExpired,
+		Actor:     audit.Actor,
+		OldStatus: db.StatusPendingPayment,
+		NewStatus: db.StatusExpired,
+		Metadata:  audit.Metadata,
+	}, 1)
+	if err != nil {
+		return nil, fmt.Errorf("expire: build audit insert: %w", err)
+	}
+
+	// $1..$7 are the audit row; the sweep itself has no other params.
+	q := `
+		WITH updated AS (
+			UPDATE reservations
+			SET status = 'EXPIRED', updated_at = NOW()
+			WHERE status = 'PENDING_PAYMENT' AND expires_at < NOW()
+			RETURNING reservation_id, user_id, event_id, seats,
+			          jsonb_build_object('seats', seats, 'event_id', event_id) AS audit_metadata
+		),
+		audited AS (
+			` + auditSQL + `
+		)
+		SELECT reservation_id, user_id, event_id, seats FROM updated
 	`
-	rows, err := pool.Query(ctx, q)
+
+	args := make([]any, 0, 7)
+	args = append(args, auditParams...)
+
+	rows, err := pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -61,14 +94,15 @@ func FindAndExpireSweptRows(ctx context.Context, pool *db.Pool) ([]SweptRow, err
 // RunSweep runs the expiry sweep every interval until ctx is canceled.
 //
 // service: label added to expiration_sweep_cycles_total and
-//          expiration_seats_expired_total metrics. Pass "worker" or
-//          "watcher" to disambiguate when both run sweeps.
+//
+//	expiration_seats_expired_total metrics. Pass "worker" or
+//	"watcher" to disambiguate when both run sweeps.
 //
 // interval: typically 60 s. Lower = faster catch-up but more DB load;
 // higher = seats stuck "held" for longer if the watcher is down.
 //
 // Behavior per tick:
-//  1. Run FindAndExpireSweptRows (atomic UPDATE+RETURNING).
+//  1. Run FindAndExpireSweptRows (atomic UPDATE + audit INSERT + RETURNING).
 //  2. For each row returned, INCRBY the inventory counter so the
 //     seat is sellable again.
 //
@@ -98,13 +132,30 @@ func RunSweep(ctx context.Context, pool *db.Pool, rdb *redis.Client, service str
 	}
 }
 
-// sweepOnce runs one pass of the sweep: UPDATE expired rows, then
-// INCRBY inventory for each. Logs counts + per-row failures.
+// sweepOnce runs one pass of the sweep: UPDATE expired rows, append the
+// EXPIRED audit rows, then INCRBY inventory for each. Logs counts +
+// per-row failures.
 func sweepOnce(ctx context.Context, pool *db.Pool, rdb *redis.Client, service string) {
 	metrics.ExpirationSweepCycles.WithLabelValues(service).Inc()
-	rows, err := FindAndExpireSweptRows(ctx, pool)
+
+	// A span per tick. The EXPIRED audit rows this sweep writes carry
+	// this span's trace_id, so an ops person holding an audit row can
+	// jump straight to the sweep's spans and log lines — the same
+	// trace→logs workflow the HTTP side already has.
+	ctx, span := tracer.Start(ctx, "expire.sweep",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.String("expire.service", service)),
+	)
+	defer span.End()
+
+	rows, err := FindAndExpireSweptRows(ctx, pool, db.Audit{
+		Actor:    db.SystemActor(ActorIDSweep),
+		Metadata: map[string]any{"service": service},
+	})
 	if err != nil {
 		slog.ErrorContext(ctx, "sweep query failed", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "sweep query failed")
 		return
 	}
 	if len(rows) == 0 {

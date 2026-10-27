@@ -13,7 +13,8 @@ This document complements the [README](../README.md). The README is the project 
 
 **What Layer 1 added at a glance:**
 
-- `internal/db/transition.go` — `TransitionStatus(ctx, pool, id, from, to) (changed, err)`, a CAS UPDATE backed by a `validTransitions` map. The single gateway for every status change in the system.
+- `internal/db/transition.go` — `TransitionStatus(ctx, pool, id, from, to, audit) (changed, err)`, a CAS UPDATE backed by a `validTransitions` map, writing the audit row in the same transaction. The single gateway for every status change in the system.
+- `internal/db/audit.go` — the audit trail's types and writers: `Audit` / `AuditActor` / `AuditEntry`, `WriteAuditEvent` (standalone INSERT), `AuditInsertSelect` (the data-modifying-CTE form the expire paths use), and `auditEventTypeForEdge` (edge → event type).
 - `GET /api/reservations/{id}` and `GET /api/me/reservations` — users can look up their own tickets (JWT-scoped, paginated, status-filterable).
 - `POST /api/reservations/{id}/cancel` — user-initiated cancel; CAS-safe against the watcher's EXPIRED sweep; releases the seat back to Redis; best-effort hold-key cleanup.
 - `GET /readyz` — three parallel dependency checks (Redis / Postgres / SQS) with 500ms per-check budgets. `200` if all green, `503` otherwise. Distinct from `/healthz` (process-alive only).
@@ -516,6 +517,7 @@ graph LR
 | ---------------------------------------- | ---------- | -------------------- |
 | "Who has what, right now"              | Redis    | Hold TTL (~10 min) |
 | "What was ever sold, with what status" | Postgres | Forever            |
+| "Who did what, and can I prove it"     | Postgres | Forever (append-only) |
 
 **The asymmetry is the point.** Redis is the hot, mutable, fast-fading truth of "this user's seat is reserved, expires in 9m 42s." Postgres is the slow, immutable, forever-true ledger of confirmed orders. They serve different access patterns.
 
@@ -534,13 +536,23 @@ stateDiagram-v2
     PENDING_PAYMENT --> CONFIRMED: Payment webhook<br/>(Stripe, future — Layer 2)
     PENDING_PAYMENT --> EXPIRED: Hold key TTL fires<br/>(watcher OR sweep,<br/>within 60s)
     PENDING_PAYMENT --> CANCELLED: POST /cancel<br/>(internal/api/cancel_<br/>reservation_handler.go)
+    CONFIRMED --> REFUNDED: Refund<br/>(Stripe, future — Layer 2)
 
     CONFIRMED --> [*]: Order complete
     EXPIRED --> [*]: Seat released<br/>via INCRBY inventory
     CANCELLED --> [*]: Seat released<br/>via INCRBY inventory
+    REFUNDED --> [*]: Money returned,<br/>seat released
 ```
 
-**Four terminal states** (`CONFIRMED`, `EXPIRED`, `CANCELLED`, plus the implicit "no row ever written" if the worker never gets the SQS message). `PENDING_PAYMENT` is the only transitional state.
+`CANCELLED` and `REFUNDED` are separate on purpose. Both release the seat,
+but they are different facts: **nobody paid** vs **the customer paid and
+we gave the money back**. Before `migrations/006_refunded_status.sql` a
+refund was stored as `CANCELLED` ("refund = cancel in our model"), which
+made "we lost the sale" and "we refunded the customer" the same query —
+in the DB, in the `?status=` filter, and in any revenue report built on
+top of it.
+
+**Five statuses**, of which three are terminal (`EXPIRED`, `CANCELLED`, `REFUNDED`) — plus the implicit "no row ever written" if the worker never gets the SQS message. `PENDING_PAYMENT` is the only transitional state, and `CONFIRMED` has exactly one way out (the refund edge).
 
 The `status` column has a `CHECK` constraint enforcing this set (`migrations/001_init.sql`), and `internal/db/reservations.go` exposes the four values as typed constants (`StatusPendingPayment`, etc.) so a typo at a call site fails to compile.
 
@@ -549,7 +561,47 @@ The `status` column has a `CHECK` constraint enforcing this set (`migrations/001
 - `CHECK (status IN (...))` catches a typo'd status string 100ms after the bad `UPDATE` lands.
 - `TransitionStatus` refuses to even *attempt* an impossible transition (`EXPIRED → CONFIRMED`, say) and returns `ErrInvalidTransition` before touching the DB. It encodes the directed graph as data, so "which moves are legal" is a single table rather than a rule scattered across call sites.
 
-Every status change in the system now flows through `TransitionStatus(ctx, pool, id, from, to) (changed bool, err error)` — a compare-and-set `UPDATE ... WHERE reservation_id = $id AND status = $from`. Two callers racing the same row (a user's cancel vs the watcher's expiry sweep, or two parallel cancels) cannot both win: the first gets `(true, nil)`, the second gets `(false, nil)` and re-reads to learn what actually happened. Layer 1's cancel endpoint is the first production consumer; §14 documents the helper in full.
+Every status change in the system now flows through `TransitionStatus(ctx, pool, id, from, to, audit) (changed bool, err error)` — a compare-and-set `UPDATE ... WHERE reservation_id = $id AND status = $from`. Two callers racing the same row (a user's cancel vs the watcher's expiry sweep, or two parallel cancels) cannot both win: the first gets `(true, nil)`, the second gets `(false, nil)` and re-reads to learn what actually happened. Layer 1's cancel endpoint is the first production consumer; §14 documents the helper in full.
+
+### The audit trail (Layer 2, item 6)
+
+The `reservations` row holds the **current** status. That answers "can this user cancel?" but not "who did what, when, and can I prove it?" — the moment a second transition overwrites the status, the history is gone. A support ticket that says *"I paid and it still says PENDING_PAYMENT"* is unanswerable without a trail.
+
+`reservation_events` (`migrations/005_audit_log.sql`) is that trail, and it is written by the **same transaction** as the status change:
+
+```go
+changed, err := db.TransitionStatus(ctx, pool, id,
+    db.StatusPendingPayment, db.StatusCancelled,
+    db.Audit{Actor: db.UserActor(claims.Subject)})
+```
+
+```sql
+BEGIN;
+  UPDATE reservations SET status = 'CANCELLED'
+   WHERE reservation_id = $1 AND status = 'PENDING_PAYMENT';
+  INSERT INTO reservation_events (reservation_id, user_id, event_type,
+                                  actor_type, actor_id, old_status,
+                                  new_status, trace_id, metadata)
+  VALUES (...);
+COMMIT;
+```
+
+Three properties fall out of that shape:
+
+1. **No window where the status changed but the audit row is missing.** If the audit `INSERT` fails, the transaction rolls back and the transition never happened. An audit log that can silently miss rows isn't an audit log.
+2. **The actor is mandatory.** `TransitionStatus` rejects an empty actor type with `ErrInvalidAudit` before any SQL runs, so "a transition happened but nobody recorded it" is not a state the code can reach. The signature change was deliberate: a sibling function without an actor would leave exactly that hole.
+3. **The event type comes from the EDGE, not the destination status.** `CONFIRMED → CANCELLED` is a `REFUND_INITIATED` — money moved back. `PENDING_PAYMENT → CANCELLED` is a `CANCELLED` — nothing was paid. Same destination status, completely different meaning to whoever reads the log later.
+
+| Path | event_type | actor_type / actor_id |
+|---|---|---|
+| Worker INSERT | `CREATED` | `user` / the user id |
+| Cancel handler | `CANCELLED` | `user` / the JWT subject |
+| Expire watcher | `EXPIRED` | `system` / `expiration-watcher` |
+| Expire sweep | `EXPIRED` | `system` / `expiration-sweep` |
+
+**Append-only is enforced by the database.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` outright and refuses every `UPDATE` except rewriting `user_id` — the GDPR anonymisation path that Layer 3, item 14 will need. The single escape hatch is a session GUC (`SET LOCAL ticket_deal.audit_purge = 'on'`), used by test fixtures and future retention policies; production code never sets it.
+
+The `trace_id` column is the join key into the observability stack: an ops person holding a trace id can pull up every log line and span for the transition, and an ops person holding an audit row can pull up the trace id that produced it. §13.6 covers the workflow.
 
 ---
 
@@ -1337,7 +1389,7 @@ Layer 1 item 2. `ReservationRow` — the single row shape used by both `GetReser
 
 #### `internal/db/transition.go`
 
-Layer 1 item 1 — **the single gateway for every status change in the system.** `TransitionStatus(ctx, pool, id, from, to string) (changed bool, err error)`.
+Layer 1 item 1 — **the single gateway for every status change in the system.** `TransitionStatus(ctx, pool, id, from, to string, audit Audit) (changed bool, err error)`.
 
 The write is a compare-and-set:
 
@@ -1346,17 +1398,24 @@ UPDATE reservations SET status = $1, updated_at = NOW()
 WHERE reservation_id = $2 AND status = $3
 ```
 
-Two callers racing the same row (a user's cancel vs the watcher's expiry sweep, or two parallel cancels) cannot both win. The first gets `(true, nil)`; the second observes `tag.RowsAffected() == 0` and gets `(false, nil)` — **not an error**, just "someone else already handled it." Callers that care re-read the row to learn the actual status. No transaction needed; Postgres row-level locks cover the rest.
+Two callers racing the same row (a user's cancel vs the watcher's expiry sweep, or two parallel cancels) cannot both win. The first gets `(true, nil)`; the second observes `tag.RowsAffected() == 0` and gets `(false, nil)` — **not an error**, just "someone else already handled it." Callers that care re-read the row to learn the actual status.
+
+Since Layer 2 item 6 the whole thing runs in a transaction, because the status change and its audit row must land together (§8). The audit write is inside that transaction, so a failed audit `INSERT` rolls the status change back with it.
 
 The `validTransitions` map encodes the entire directed graph as data:
 
 ```go
 var validTransitions = map[string][]string{
     StatusPendingPayment: {StatusConfirmed, StatusExpired, StatusCancelled},
-    StatusConfirmed:      {StatusCancelled},
-    // StatusExpired, StatusCancelled: terminal — absent from the map
+    StatusConfirmed:      {StatusRefunded},
+    // StatusExpired, StatusCancelled, StatusRefunded: terminal — absent
+    // from the map
 }
 ```
+
+Note what is **not** an edge: `CONFIRMED → CANCELLED`. It used to be one
+(`"refund = cancel in our model"`), and splitting it out is what gives
+`CANCELLED` and `REFUNDED` one meaning each.
 
 `EXPIRED` and `CANCELLED` are terminal: no outgoing edges, and they're deliberately absent from the map keys so the "nothing leaves a terminal state" rule is visible at a glance. Asking for an edge that isn't in the table returns `(false, ErrInvalidTransition)` — a **programmer** error, distinct from a CAS miss. Detected with `errors.Is`.
 
@@ -1618,7 +1677,7 @@ Coverage for handler paths, drainer token calculations, and the in-process chann
 Creates the two tables every phase needs:
 
 - `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `created_at TIMESTAMPTZ DEFAULT NOW()`
-- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()`
+- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`
 - Indexes: `idx_reservations_event_status (event_id, status)` for "how many PENDING does this event have?" queries; partial `idx_reservations_pending_expiry (expires_at) WHERE status = 'PENDING_PAYMENT'` powers the sweep job's WHERE clause.
 
 #### `migrations/002_seed.sql`
@@ -1635,6 +1694,23 @@ Layer 1 item 2. `CREATE INDEX IF NOT EXISTS idx_reservations_user_created ON res
 
 Composite, and in that order on purpose: the index ordering matches `ListReservationsByUser`'s `WHERE user_id = $1 ORDER BY created_at DESC` exactly, so Postgres satisfies both the filter and the sort from the index in one pass — no sort node in the plan. A single-column `user_id` index would still need a separate sort. Cheap to add now while the table is small; retrofitting it later on a large table means an online `CONCURRENTLY` rebuild.
 
+#### `migrations/005_audit_log.sql`
+
+Layer 2 item 6. Creates `reservation_events` — the append-only audit trail (§8):
+
+- `event_id BIGSERIAL PRIMARY KEY` — insertion order, so it *is* the chronological order
+- `reservation_id UUID FK → reservations(reservation_id)`
+- `user_id TEXT NOT NULL` — denormalised; Layer 3's GDPR sweep needs to find a user's rows by `user_id` alone
+- `event_type TEXT CHECK IN ('CREATED','CONFIRMED','EXPIRED','CANCELLED','REFUND_INITIATED')`
+- `actor_type TEXT CHECK IN ('user','system','admin','stripe_webhook')` + `actor_id TEXT`
+- `old_status` / `new_status TEXT` — NULL for `CREATED`
+- `trace_id TEXT` — the join key into Grafana / Loki / Jaeger
+- `metadata JSONB NOT NULL DEFAULT '{}'::jsonb` — seat counts, Stripe charge ids, …
+
+Indexes: `(reservation_id, event_id)` for "the history of this reservation"; `(user_id, event_id)` for the GDPR sweep; a partial index on `trace_id WHERE trace_id IS NOT NULL` for the trace join (most rows have no trace — background sweeps have no span).
+
+Plus `reservation_events_append_only()` — a `BEFORE UPDATE OR DELETE` trigger that refuses `DELETE` outright and refuses every `UPDATE` except rewriting `user_id`. One escape hatch: `SET LOCAL ticket_deal.audit_purge = 'on'`.
+
 ---
 
 ### `docs/`
@@ -1645,7 +1721,7 @@ Composite, and in that order on purpose: the index ordering matches `ListReserva
 
 #### `docs/product-roadmap.md`
 
-**The current source of truth for "what's next."** Lays out the remaining work as numbered layers, each with a per-item spec (endpoint shapes, status codes, JSON bodies, effort estimates). Layer 1 is shipped 5/5; Layer 2+ is unstarted. Also carries a "what's not there at all" gap list — the fastest way to see what's missing at a glance.
+**The current source of truth for "what's next."** Lays out the remaining work as numbered layers, each with a per-item spec (endpoint shapes, status codes, JSON bodies, effort estimates). Layer 1 is shipped 5/5; Layer 2 item 6 (the audit log) is shipped; Layer 2 items 7-10 and Layer 3 are unstarted. Also carries a "what's not there at all" gap list — the fastest way to see what's missing at a glance.
 
 Each Layer 1 item cites the branch that shipped it, so the git history and the roadmap cross-reference each other rather than drifting apart.
 

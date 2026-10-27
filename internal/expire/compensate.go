@@ -36,6 +36,19 @@ const tracerName = "github.com/emmitt-k/ticket-deal/internal/expire"
 
 var tracer = otel.Tracer(tracerName)
 
+// Actor ids recorded in the audit log's actor_id column for the two
+// expiry mechanisms. They are different components on purpose: when an
+// operator asks "why did this reservation expire?", the answer should
+// say WHICH mechanism did it — the near-instant keyspace watcher, or
+// the 60-second safety-net sweep.
+const (
+	// ActorIDWatcher — the Redis keyspace-notification watcher.
+	ActorIDWatcher = "expiration-watcher"
+
+	// ActorIDSweep — the periodic DB sweep.
+	ActorIDSweep = "expiration-sweep"
+)
+
 // Compensate handles a hold-key expiration: transitions the matching
 // PENDING_PAYMENT row to EXPIRED and INCRBYs the inventory counter so
 // the seat is sellable again.
@@ -148,10 +161,51 @@ func hashUserID(s string) int64 {
 // without a second SELECT, and the WHERE status='PENDING_PAYMENT' is
 // the compare-and-set that makes concurrent Compensate + Sweep calls
 // safe (only one wins, the other sees 0 rows).
+//
+// The audit row is written by a THIRD CTE in the same statement.
+// Postgres guarantees a data-modifying CTE runs exactly once and to
+// completion, even when the outer query never reads its output — so
+// the EXPIRED audit row and the status change commit or roll back
+// together, with no extra round-trip and no window where one exists
+// without the other.
+//
+// This path deliberately does NOT go through db.TransitionStatus:
+// AGENTS.md convention #9 names package expire as a deliberate
+// exception, because this query finds the row by (user_id, event_id)
+// and reads the seat count back in the same statement. Routing it
+// through the helper would trade one atomicity for another — and this
+// is the one path where a subtle race means overselling.
 func expireRowIfPending(ctx context.Context, pool *db.Pool,
 	userID string, eventID int64,
 ) (int, error) {
-	const q = `
+	auditSQL, auditParams, err := db.AuditInsertSelect(ctx, "updated", db.AuditEntry{
+		EventType: db.AuditEventExpired,
+		Actor:     db.SystemActor(ActorIDWatcher),
+		OldStatus: db.StatusPendingPayment,
+		NewStatus: db.StatusExpired,
+	}, 3)
+	if err != nil {
+		return 0, fmt.Errorf("expire: build audit insert: %w", err)
+	}
+
+	// $1/$2 are the target lookup; $3..$9 are the audit row.
+	//
+	// The `status = 'PENDING_PAYMENT'` guard is repeated in the
+	// UPDATE's own WHERE clause, and it has to be. The `target` CTE is
+	// evaluated against the statement's SNAPSHOT — it is not re-read
+	// when a concurrent transaction commits. So without the guard in
+	// the UPDATE, two concurrent Compensate calls can both list the
+	// row in their `target`, both block on the row lock, and after the
+	// first one commits, the second one's UPDATE re-check finds
+	// `reservation_id IN (target)` still true (the id didn't change) —
+	// so it flips the row a SECOND time and INCRBYs the seat again.
+	// Inventory ends up one seat too high: a silent oversell.
+	//
+	// With the guard in the UPDATE, the re-check runs against the NEW
+	// row version, sees status='EXPIRED', and skips it. Exactly one
+	// caller wins. This is the same compare-and-set shape as
+	// db.TransitionStatus (`WHERE reservation_id = $2 AND status = $3`).
+	q := `
 		WITH target AS (
 			SELECT reservation_id, seats FROM reservations
 			WHERE user_id = $1 AND event_id = $2 AND status = 'PENDING_PAYMENT'
@@ -162,12 +216,22 @@ func expireRowIfPending(ctx context.Context, pool *db.Pool,
 			UPDATE reservations
 			SET status = 'EXPIRED', updated_at = NOW()
 			WHERE reservation_id IN (SELECT reservation_id FROM target)
-			RETURNING seats
+			  AND status = 'PENDING_PAYMENT'
+			RETURNING reservation_id, user_id, seats,
+			          jsonb_build_object('seats', seats, 'event_id', $2) AS audit_metadata
+		),
+		audited AS (
+			` + auditSQL + `
 		)
 		SELECT COALESCE((SELECT seats FROM updated), 0)
 	`
+
+	args := make([]any, 0, 9)
+	args = append(args, userID, eventID)
+	args = append(args, auditParams...)
+
 	var seats int
-	if err := pool.QueryRow(ctx, q, userID, eventID).Scan(&seats); err != nil {
+	if err := pool.QueryRow(ctx, q, args...).Scan(&seats); err != nil {
 		return 0, err
 	}
 	return seats, nil

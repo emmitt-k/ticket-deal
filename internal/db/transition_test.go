@@ -21,7 +21,7 @@ func TestIsValidTransition(t *testing.T) {
 		{StatusPendingPayment, StatusConfirmed, true},
 		{StatusPendingPayment, StatusExpired, true},
 		{StatusPendingPayment, StatusCancelled, true},
-		{StatusConfirmed, StatusCancelled, true},
+		{StatusConfirmed, StatusRefunded, true},
 
 		// No self-loops (would be a no-op transition; not in the spec)
 		{StatusPendingPayment, StatusPendingPayment, false},
@@ -37,9 +37,19 @@ func TestIsValidTransition(t *testing.T) {
 		{StatusCancelled, StatusExpired, false},
 		{StatusCancelled, StatusPendingPayment, false},
 
-		// CONFIRMED can only go to CANCELLED (refund-as-cancel)
+		// CONFIRMED can only go to REFUNDED (the money came back).
 		{StatusConfirmed, StatusPendingPayment, false},
 		{StatusConfirmed, StatusExpired, false},
+
+		// CONFIRMED -> CANCELLED is NOT an edge. It used to be one
+		// ("refund = cancel in our model"), but that conflated "never
+		// paid" with "paid and then refunded" — a refund is REFUNDED.
+		{StatusConfirmed, StatusCancelled, false},
+
+		// REFUNDED is terminal.
+		{StatusRefunded, StatusRefunded, false},
+		{StatusRefunded, StatusConfirmed, false},
+		{StatusRefunded, StatusCancelled, false},
 
 		// Illegal backward edges — no resurrection
 		{StatusConfirmed, StatusPendingPayment, false}, // duplicate assertion above, kept for readability
@@ -77,7 +87,7 @@ func TestTransitionStatus_RejectsInvalidTransition(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			changed, err := TransitionStatus(context.Background(), pool, id, tc.from, tc.to)
+			changed, err := TransitionStatus(context.Background(), pool, id, tc.from, tc.to, Audit{Actor: UserActor("test-user")})
 			require.Error(t, err, "TransitionStatus(%q, %q) should return an error", tc.from, tc.to)
 			require.ErrorIs(t, err, ErrInvalidTransition,
 				"caller should detect via errors.Is(err, ErrInvalidTransition)")
@@ -104,7 +114,7 @@ func TestTransitionStatus_HappyPath(t *testing.T) {
 
 	// Flip to EXPIRED.
 	changed, err := TransitionStatus(context.Background(), pool,
-		r.ReservationID, StatusPendingPayment, StatusExpired)
+		r.ReservationID, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed, "expected the CAS to flip the row from PENDING to EXPIRED")
 
@@ -132,13 +142,13 @@ func TestTransitionStatus_CASMiss(t *testing.T) {
 
 	// First call: actually flips it.
 	changed, err := TransitionStatus(context.Background(), pool,
-		r.ReservationID, StatusPendingPayment, StatusExpired)
+		r.ReservationID, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 
 	// Second call: row is in EXPIRED, not PENDING → CAS misses.
 	changed, err = TransitionStatus(context.Background(), pool,
-		r.ReservationID, StatusPendingPayment, StatusExpired)
+		r.ReservationID, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err, "CAS miss must NOT return an error — the row is in a valid status")
 	require.False(t, changed, "no rows should change on the second call")
 
@@ -157,7 +167,7 @@ func TestTransitionStatus_NonexistentRow(t *testing.T) {
 	id := uuid.NewString() // guaranteed unique
 
 	changed, err := TransitionStatus(context.Background(), pool,
-		id, StatusPendingPayment, StatusExpired)
+		id, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err, "nonexistent row is not an error")
 	require.False(t, changed)
 }

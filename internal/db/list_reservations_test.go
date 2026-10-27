@@ -80,7 +80,7 @@ func TestListReservationsByUser_StatusFilter(t *testing.T) {
 	require.NoError(t, InsertIfAbsent(context.Background(), pool, r2))
 
 	changed, err := TransitionStatus(context.Background(), pool,
-		r1.ReservationID, StatusPendingPayment, StatusExpired)
+		r1.ReservationID, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 

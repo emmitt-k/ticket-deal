@@ -78,7 +78,18 @@ func insertPendingReservation(t *testing.T, pool *db.Pool, eventID int64, userID
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(),
+		ctx := context.Background()
+		// The audit rows go first, and they need the purge escape hatch:
+		// reservation_events is append-only (migrations/005_audit_log.sql),
+		// so a plain DELETE is refused by the trigger. SET LOCAL scopes
+		// the override to this transaction only.
+		tx, txErr := pool.Begin(ctx)
+		if txErr == nil {
+			_, _ = tx.Exec(ctx, "SET LOCAL ticket_deal.audit_purge = 'on'")
+			_, _ = tx.Exec(ctx, "DELETE FROM reservation_events WHERE reservation_id = $1", id)
+			_ = tx.Commit(ctx)
+		}
+		_, _ = pool.Exec(ctx,
 			"DELETE FROM reservations WHERE reservation_id = $1", id)
 	})
 	return id
@@ -218,33 +229,64 @@ func TestCompensate_Idempotent(t *testing.T) {
 // same (user, event). Exactly one CAS wins; inventory only goes up by 1.
 // Same property as the SQS worker idempotency test, just on a
 // different code path.
+//
+// The race window is narrow (it needs two statements to take their
+// snapshot before the first one commits), so the scenario is repeated
+// over several rounds — one round catches a regression only sometimes,
+// several catch it reliably.
 func TestCompensate_Concurrent(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
 	const eID = int64(71006)
 	seedEvent(t, pool, eID)
-	uid := "concur-" + uuid.NewString()[:8]
 
 	require.NoError(t, rdb.Set(context.Background(),
 		redispkg.InventoryKey(eID), 0, 0).Err())
 	t.Cleanup(func() { rdb.Del(context.Background(), redispkg.InventoryKey(eID)) })
 
-	insertPendingReservation(t, pool, eID, uid, 1, time.Now().Add(10*time.Minute))
-
 	const N = 50
-	errCh := make(chan error, N)
-	for i := 0; i < N; i++ {
-		go func() {
-			errCh <- Compensate(context.Background(), pool, rdb, eID, uid)
-		}()
-	}
-	for i := 0; i < N; i++ {
-		require.NoError(t, <-errCh)
-	}
+	const rounds = 10
 
-	inv, err := rdb.Get(context.Background(), redispkg.InventoryKey(eID)).Int()
-	require.NoError(t, err)
-	require.Equal(t, 1, inv, "50 concurrent Compensate calls → 1 INCRBY (CAS winner)")
+	for round := 0; round < rounds; round++ {
+		uid := "concur-" + uuid.NewString()[:8]
+		rid := insertPendingReservation(t, pool, eID, uid, 1, time.Now().Add(10*time.Minute))
+		require.NoError(t, rdb.Set(context.Background(),
+			redispkg.InventoryKey(eID), 0, 0).Err())
+
+		// Start barrier: every goroutine begins its statement at the
+		// same instant, so they all take their snapshot BEFORE the
+		// first one commits. That is exactly the window where a
+		// missing compare-and-set in the UPDATE's WHERE clause lets
+		// two callers both flip the row — the second one's re-check
+		// after the first commit finds `reservation_id IN (target)`
+		// still true, because the status guard lives in the
+		// snapshot-evaluated CTE instead of in the UPDATE itself.
+		start := make(chan struct{})
+		errCh := make(chan error, N)
+		for i := 0; i < N; i++ {
+			go func() {
+				<-start
+				errCh <- Compensate(context.Background(), pool, rdb, eID, uid)
+			}()
+		}
+		close(start)
+		for i := 0; i < N; i++ {
+			require.NoError(t, <-errCh)
+		}
+
+		inv, err := rdb.Get(context.Background(), redispkg.InventoryKey(eID)).Int()
+		require.NoError(t, err)
+		require.Equal(t, 1, inv,
+			"round %d: 50 concurrent Compensate calls → 1 INCRBY (CAS winner)", round)
+
+		// And exactly one EXPIRED audit row. A double-flip would
+		// return the seats twice, INCRBY twice (overselling the event
+		// by one seat) and log the transition twice.
+		events, err := db.ListAuditEvents(context.Background(), pool, rid)
+		require.NoError(t, err)
+		require.Len(t, events, 2, "round %d: CREATED + exactly one EXPIRED", round)
+		require.Equal(t, db.AuditEventExpired, events[1].EventType)
+	}
 }
 
 // silence unused-import warning for fmt kept for any future debug helper.
