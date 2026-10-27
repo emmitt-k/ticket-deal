@@ -52,7 +52,7 @@ func TestAuditEventTypeForEdge_UnknownEdge(t *testing.T) {
 // refused BEFORE any SQL runs. The row must not change.
 func TestTransitionStatus_RequiresActor(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64001)
+	const eventID = int64(65001)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -77,7 +77,7 @@ func TestTransitionStatus_RequiresActor(t *testing.T) {
 // records a CREATED row naming the user as the actor.
 func TestInsertIfAbsent_WritesCreatedAuditRow(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64002)
+	const eventID = int64(65002)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -105,7 +105,7 @@ func TestInsertIfAbsent_WritesCreatedAuditRow(t *testing.T) {
 // insert that actually created the row.
 func TestInsertIfAbsent_Duplicate_NoSecondAuditRow(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64003)
+	const eventID = int64(65003)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -126,7 +126,7 @@ func TestInsertIfAbsent_Duplicate_NoSecondAuditRow(t *testing.T) {
 // new status, and the seat count in the metadata.
 func TestTransitionStatus_WritesAuditRow(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64004)
+	const eventID = int64(65004)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -157,7 +157,7 @@ func TestTransitionStatus_WritesAuditRow(t *testing.T) {
 // attempts.
 func TestTransitionStatus_CASMiss_NoAuditRow(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64005)
+	const eventID = int64(65005)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -191,7 +191,7 @@ func TestTransitionStatus_CASMiss_NoAuditRow(t *testing.T) {
 // no audit log at all.
 func TestTransitionStatus_RollsBackWhenAuditFails(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64006)
+	const eventID = int64(65006)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -219,7 +219,7 @@ func TestTransitionStatus_RollsBackWhenAuditFails(t *testing.T) {
 // survives alongside the transition's own fields.
 func TestTransitionStatus_MergesCallerMetadata(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64007)
+	const eventID = int64(65007)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -254,7 +254,7 @@ func TestTransitionStatus_MergesCallerMetadata(t *testing.T) {
 // refused by the trigger.
 func TestAuditLog_RejectsDelete(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64008)
+	const eventID = int64(65008)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -271,7 +271,7 @@ func TestAuditLog_RejectsDelete(t *testing.T) {
 // column except user_id (the GDPR anonymisation path).
 func TestAuditLog_RejectsHistoryRewrite(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64009)
+	const eventID = int64(65009)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -294,7 +294,7 @@ func TestAuditLog_RejectsHistoryRewrite(t *testing.T) {
 // anonymising the user id (Layer 3, item 14).
 func TestAuditLog_AllowsGDPRUserIDRewrite(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64010)
+	const eventID = int64(65010)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -329,7 +329,7 @@ func TestAuditRow_CarriesTraceID(t *testing.T) {
 	})
 
 	pool := newTestPool(t)
-	const eventID = int64(64011)
+	const eventID = int64(65011)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -354,7 +354,7 @@ func TestAuditRow_CarriesTraceID(t *testing.T) {
 // a made-up value.
 func TestAuditRow_NoTraceIDWithoutSpan(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64012)
+	const eventID = int64(65012)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -374,7 +374,7 @@ func TestAuditRow_NoTraceIDWithoutSpan(t *testing.T) {
 // they happened (event_id is the insertion order).
 func TestListAuditEvents_Chronological(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(64013)
+	const eventID = int64(65013)
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)

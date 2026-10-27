@@ -189,6 +189,22 @@ func expireRowIfPending(ctx context.Context, pool *db.Pool,
 	}
 
 	// $1/$2 are the target lookup; $3..$9 are the audit row.
+	//
+	// The `status = 'PENDING_PAYMENT'` guard is repeated in the
+	// UPDATE's own WHERE clause, and it has to be. The `target` CTE is
+	// evaluated against the statement's SNAPSHOT — it is not re-read
+	// when a concurrent transaction commits. So without the guard in
+	// the UPDATE, two concurrent Compensate calls can both list the
+	// row in their `target`, both block on the row lock, and after the
+	// first one commits, the second one's UPDATE re-check finds
+	// `reservation_id IN (target)` still true (the id didn't change) —
+	// so it flips the row a SECOND time and INCRBYs the seat again.
+	// Inventory ends up one seat too high: a silent oversell.
+	//
+	// With the guard in the UPDATE, the re-check runs against the NEW
+	// row version, sees status='EXPIRED', and skips it. Exactly one
+	// caller wins. This is the same compare-and-set shape as
+	// db.TransitionStatus (`WHERE reservation_id = $2 AND status = $3`).
 	q := `
 		WITH target AS (
 			SELECT reservation_id, seats FROM reservations
@@ -200,6 +216,7 @@ func expireRowIfPending(ctx context.Context, pool *db.Pool,
 			UPDATE reservations
 			SET status = 'EXPIRED', updated_at = NOW()
 			WHERE reservation_id IN (SELECT reservation_id FROM target)
+			  AND status = 'PENDING_PAYMENT'
 			RETURNING reservation_id, user_id, seats,
 			          jsonb_build_object('seats', seats, 'event_id', $2) AS audit_metadata
 		),
