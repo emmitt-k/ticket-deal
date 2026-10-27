@@ -80,7 +80,7 @@
   33. Refunds
   34. The state machine's new edges
   35. The failure matrix
-- **Part 8 — Open questions**
+- **Part 8 — Decisions**
 - **Appendix A — Setup checklist**
 - **Appendix B — Test card numbers**
 - **Appendix C — Local testing recipes**
@@ -610,6 +610,9 @@ Part 7 §31 covers this.
 
 ## 17. Returning 2xx fast
 
+> **Decided:** async — publish to the `stripe-events` queue, then return 200.
+> See Part 8, decision 1.
+
 > *"Your endpoint must quickly return a successful code (2xx) before any
 > complex logic that might cause a timeout. For example, you must return a 200
 > response before updating a customer's invoice as paid in your accounting
@@ -882,6 +885,8 @@ r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB
 ```
 
 ## 23. Testing locally with the Stripe CLI
+
+> **Decided:** yes — a `stripe-listen` Makefile target. See Part 8, decision 3.
 
 This is the tool that makes the whole thing tractable. It sits between Stripe
 and your localhost, forwarding real signed events.
@@ -1213,6 +1218,8 @@ event is representable, and the payment layer is where that gets rejected.
 
 ## 29. The config
 
+> **Decided:** Stripe is **not** a `/readyz` dependency. See Part 8, decision 3.
+
 Following the existing `config.Load()` pattern — validated at startup,
 fail-fast:
 
@@ -1282,6 +1289,10 @@ already covers `.env` — verify it covers `.env.docker`.
 
 ## 30. The routes
 
+> **Decided:** the table is `payment_intents`, with a nullable
+> `stripe_payment_intent_id` and `reservation_id` as Stripe's idempotency key.
+> See Part 8, decision 2.
+
 Two new routes, per the roadmap:
 
 ```
@@ -1347,6 +1358,9 @@ the "already exists" path. With the nullable retry above that's recoverable;
 without it, the reservation is bricked. Another argument for nullable.
 
 ## 31. The webhook handler, end to end
+
+> **Decided:** async — the handler verifies, publishes to `stripe-events`, and
+> returns 200. See Part 8, decision 1.
 
 This is the heart of Layer 2. Recommended shape:
 
@@ -1526,6 +1540,9 @@ refund needs a Charge ID and by then the webhook may be days old.
 
 ## 34. The state machine's new edges
 
+> **Decided:** the cancel-vs-webhook race alerts for manual handling — it does
+> not auto-refund. See Part 8, decision 4.
+
 Verified current table in `internal/db/transition.go`:
 
 ```go
@@ -1625,32 +1642,86 @@ unsubscribed event it receives forever. `200` + log.
 
 ---
 
-# Part 8 — Open questions
+# Part 8 — Decisions
 
-Consolidated so these get decided rather than discovered:
+Consolidated so these get decided rather than discovered. **All decided.**
+Each decision is followed by the reasoning, because the reasoning is what
+survives if the decision is revisited later.
 
-1. **Sync or async webhook processing?** (§17, §31) — Async reuses the SQS
-   plumbing and keeps the handler trivially fast. Sync is simpler and avoids a
-   new failure mode (event accepted but SQS publish failed).
-2. **Table name.** `payment_intents` (roadmap fidelity) vs
-   `reservation_payments` (avoids shadowing the Stripe concept).
-3. **Nullable `stripe_payment_intent_id`** to survive a crash between INSERT
-   and Stripe `Create`. (§30)
-4. **Stripe in `/readyz` or not?** (§29) — leaning no; metric + alert instead.
-5. **Add a `stripe-listen` Makefile target?** (§23)
-6. **Auto-refund on the cancel-vs-webhook race, or alert for manual handling?**
-   (§34 race 2) — leaning alert, because auto-refund on a race condition is
-   its own class of bug.
-7. ~~**Price source** — hardcode in seed, or add `price_cents` to `events`? (§28)~~
-   **RESOLVED:** `events.price_cents` + `events.currency`, with the reservation
-   snapshotting them at hold time (`007_event_price.sql`).
-8. **Sync webhook or SQS — and if SQS, a new queue or the existing one?**
-   (§17) The roadmap reserves `reservations-notifications` for item 8, so a
-   third queue `stripe-events` may be warranted.
-9. **`EventType` constants vs string literals** — v82 has typed constants
-   (`stripe.EventTypePaymentIntentSucceeded`), verified. Use them, but note the
-   thin-event type names (`v1.billing...`) have no constants, so a mixed setup
-   would be inconsistent. We chose snapshot in §14, so this is fine.
+## 1. Async webhook processing, on a third queue — `stripe-events` ✅
+
+`POST /webhooks/stripe` verifies the signature, publishes to a **new** SQS
+queue `stripe-events`, and returns 200. A new worker consumes it.
+
+*Why:* consistent with the architecture the whole project already uses
+(reserve → SQS → worker), and the trace propagation comes free via the
+`_traceparent` pattern already proven in the queue. The handler stays trivially
+fast, which matters against Stripe's webhook timeout.
+
+*The failure mode this design has to get right:* "event accepted but the
+publish failed". The fix is ordering — **publish first, then return 200** — and
+returning 5xx when the publish fails, so Stripe retries the delivery. The
+window where an event is lost is the window between "we said 200" and "the
+event is durable", and the publish happens before the 200, so there isn't one.
+
+*Why a third queue and not the existing one:* the roadmap reserves
+`reservations-notifications` for item 8, and a queue that carries unrelated
+message types needs a type switch in the consumer. Three queues, three
+concerns.
+
+## 2. `payment_intents`, with a nullable `stripe_payment_intent_id` ✅
+
+One row per reservation. `reservation_id UNIQUE`. `stripe_payment_intent_id`
+is **nullable** — it has to be, because the row is written before Stripe's
+`Create` returns.
+
+*Why nullable:* the row is inserted first (so the intent is durable before we
+call Stripe), then updated with the id. A crash in between leaves a row with no
+id. Nullable is the honest representation of that intermediate state.
+
+*And the idempotency key closes the window for real:* **use `reservation_id` as
+Stripe's own idempotency key.** A retried `Create` then returns the *same*
+PaymentIntent instead of creating a second one. Without this, the crash window
+is a double-charge; with it, the crash window is a retry that converges.
+
+## 3. Stripe is **not** a `/readyz` dependency; but yes to a `stripe-listen` target ✅
+
+`/readyz` stays at three checks (Redis / Postgres / SQS) — the dependencies the
+**reserve** path needs. A Stripe outage should not pull the API out of
+rotation: you can still take reservations and hold seats while Stripe is down.
+
+*Why not:* `/readyz` answers "should this process receive traffic", and the
+traffic it should keep receiving is reservations. Stripe is needed by the
+**pay** path only. So Stripe gets a metric and an alert instead — a
+`stripe_webhook_failures_total` counter and an alert on it, rather than a
+readiness gate that would take the whole API offline for a third-party outage.
+
+*Yes to `stripe-listen`:* a Makefile target that runs the Stripe CLI against
+the local webhook endpoint. It is how webhooks get tested locally without
+anyone installing the CLI by hand.
+
+## 4. The cancel-vs-webhook race: **alert, don't auto-refund** ✅
+
+The user cancels while Stripe's `payment_intent.succeeded` webhook is in
+flight. We detect it, emit a metric, and log it for a human — we do **not**
+automatically refund.
+
+*Why:* auto-refunding on a race is its own class of bug. Money moves on a path
+that did not reason about idempotency, partial refunds, or which party actually
+owns the seat. And the audit trail then has to explain a refund nobody asked
+for. A human decides; the system tells them clearly that it happened.
+
+## 5. Typed `EventType` constants ✅
+
+Use `stripe.EventTypePaymentIntentSucceeded` and friends. The thin-event type
+names (`v1.billing...`) have no constants, but §14 settled on *snapshot* events
+— we store the fields we need — so the mixed setup never arises.
+
+## 6. Price source ✅ (settled with the price change)
+
+`events.price_cents` + `events.currency`, with the reservation snapshotting
+them at hold time (`migrations/007_event_price.sql`). The PaymentIntent amount
+is `unit_price_cents × seats` — the server's number, never the client's.
 
 ---
 

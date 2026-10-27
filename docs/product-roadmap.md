@@ -290,15 +290,25 @@ The audit row has the OTel `trace_id` so an ops person can paste it into Grafana
 > **This is the next item.** Layer 1 is 5/5 and item 6 is shipped, so item 7 is
 > the only thing between the current system and a product that takes money.
 >
-> **Before writing code**, settle the **eight open decisions** in Part 8 of
-> [`comprehensive-stripe.md`](./comprehensive-stripe.md) — a 35-section
-> reference built from Stripe's own docs: sync vs async webhook processing, the
-> table name (`payment_intents` vs `reservation_payments`), a nullable
-> `stripe_payment_intent_id`, whether Stripe belongs in `/readyz`, a
-> `stripe-listen` Makefile target, auto-refund vs alert on the cancel-vs-webhook
-> race, which queue carries Stripe events, and typed `EventType` constants vs
-> string literals. Deciding them up front is cheaper than discovering them
-> half-way through.
+> **The decisions are made** — Part 8 of
+> [`comprehensive-stripe.md`](./comprehensive-stripe.md) is now a decision log
+> rather than a list of open questions:
+>
+> - **Async**, on a third SQS queue `stripe-events` — the webhook verifies,
+>   publishes, then returns 200. Consistent with the architecture the project
+>   already uses, and the trace propagation comes free.
+> - **`payment_intents`**, one row per reservation, `reservation_id UNIQUE`,
+>   `stripe_payment_intent_id` **nullable** — and `reservation_id` is Stripe's
+>   own idempotency key, so a crash between our INSERT and Stripe's `Create`
+>   converges on a retry instead of double-charging.
+> - **Stripe is not a `/readyz` dependency** (it would take the API out of
+>   rotation for a third-party outage) — a metric and an alert instead. But
+>   **yes** to a `stripe-listen` Makefile target for local testing.
+> - **The cancel-vs-webhook race alerts for manual handling** — it does not
+>   auto-refund. Money should not move on a path that didn't reason about
+>   idempotency and partial refunds.
+> - **Typed `EventType` constants**, and the price comes from the reservation's
+>   snapshot (already shipped).
 >
 > **Migration numbering:** the Stripe doc sketches `005_stripe_payments.sql`.
 > That number is taken — the audit log is 005, and `006_refunded_status.sql` +
