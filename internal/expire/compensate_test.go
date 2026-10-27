@@ -78,7 +78,18 @@ func insertPendingReservation(t *testing.T, pool *db.Pool, eventID int64, userID
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(),
+		ctx := context.Background()
+		// The audit rows go first, and they need the purge escape hatch:
+		// reservation_events is append-only (migrations/005_audit_log.sql),
+		// so a plain DELETE is refused by the trigger. SET LOCAL scopes
+		// the override to this transaction only.
+		tx, txErr := pool.Begin(ctx)
+		if txErr == nil {
+			_, _ = tx.Exec(ctx, "SET LOCAL ticket_deal.audit_purge = 'on'")
+			_, _ = tx.Exec(ctx, "DELETE FROM reservation_events WHERE reservation_id = $1", id)
+			_ = tx.Commit(ctx)
+		}
+		_, _ = pool.Exec(ctx,
 			"DELETE FROM reservations WHERE reservation_id = $1", id)
 	})
 	return id
