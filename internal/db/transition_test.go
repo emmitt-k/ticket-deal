@@ -77,7 +77,7 @@ func TestTransitionStatus_RejectsInvalidTransition(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			changed, err := TransitionStatus(context.Background(), pool, id, tc.from, tc.to)
+			changed, err := TransitionStatus(context.Background(), pool, id, tc.from, tc.to, Audit{Actor: UserActor("test-user")})
 			require.Error(t, err, "TransitionStatus(%q, %q) should return an error", tc.from, tc.to)
 			require.ErrorIs(t, err, ErrInvalidTransition,
 				"caller should detect via errors.Is(err, ErrInvalidTransition)")
@@ -104,7 +104,7 @@ func TestTransitionStatus_HappyPath(t *testing.T) {
 
 	// Flip to EXPIRED.
 	changed, err := TransitionStatus(context.Background(), pool,
-		r.ReservationID, StatusPendingPayment, StatusExpired)
+		r.ReservationID, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed, "expected the CAS to flip the row from PENDING to EXPIRED")
 
@@ -132,13 +132,13 @@ func TestTransitionStatus_CASMiss(t *testing.T) {
 
 	// First call: actually flips it.
 	changed, err := TransitionStatus(context.Background(), pool,
-		r.ReservationID, StatusPendingPayment, StatusExpired)
+		r.ReservationID, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err)
 	require.True(t, changed)
 
 	// Second call: row is in EXPIRED, not PENDING → CAS misses.
 	changed, err = TransitionStatus(context.Background(), pool,
-		r.ReservationID, StatusPendingPayment, StatusExpired)
+		r.ReservationID, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err, "CAS miss must NOT return an error — the row is in a valid status")
 	require.False(t, changed, "no rows should change on the second call")
 
@@ -157,7 +157,7 @@ func TestTransitionStatus_NonexistentRow(t *testing.T) {
 	id := uuid.NewString() // guaranteed unique
 
 	changed, err := TransitionStatus(context.Background(), pool,
-		id, StatusPendingPayment, StatusExpired)
+		id, StatusPendingPayment, StatusExpired, Audit{Actor: UserActor("test-user")})
 	require.NoError(t, err, "nonexistent row is not an error")
 	require.False(t, changed)
 }
