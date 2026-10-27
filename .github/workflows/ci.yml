@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # ANY base branch, not just `main`. This repo uses STACKED branches
+  # (a feature branch based on the previous feature branch), so a PR
+  # whose base is `feature/…` must get CI too. Filtering on `main` here
+  # meant a stacked PR ran NO checks at all — and no check means no
+  # required status check can be satisfied on it.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
