@@ -47,41 +47,44 @@ const maxIdempotencyKeyLen = 255
 // ReserveHandler limits POST /api/tickets/reserve.
 //
 // Auth:        middleware has already verified the JWT and injected
-//              *auth.Claims into the request context. We trust those
-//              claims as the single source of identity — no body field
-//              for user_id or event_id (they'd be attack vectors: a stale
-//              token for event 1 plus a body saying event 2 would be
-//              a privilege escalation if we cross-checked loosely).
+//
+//	*auth.Claims into the request context. We trust those
+//	claims as the single source of identity — no body field
+//	for user_id or event_id (they'd be attack vectors: a stale
+//	token for event 1 plus a body saying event 2 would be
+//	a privilege escalation if we cross-checked loosely).
 //
 // Body:        { "seats_requested": N }    (optional, default 1, max 10)
 //
 // Idempotency-Key (optional):
-//              Clients MAY send `Idempotency-Key: <token>` to make
-//              retries safe. Layer 1 item 5 of docs/product-roadmap.md.
-//              Behaviour:
-//                - First call with a given key: fresh reserve, then
-//                  cache the 200 response under the key for 24 h.
-//                - Retry with same key + same body: cached 200 returned
-//                  with `Idempotency-Replayed: true` header.
-//                - Same key + DIFFERENT body: 409 idempotency_key_mismatch.
-//                - Two parallel retries: only one runs the reserve;
-//                  the other gets 409 in_flight.
-//              idempotency may be nil; in that case the header is
-//              ignored (the handler still works). main.go wires a
-//              real one; tests pass nil for the simple cases.
+//
+//	Clients MAY send `Idempotency-Key: <token>` to make
+//	retries safe. Layer 1 item 5 of docs/product-roadmap.md.
+//	Behaviour:
+//	  - First call with a given key: fresh reserve, then
+//	    cache the 200 response under the key for 24 h.
+//	  - Retry with same key + same body: cached 200 returned
+//	    with `Idempotency-Replayed: true` header.
+//	  - Same key + DIFFERENT body: 409 idempotency_key_mismatch.
+//	  - Two parallel retries: only one runs the reserve;
+//	    the other gets 409 in_flight.
+//	idempotency may be nil; in that case the header is
+//	ignored (the handler still works). main.go wires a
+//	real one; tests pass nil for the simple cases.
 //
 // Status codes:
-//   200 { reservation_id, expires_in }                seat reserved
-//   200 Idempotency-Replayed: true                    cached replay
-//   400 invalid_request                               bad seats_requested
-//   400 invalid_idempotency_key                       key format / length
-//   401 missing_claims                                middleware not run (defensive)
-//   404 event_not_found                               inventory key missing
-//   409 sold_out                                      no seats remain
-//   409 already_holding                               user already has one
-//   409 in_flight                                     concurrent retry on same key
-//   409 idempotency_key_mismatch                      same key, different body
-//   500 internal_error                                Redis or marshal failure
+//
+//	200 { reservation_id, expires_in }                seat reserved
+//	200 Idempotency-Replayed: true                    cached replay
+//	400 invalid_request                               bad seats_requested
+//	400 invalid_idempotency_key                       key format / length
+//	401 missing_claims                                middleware not run (defensive)
+//	404 event_not_found                               inventory key missing
+//	409 sold_out                                      no seats remain
+//	409 already_holding                               user already has one
+//	409 in_flight                                     concurrent retry on same key
+//	409 idempotency_key_mismatch                      same key, different body
+//	500 internal_error                                Redis or marshal failure
 //
 // Phase 5 publishes the reservation event via ReservationPublisher
 // (currently a log-only LogPublisher). Phase 6 swaps the publisher

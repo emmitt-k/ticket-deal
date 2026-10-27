@@ -37,8 +37,8 @@ import (
 // admissionChannels is the registry of live SSE goroutines waiting for promotion.
 // Key: "eventID:userID", Value: chan string (delivers JWT on admission).
 var admissionChannels = struct {
-	mu  sync.RWMutex
-	ch  map[string]chan string
+	mu sync.RWMutex
+	ch map[string]chan string
 }{
 	ch: make(map[string]chan string),
 }

@@ -140,7 +140,9 @@ func TestReadyZ_SQSFailure(t *testing.T) {
 	rec, body := doReadyZ(ReadinessChecks{
 		Redis:    func(ctx context.Context) error { return nil },
 		Postgres: func(ctx context.Context) error { return nil },
-		SQS:      func(ctx context.Context) error { return errors.New("operation error SQS: GetQueueAttributes: 500 Internal Server Error") },
+		SQS: func(ctx context.Context) error {
+			return errors.New("operation error SQS: GetQueueAttributes: 500 Internal Server Error")
+		},
 	})
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	require.Equal(t, "ok", body["redis"])
@@ -204,7 +206,7 @@ func TestReadyZ_PerCheckTimeoutEnforced(t *testing.T) {
 // Validates the wiring of `redis.Ping(ctx, rdb)` + `pool.Ping(ctx)`
 // doesn't crash, panic, or hang.
 func TestReadyZ_RealRedisAndPostgres_OK(t *testing.T) {
-	rdb := newTestClient(t) // skips when Redis unavailable
+	rdb := newTestClient(t)   // skips when Redis unavailable
 	pool := apiNewTestPool(t) // skips when Postgres unavailable
 
 	rec, body := doReadyZ(ReadinessChecks{

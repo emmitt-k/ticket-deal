@@ -62,8 +62,8 @@ type ConsumerConfig struct {
 //   - ctx.Done() returns true      → returns ctx.Err()
 //   - handler returns nil          → message deleted, loop continues
 //   - handler returns non-nil err  → message left visible, loop
-//                                    continues (logs at the call site
-//                                    so we don't spam the same error)
+//     continues (logs at the call site
+//     so we don't spam the same error)
 //   - ReceiveMessage itself errors → logs, sleeps 1 s, retries
 //
 // Poll blocks until ctx is cancelled. The cmd/worker binary runs it

@@ -17,19 +17,19 @@
 //
 // Hot path:
 //
-//   POST /reserve (API)
-//     → Redis Lua reserve (hold key, decrement inventory)
-//     → SQSPublisher.SendReservation (Phase 6)
-//     → 200 to client
+//	POST /reserve (API)
+//	  → Redis Lua reserve (hold key, decrement inventory)
+//	  → SQSPublisher.SendReservation (Phase 6)
+//	  → 200 to client
 //
-//   SQS message (this binary)
-//     ↳ queue.Poll receives via long-poll
-//     ↳ db.InsertIfAbsent writes Postgres row (ON CONFLICT DO NOTHING)
-//     ↳ DeleteMessage on success
+//	SQS message (this binary)
+//	  ↳ queue.Poll receives via long-poll
+//	  ↳ db.InsertIfAbsent writes Postgres row (ON CONFLICT DO NOTHING)
+//	  ↳ DeleteMessage on success
 //
-//   hold:event:<id>:user:<user>  TTL expires (Phase 7)
-//     ↳ SIDE: RunSweep goroutine picks up the row on a ticker
-//     ↳ expire.Compensate: row flipped + inventory incremented
+//	hold:event:<id>:user:<user>  TTL expires (Phase 7)
+//	  ↳ SIDE: RunSweep goroutine picks up the row on a ticker
+//	  ↳ expire.Compensate: row flipped + inventory incremented
 //
 // At-least-once delivery + idempotent INSERT = effectively-once
 // durable state.
@@ -202,10 +202,10 @@ func run() error {
 	})
 
 	err = queue.Poll(ctx, queue.ConsumerConfig{
-		Client:                  sqsClient,
-		QueueURL:                cfg.SQSQueueURL,
-		MaxMessages:             10,
-		WaitTimeSeconds:         int32(cfg.WorkerLongPollSeconds),
+		Client:                   sqsClient,
+		QueueURL:                 cfg.SQSQueueURL,
+		MaxMessages:              10,
+		WaitTimeSeconds:          int32(cfg.WorkerLongPollSeconds),
 		VisibilityTimeoutSeconds: int32(cfg.VisibilityTimeoutSeconds),
 	}, handler)
 
@@ -286,14 +286,14 @@ func handleMessage(ctx context.Context, pool *db.Pool, raw []byte) error {
 // isolation — e.g. for a manual `go run ./cmd/worker` smoke test in
 // any environment where DATABASE_URL and SQS_QUEUE_URL are set.
 type config struct {
-	DatabaseURL            string
-	SQSQueueURL            string
-	SQSRegion              string
-	SQSEndpointURL         string // local path
+	DatabaseURL              string
+	SQSQueueURL              string
+	SQSRegion                string
+	SQSEndpointURL           string // local path
 	VisibilityTimeoutSeconds int
-	WorkerLongPollSeconds  int
-	RedisAddr              string        // Phase 7: needed by the sweep goroutine
-	SweepInterval          time.Duration // Phase 7: how often to scan for expired rows
+	WorkerLongPollSeconds    int
+	RedisAddr                string        // Phase 7: needed by the sweep goroutine
+	SweepInterval            time.Duration // Phase 7: how often to scan for expired rows
 }
 
 func loadConfig() (*config, error) {
@@ -305,14 +305,14 @@ func loadConfig() (*config, error) {
 	_ = godotenv.Load()
 
 	c := &config{
-		DatabaseURL:             getEnv("DATABASE_URL", ""),
-		SQSQueueURL:             getEnv("SQS_QUEUE_URL", ""),
-		SQSRegion:               getEnv("AWS_REGION", "us-east-1"),
-		SQSEndpointURL:          getEnv("SQS_ENDPOINT_URL", ""),
+		DatabaseURL:              getEnv("DATABASE_URL", ""),
+		SQSQueueURL:              getEnv("SQS_QUEUE_URL", ""),
+		SQSRegion:                getEnv("AWS_REGION", "us-east-1"),
+		SQSEndpointURL:           getEnv("SQS_ENDPOINT_URL", ""),
 		VisibilityTimeoutSeconds: atoiOr(getEnv("SQS_VISIBILITY_TIMEOUT_SECONDS", "30"), 30),
-		WorkerLongPollSeconds:   atoiOr(getEnv("WORKER_LONG_POLL_SECONDS", "20"), 20),
-		RedisAddr:               getEnv("REDIS_ADDR", "localhost:6379"),
-		SweepInterval:           sweepIntervalOr(getEnv("SWEEP_INTERVAL_SECONDS", "60"), 60*time.Second),
+		WorkerLongPollSeconds:    atoiOr(getEnv("WORKER_LONG_POLL_SECONDS", "20"), 20),
+		RedisAddr:                getEnv("REDIS_ADDR", "localhost:6379"),
+		SweepInterval:            sweepIntervalOr(getEnv("SWEEP_INTERVAL_SECONDS", "60"), 60*time.Second),
 	}
 	if c.DatabaseURL == "" {
 		return nil, errors.New("DATABASE_URL is required")

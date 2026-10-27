@@ -35,7 +35,8 @@ type AdmissionResult struct {
 //	E.g. 10 = 10 users/sec once the bucket is drained.
 //
 // QueueTTLSeconds: auto-cleanup window for abandoned queue entries.
-//   Prevents unbounded growth from disconnected users.
+//
+//	Prevents unbounded growth from disconnected users.
 type WaitRoomConfig struct {
 	EventID         int64
 	Capacity        int
@@ -45,14 +46,14 @@ type WaitRoomConfig struct {
 
 // bucketKey returns the bucket state key for an event.
 //
-//   "bucket:event:42"
+//	"bucket:event:42"
 func bucketKey(eventID int64) string {
 	return fmt.Sprintf("bucket:event:%d", eventID)
 }
 
 // queueKey returns the queue key for an event.
 //
-//   "queue:event:42"
+//	"queue:event:42"
 func queueKey(eventID int64) string {
 	return fmt.Sprintf("queue:event:%d", eventID)
 }

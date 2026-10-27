@@ -82,17 +82,17 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 
 		if result.Admitted {
 			// ── Admitted: mint JWT ───────────────────────────────────
-		token, err := auth.Issue(req.UserID, req.EventID, cfg.JWTSecret, 2*time.Minute)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "Issue failed",
-				"user", req.UserID,
-				"event", req.EventID,
-				"error", err,
-			)
-			apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
-				"failed to issue token, try again")
-			return
-		}
+			token, err := auth.Issue(req.UserID, req.EventID, cfg.JWTSecret, 2*time.Minute)
+			if err != nil {
+				slog.ErrorContext(r.Context(), "Issue failed",
+					"user", req.UserID,
+					"event", req.EventID,
+					"error", err,
+				)
+				apiutil.WriteError(w, http.StatusInternalServerError, "internal_error",
+					"failed to issue token, try again")
+				return
+			}
 			apiutil.WriteJSON(w, http.StatusOK, map[string]any{
 				"token":      token,
 				"expires_in": 120, // seconds
@@ -120,9 +120,9 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 
 		eta := etaSeconds(pos, cfg.WaitRoom.RefillRate)
 		apiutil.WriteJSON(w, http.StatusTooManyRequests, map[string]any{
-			"queue_url":    fmt.Sprintf("/api/tickets/queue?event_id=%d&user_id=%s", req.EventID, req.UserID),
-			"position":     pos,
-			"eta_seconds":  eta,
+			"queue_url":   fmt.Sprintf("/api/tickets/queue?event_id=%d&user_id=%s", req.EventID, req.UserID),
+			"position":    pos,
+			"eta_seconds": eta,
 			"message":     "event is at capacity, you are in the queue",
 		})
 	}

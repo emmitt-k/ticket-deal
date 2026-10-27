@@ -45,8 +45,8 @@ func StartDrainer(ctx context.Context, cfg DrainerConfig) func() {
 	// active tracks the set of eventIDs that currently have a drain loop running.
 	// Access is protected by the mutex.
 	var (
-		active   map[int64]struct{} = make(map[int64]struct{})
-		mu       sync.Mutex
+		active    map[int64]struct{} = make(map[int64]struct{})
+		mu        sync.Mutex
 		cancelFns = make(map[int64]context.CancelFunc)
 		wg        sync.WaitGroup
 	)

@@ -13,12 +13,12 @@
 //
 // Per the spec:
 //
-//   1. Each check has a short timeout (~500ms). Long enough for a
-//      healthy dep on a cold day, short enough that the K8s readiness
-//      probe (typically 1 s) responds before our check times out.
-//   2. Checks run in PARALLEL so one slow dep doesn't block the others.
-//   3. Response is a JSON object naming each check + a top-level
-//      "ready" boolean. 200 if true, 503 if false.
+//  1. Each check has a short timeout (~500ms). Long enough for a
+//     healthy dep on a cold day, short enough that the K8s readiness
+//     probe (typically 1 s) responds before our check times out.
+//  2. Checks run in PARALLEL so one slow dep doesn't block the others.
+//  3. Response is a JSON object naming each check + a top-level
+//     "ready" boolean. 200 if true, 503 if false.
 //
 // Dev-mode SQS: when main.go hasn't wired a queue (LogPublisher is
 // the publisher), the SQS check is nil → handler reports sqs:
@@ -86,9 +86,9 @@ type readyZResponse struct {
 //
 // Wiring responsibilities (in cmd/api/main.go):
 //
-//   Redis check:    func(ctx) error { return redis.Ping(ctx, rdb) }
-//   Postgres check: func(ctx) error { return pool.Ping(ctx) }
-//   SQS check:      publisher.Ping  (or nil for dev/LogPublisher mode)
+//	Redis check:    func(ctx) error { return redis.Ping(ctx, rdb) }
+//	Postgres check: func(ctx) error { return pool.Ping(ctx) }
+//	SQS check:      publisher.Ping  (or nil for dev/LogPublisher mode)
 //
 // Returns 200 + `{ready: true, ...}` when every check is "ok" or
 // "not_configured". Returns 503 + `{ready: false, ...}` otherwise.

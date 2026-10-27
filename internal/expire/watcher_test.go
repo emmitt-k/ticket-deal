@@ -37,13 +37,13 @@ func TestParseHoldKey_Valid(t *testing.T) {
 // aren't hold keys. Must be filtered out, not panicked on.
 func TestParseHoldKey_NotHold(t *testing.T) {
 	tests := []string{
-		"inventory:event:42",          // the inventory counter
-		"wait:queue:event:42",         // waiting-room zset
-		"token_bucket:ip:1.2.3.4",     // IP-limit bucket
-		"",                            // empty
-		"hold",                        // truncated
-		"hold:event",                 // truncated
-		"hold:other:42:user:u1",      // wrong prefix part
+		"inventory:event:42",      // the inventory counter
+		"wait:queue:event:42",     // waiting-room zset
+		"token_bucket:ip:1.2.3.4", // IP-limit bucket
+		"",                        // empty
+		"hold",                    // truncated
+		"hold:event",              // truncated
+		"hold:other:42:user:u1",   // wrong prefix part
 	}
 	for _, key := range tests {
 		t.Run(key, func(t *testing.T) {

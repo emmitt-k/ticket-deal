@@ -17,7 +17,7 @@ import (
 // TestInjectExtractRoundtrip verifies the trace context set on ctx
 // survives an SQS roundtrip:
 //
-//   ctx → InjectTraceContext → SQS input → SQS msg → ExtractTraceContext → ctx
+//	ctx → InjectTraceContext → SQS input → SQS msg → ExtractTraceContext → ctx
 //
 // The trace_id MUST be the same on both sides. If it isn't, the worker's
 // span will be a disconnected root and the end-to-end waterfall breaks.
@@ -58,8 +58,8 @@ func TestInjectExtractRoundtrip(t *testing.T) {
 	// real SQS client in the test, so we just turn the input back into
 	// a types.Message (which is what ReceiveMessage returns).
 	msg := types.Message{
-		MessageId:     aws.String("test-msg-id"),
-		Body:          input.MessageBody,
+		MessageId:         aws.String("test-msg-id"),
+		Body:              input.MessageBody,
 		MessageAttributes: input.MessageAttributes,
 	}
 	extractedCtx := ExtractTraceContext(context.Background(), msg)
