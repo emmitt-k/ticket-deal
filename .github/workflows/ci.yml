@@ -46,7 +46,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U tickets -d tickets"
+          --health-cmd "pg_isready -h 127.0.0.1 -U tickets -d tickets"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
@@ -267,10 +267,24 @@ jobs:
       - name: Apply migrations
         run: |
           docker compose --env-file .env.docker up -d postgres
-          for i in $(seq 1 30); do
-            docker exec ticket-postgres pg_isready -U tickets -d tickets >/dev/null 2>&1 && break
-            sleep 1
+          # Wait until the DATABASE is queryable, not merely until the
+          # server answers. During the image's init phase the server
+          # listens on the Unix socket only, so pg_isready succeeds
+          # before the `tickets` database exists — and the first
+          # migration would fail with 'database "tickets" does not
+          # exist'. That is exactly how this job failed the first time.
+          for i in $(seq 1 60); do
+            if docker exec ticket-postgres psql -U tickets -d tickets -c "SELECT 1" >/dev/null 2>&1; then
+              echo "✓ postgres is ready"
+              break
+            fi
+            echo "waiting for postgres ($i)…"
+            sleep 2
           done
+          docker exec ticket-postgres psql -U tickets -d tickets -c "SELECT 1" >/dev/null 2>&1 || {
+            echo "::error::postgres never became usable"
+            exit 1
+          }
           if docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
                "SELECT 1 FROM information_schema.tables WHERE table_name='reservations'" \
                | grep -q 1; then
