@@ -55,8 +55,9 @@ The three phases, in one line each:
 
 ## API Surface
 
-Nine routes. Everything under `/api/reservations` and `/api/me` requires a JWT from
-`/enter`; the waiting-room and health routes are open.
+Fifteen routes. Everything under `/api/reservations` and `/api/me` requires a JWT from
+`/enter`; the waiting-room and health routes are open; the `/admin` tree is
+HMAC-signed (see below).
 
 | Method | Route | Auth | Purpose |
 |---|---|---|---|
@@ -69,12 +70,18 @@ Nine routes. Everything under `/api/reservations` and `/api/me` requires a JWT f
 | `GET` | `/api/reservations/{id}` | JWT | Fetch one reservation |
 | `GET` | `/api/me/reservations` | JWT | List your reservations |
 | `POST` | `/api/reservations/{id}/cancel` | JWT | Cancel a `PENDING_PAYMENT` reservation |
+| `POST` | `/api/reservations/{id}/pay` | JWT | Create the Stripe PaymentIntent; returns the `client_secret` |
+| `POST` | `/webhooks/stripe` | Stripe signature | Stripe's callback. Verifies, snapshots, queues — no state change here |
+| `GET` | `/admin/reservations/lookup?user_id=` | HMAC | Support lookup — a user's reservations |
+| `GET` | `/admin/reservations/{id}` | HMAC | Support lookup — one reservation |
+| `POST` | `/admin/reservations/{id}/cancel` | HMAC | Cancel a held reservation; releases the seat |
+| `POST` | `/admin/reservations/{id}/release-seat` | HMAC | Put a seat back on sale; the status does not change |
 
 ### Try the whole flow
 
 ```bash
 make env                                              # host-side .env for mintjwt
-JWT=$(USER_ID=demo EVENT_ID=1 make -s mintjwt)
+JWT=$(USER=demo EVENT=1 make -s mintjwt)
 
 # 1. Reserve a seat
 RES=$(curl -sS -X POST http://localhost:8080/api/tickets/reserve \
@@ -93,11 +100,40 @@ curl -sS "http://localhost:8080/api/me/reservations?status=PENDING_PAYMENT" \
 curl -sS -X POST http://localhost:8080/api/reservations/$ID/cancel \
   -H "Authorization: Bearer $JWT"
 
-# 5. Health + readiness
+# 5. Pay for it (Stripe test mode) — returns the client_secret
+curl -sS -X POST http://localhost:8080/api/reservations/$ID/pay \
+  -H "Authorization: Bearer $JWT"
+# → {"payment_intent_id":"pi_...","client_secret":"pi_..._secret_...",
+#    "amount_cents":2500,"currency":"usd","seats":1}
+#
+# The client confirms the payment with Stripe Elements, and the SERVER
+# learns the outcome from the webhook — never from the client. So a
+# client that confirms and then never reports back is a case the server
+# does not depend on.
+
+# 6. Health + readiness
 curl -sS http://localhost:8080/healthz
 curl -sS http://localhost:8080/readyz
 # → {"redis":"ok","postgres":"ok","sqs":"ok","ready":true}
 ```
+
+### The payment path is asynchronous, on purpose
+
+```
+POST /webhooks/stripe
+  → verify Stripe's signature over the RAW body      → 400 on failure
+  → snapshot the event into our own struct
+  → publish the snapshot to the `stripe-events` queue → 200
+                                        │
+                                        ▼
+                             cmd/stripe-worker consumes it
+                               → internal/payment applies it
+```
+
+The webhook handler **touches no database and changes no status** — the state machine
+lives behind a queue, the same shape as the reservation path. And the publish happens
+**before** the 200: if the publish fails the handler returns 500, Stripe retries, and the
+window between "we said 200" and "the event is durable" does not exist.
 
 ### Safe retries
 
@@ -132,6 +168,9 @@ requests with one key: the second gets `409 in_flight` and does not reserve.
 | 8   | Load test + invariants      | ✅ Done      | `loadtest/burst.js` (1000 VUs, 1 iter — pure shock) + `loadtest/ramp.js` (7-stage 0→50→200→1000 VUs, ~90s); live dashboard on http://localhost:8082 (polls k6 REST); 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
 | 9   | Polish                      | ✅ Done      | `Makefile` (30+ targets, `make help`); all services (infra + the 4 long-running Go services) brought up by one `docker compose --env-file .env.docker up -d`; legacy host-mode `make all-services` kept for fast `go run` iteration; structured logging + Loki/Promtail log shipping; 100×200 + 1.8M×409 verified across 1.8M requests, 0 oversell, 0 data loss, p(99)=62ms under sustained 1000 VUs |
 
+**Today: 236 tests, 54.9% statement coverage, three CI jobs.** The per-phase counts in
+the table above are as-landed; the suite has grown since.
+
 ### Layer 1 — the product surface (all 5 shipped)
 
 The core system above is a reservation *engine*. Layer 1 is what turns it into
@@ -154,9 +193,38 @@ inside: an audit trail you can defend, and a payment flow that settles.
 | # | Item | Status | What landed |
 |---|---|---|---|
 | 6 | **Audit log** | ✅ Done | `reservation_events` — an append-only trail of every transition (`CREATED` / `CONFIRMED` / `EXPIRED` / `CANCELLED` / `REFUND_INITIATED`), written in the **same transaction** as the status change, so a transition can't happen unrecorded. Records *who* did it (`user` / `system` / `admin` / `stripe_webhook`), carries the OTel `trace_id` for the trace↔logs join, and is sealed by a database trigger that refuses `DELETE` and refuses history rewrites |
-| 7 | **Stripe test mode** | 🔜 Next | PaymentIntents + a signature-verified webhook receiver — the last unbuilt transition (`PENDING_PAYMENT → CONFIRMED`) |
+| 7 | **Stripe test mode** | ✅ Done | `payment_intents` + a signature-verified webhook receiver, on a **third queue** (`stripe-events`) with its own worker binary. The webhook handler verifies the signature over the raw bytes, snapshots the event and **queues** it — it never touches the database, so the state machine lives in one place. The idempotency key is the `reservation_id`, which makes the crash window between "we wrote the payment row" and "Stripe answered" a *retry* rather than a double-charge. `CONFIRMED → REFUNDED` is a real edge, and a **partial** refund is recorded as an event without changing the status |
+| 9 | **Admin / ops API** | ✅ Done | Four HMAC-signed support endpoints. The signature covers the method, the **full URI** (query string included), the body and a timestamp — so a captured signature is good for one request, one body, five minutes. The audit trail records the *fingerprint* of the signing key, never the secret. The power is bounded by the state machine: a paid reservation is **refunded**, not cancelled |
 
 > Layer-by-layer specs, and what's next → [`/docs/product-roadmap.md`](docs/product-roadmap.md) · Design rationale and per-file reference → [`/docs/architecture.md`](docs/architecture.md)
+
+---
+
+## Continuous Integration
+
+Three jobs, all on GitHub-hosted runners. `main` is branch-protected and the `Test`
+check is required, so nothing merges on a red build.
+
+| Job | What it does |
+|---|---|
+| **`Test`** | `go vet` → apply the migrations → `go test -race` against a **real Postgres, a real Redis and a real SQS broker** (all three are service containers) → enforce the coverage floor → `go build` |
+| **`Lint`** | `gofmt -l` (fails on any drift) → `go mod tidy` (fails if `go.mod`/`go.sum` are not tidy) → `govulncheck ./...` (known CVEs in the stdlib and the dependencies) |
+| **`E2E`** | Boots the **real Docker Compose stack** and drives one reservation all the way through — `reserve → SQS → worker → Postgres`, then a signed Stripe webhook → `SQS → stripe-worker → CONFIRMED` — and checks the audit trail recorded both transitions |
+
+**The service containers are the point.** The state machine's correctness — the
+compare-and-set, the audit row in the same transaction, the seat release on a refund —
+is only provable against a real database. Before they existed, **146 of the 236 tests
+skipped themselves** and the job reported 15.4% coverage while looking green. Now all
+236 run, at **54.9%**.
+
+Two of the gates earned their place the day they were added:
+
+- **`govulncheck` found 14 CVEs** — 12 in the Go standard library and one in
+  `golang.org/x/net`. The fix was a toolchain bump; it is clean now, and the gate keeps
+  it clean.
+- **The E2E job caught a flaky test on its first run** — a concurrency test that was
+  asserting a *timing window* instead of a contract. It had never been executed by
+  anything but a developer sitting in front of the machine.
 
 ---
 
@@ -164,7 +232,7 @@ inside: an audit trail you can defend, and a payment flow that settles.
 
 | Layer          | Technology                                                                                          | Why                                                                                                                       |
 | -------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Language       | **Go 1.27.1**                                                                                       | Goroutines make the hot path cheap; single static binaries; one language across API, worker, watcher, dashboard               |
+| Language       | **Go 1.27.3**                                                                                       | Goroutines make the hot path cheap; single static binaries; one language across API, worker, watcher, dashboard               |
 | API server     | **Go** + [`chi`](https://github.com/go-chi/chi)                                                     | Goroutines handle 10k+ connections per process; single static binary                                                      |
 | Hot-path       | **Redis 7**                                                                                         | Single-threaded execution makes Lua atomic; microsecond reads; native TTL; keyspace notifications built in               |
 | Queue          | **AWS SQS Standard**                                                                                | Unlimited throughput (Standard, not FIFO). At-least-once + idempotent workers = reliable enough                           |
@@ -189,24 +257,29 @@ inside: an audit trail you can defend, and a payment flow that settles.
 
 ```
 .
-├── cmd/                      # 6 binaries
-│   ├── api/                  # HTTP server (chi router, SSE, reserve/get/list/cancel, readyz)
+├── cmd/                      # 7 binaries
+│   ├── api/                  # HTTP server (chi router, SSE, reserve/get/list/cancel/pay, readyz, webhooks, admin)
 │   ├── worker/               # SQS consumer → Postgres writer + 60s expiry sweep goroutine
+│   ├── stripe-worker/        # SQS consumer → the Stripe payment state machine
 │   ├── expiration-watcher/   # Redis keyspace listener → marks expirations in Postgres
 │   ├── dashboard-server/     # Serves the live k6 dashboard (:8082)
 │   ├── mintjwt/              # Mint a JWT by hand (used by load tests + curl)
 │   └── seed-inventory/       # Seeds Postgres with an event + 100 seats
 ├── internal/
 │   ├── api/                  # HTTP handlers + the publisher seam
+│   ├── admin/                # The admin/ops API — HMAC-signed, audited, bounded
 │   ├── auth/                 # JWT issue + verify, HS256, fail-fast secret
 │   ├── config/               # env loading + fail-fast validation (incl. Postgres DSN)
 │   ├── apiutil/              # JSON helpers + ErrorBody shape + slog access-log middleware
 │   ├── iplimit/              # Per-IP token bucket (rate limit at /enter)
 │   ├── waitingroom/          # Per-event token bucket + ZSET queue + SSE handler + drainer
-│   ├── redis/                # Lua scripts, seat locking, Idempotency-Key store
+│   ├── redis/                # Lua scripts, seat locking, Idempotency-Key store, atomic seat release
 │   ├── queue/                # SQS publisher + consumer (aws-sdk-go-v2)
-│   ├── db/                   # pgx pool, idempotent writes, TransitionStatus, list queries
+│   ├── db/                   # pgx pool, idempotent writes, TransitionStatus, list queries, audit log, payments
 │   ├── expire/               # Compensate (DB+INCRBY) shared by watcher + sweep
+│   ├── payment/              # The Stripe payment state machine (the consumer side)
+│   ├── stripe/               # The Stripe client: create a PaymentIntent, verify a webhook, snapshot an event
+│   ├── e2e/                  # The end-to-end test (build tag `e2e`): the whole stack, one reservation
 │   ├── logging/              # slog init + OTel trace correlation handler
 │   ├── tracing/              # OpenTelemetry init + shutdown flush
 │   └── metrics/              # Prometheus catalog
@@ -214,7 +287,12 @@ inside: an audit trail you can defend, and a payment flow that settles.
 │   ├── 001_init.sql          # events, reservations, idempotency PK, partial index
 │   ├── 002_seed.sql          # Dev event id=1 with 100 inventory
 │   ├── 003_add_seats.sql     # seats column on reservations (Phase 7 INCRBY sizing)
-│   └── 004_user_lookup_index.sql  # (user_id, created_at DESC) for GET /api/me/reservations
+│   ├── 004_user_lookup_index.sql  # (user_id, created_at DESC) for GET /api/me/reservations
+│   ├── 005_audit_log.sql     # The append-only reservation_events trail + its trigger
+│   ├── 006_refunded_status.sql  # Adds the REFUNDED status (a refund is not a cancel)
+│   ├── 007_event_price.sql   # events.price_cents + the reservation's frozen price snapshot
+│   ├── 008_stripe_payments.sql  # The payment_intents table (one reservation, one PaymentIntent)
+│   └── 009_admin_audit.sql   # The SEAT_RELEASED audit event (the admin API)
 ├── docker/
 │   └── elasticmq.conf        # Pre-creates 'reservations' queue on boot (2-RTT cheaper than manual aws-cli)
 ├── loadtest/                 # k6 scripts (burst.js, ramp.js, live dashboard)
@@ -235,7 +313,7 @@ inside: an audit trail you can defend, and a payment flow that settles.
 │   └── clear-logs.sh         # Delete or truncate runtime + k6 logs (safe in-flight)
 ├── logs/                     # Runtime logs + timestamped k6 output (bind-mounted into containers)
 ├── .github/                  # CI workflow + Dependabot config
-├── docker-compose.yml        # 12 services: 8 infra + the 4 Go services (api, worker, watcher, dashboard-server), all with healthchecks
+├── docker-compose.yml        # 13 services: 8 infra + the 5 Go services (api, worker, stripe-worker, watcher, dashboard-server)
 ├── Dockerfile                # Multi-stage, distroless/static-debian12:nonroot; one file, parameterised by SERVICE build arg
 ├── .dockerignore             # Keeps the build context tight (.git, logs, bin, monitoring, etc.)
 ├── .env.example              # Template — copy to .env (NEVER commit .env) — host-mode run config
@@ -257,7 +335,7 @@ brew install k6
 brew install --cask docker   # Docker Desktop
 ```
 
-That's it. The 4 long-running Go services are now Dockerised too — `docker compose up -d` brings up **everything** (infra + Go services + observability), no Go toolchain required for just running it.
+That's it. The 5 long-running Go services are now Dockerised too — `docker compose up -d` brings up **everything** (infra + Go services + observability), no Go toolchain required for just running it.
 
 If you want to develop the Go services themselves (edit source, rebuild, etc.) you'll also need:
 
@@ -278,7 +356,7 @@ make doctor                            # check prereqs (docker, k6)
 docker compose --env-file .env.docker up -d --build
 ```
 
-That's every service running: redis, postgres, elasticmq, jaeger, prometheus, grafana, loki, promtail, **api, worker, expiration-watcher, dashboard-server**.
+That's every service running: redis, postgres, elasticmq, jaeger, prometheus, grafana, loki, promtail, **api, worker, stripe-worker, expiration-watcher, dashboard-server**.
 
 Daily dev loop:
 
@@ -292,7 +370,7 @@ docker compose --env-file .env.docker down                  # stop everything
 
 # Test it
 make env                                                    # create host-side .env from .env.example (for mintjwt + ad-hoc CLI)
-JWT=$(USER_ID=smoke-user EVENT_ID=1 make -s mintjwt)
+JWT=$(USER=smoke-user EVENT=1 make -s mintjwt)
 curl -sS -X POST http://localhost:8080/api/tickets/enter \
   -H "Content-Type: application/json" -d '{"user_id":"smoke-user","event_id":1}'
 curl -sS -X POST http://localhost:8080/api/tickets/reserve \
@@ -318,7 +396,7 @@ The old flow had Go services running on the host via `make all-services` and onl
 ```bash
 make up               # infra only (Redis + Postgres + ElasticMQ)
 make migrate          # apply migrations + seed if first run
-make build            # all 6 binaries into bin/
+make build            # all 7 binaries into bin/
 make all-services     # api + worker + watcher in background on host
 make dashboard-bg     # dashboard-server in background on host
 make stop             # stop all 4
@@ -336,7 +414,7 @@ SELECT 1
 
 ticket-redis      6379   healthy
 ticket-postgres   5432   healthy
-ticket-elasticmq  9324   healthy   reservations queue pre-created
+ticket-elasticmq  9324   healthy   reservations + stripe-events queues pre-created
 ```
 
 ### Switching to real AWS for production
@@ -345,7 +423,7 @@ ticket-elasticmq  9324   healthy   reservations queue pre-created
 - Remove the LocalStack-style endpoint override from the queue config.
 - No Go code changes. The same worker binary talks to ElasticMQ locally and AWS SQS in prod.
 
-> **All Phases 0–9 plus Layer 1 are complete.** Run `make loadtest-burst` or `make loadtest-ramp` (see [Quick Start](#quick-start) above) to prove the core invariant under load.
+> **All Phases 0–9, all of Layer 1, and Layer 2 items 6, 7 and 9 are complete.** Run `make loadtest-burst` or `make loadtest-ramp` (see [Quick Start](#quick-start) above) to prove the core invariant under load.
 
 ### Load testing (k6 + live dashboard)
 
@@ -418,7 +496,7 @@ docker compose --env-file .env.docker up -d
 
 # Open Jaeger UI
 #   http://localhost:16686
-#   - Pick service: api / worker / expiration-watcher
+#   - Pick service: api / worker / stripe-worker / expiration-watcher
 #   - Click a trace to see the waterfall
 ```
 
@@ -515,12 +593,13 @@ that file is the source of truth; this list is the short version.
 - [ ] **Redis Cluster** — shard seats across nodes for >100k concurrent users
 - [x] **Observability** — Prometheus + Grafana (request rate, latency, reservation outcomes, worker throughput, expiration activity; `reservations_oversold_total` is the headline alert)
 - [x] **Distributed tracing** — OpenTelemetry → Jaeger, end-to-end waterfall across API → SQS → worker (with body-fallback for ElasticMQ in dev)
-- [x] **Structured logging** — `log/slog` across all 4 long-running services, with OTel `trace_id` / `span_id` auto-injected on every line (and HTTP access log via custom chi middleware)
+- [x] **Structured logging** — `log/slog` across all 5 long-running services, with OTel `trace_id` / `span_id` auto-injected on every line (and HTTP access log via custom chi middleware)
 - [x] **Log aggregation** — Grafana Loki + Promtail, "Ticket Deal — Logs" dashboard with service + trace_id filters, click-through from log line to Jaeger trace
-- [x] **Dockerised** — all 4 long-running Go services run in containers; one `docker compose up -d` brings up everything
+- [x] **Dockerised** — all 5 long-running Go services run in containers; one `docker compose up -d` brings up everything
 - [x] **Read + cancel + retry safety** — Layer 1: state-machine gateway, `GET` endpoints, `POST /cancel`, `/readyz`, `Idempotency-Key`
 - [x] **Audit trail** — Layer 2 item 6: an append-only `reservation_events` log written atomically with every transition, recording who did what and joining to traces via `trace_id`
-- [ ] **Payment gateway** — Stripe webhook handler that confirms reservations (`PENDING_PAYMENT → CONFIRMED`, the one transition with no code path yet) and releases the hold. **This is Layer 2 item 7 — the next milestone.**
+- [x] **Payment gateway** — Stripe test mode: `POST /pay` creates the PaymentIntent, `POST /webhooks/stripe` verifies the signature and queues the event, and a separate `stripe-worker` applies it (`PENDING_PAYMENT → CONFIRMED`, `CONFIRMED → REFUNDED`). The webhook handler touches no database and changes no status — the state machine lives behind a queue, the same shape as the reservation path
+- [x] **Admin / ops API** — Layer 2 item 9: HMAC-signed support endpoints (look up a customer's reservations, cancel a held one, put a stuck seat back on sale). Every write is audited with `actor_type='admin'`
 - [ ] **Seat-level granularity** — Redis Hash per event instead of a single counter
 - [ ] **Anti-bot** *(intentionally skipped in lite-auth; revisit if slash-traction emerges)* — CAPTCHA + device fingerprinting before JWT issuance
 - [ ] **Replay testing** — deterministic k6 replay against a seeded Redis state
