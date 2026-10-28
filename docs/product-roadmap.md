@@ -377,9 +377,34 @@ Events to send:
 - `PENDING_PAYMENT → EXPIRED` → "Your hold expired, the seats are back"
 - `PENDING_PAYMENT → CANCELLED` (user-initiated) → "You cancelled your reservation"
 
-### 9. Admin / ops API (gated by HMAC admin key) ⬜ Not started
+### 9. Admin / ops API (gated by HMAC admin key) ✅ Done
 
 **Effort:** ~1 day. **Why:** every real product has "support override."
+
+> **Shipped** on `feature/admin-api`. Notes on what changed vs the sketch below:
+>
+> - The signature is an HMAC over the **request** — the method, the FULL URI
+>   (query string included), the body and a timestamp — not a bearer token. A
+>   captured signature is good for one request, one body, five minutes.
+> - The actor id in the audit trail is the **fingerprint** of the signing key
+>   (the first 8 hex characters of its SHA-256), never the secret, so the trail
+>   records *which* key acted. Several keys may be configured, so a key can be
+>   rotated.
+> - **The power is bounded by the state machine.** A `CONFIRMED` reservation is
+>   REFUNDED, not cancelled — there is no `CONFIRMED → CANCELLED` edge, and the
+>   `409 already_paid` points at the refund path. Each forbidden status has its own
+>   code; an already-cancelled reservation is a `200` (idempotent), so a retried
+>   admin call is not a failure.
+> - A fourth endpoint was added: `POST /admin/reservations/{id}/release-seat` puts a
+>   seat back on sale **without** changing the status, and it is the one action
+>   that needs an atomic guard — the hold key. A missing hold means the seat is
+>   already back on sale, and releasing it again would oversell. It writes a
+>   `SEAT_RELEASED` audit row (old_status == new_status).
+> - **Lookups are logged, not audited** — the audit table is a state-transition
+>   trail and a read is not a transition. A deliberate deviation from "every
+>   admin call writes to the audit log", below.
+> - The feature is **OPTIONAL**, like Stripe: with no `ADMIN_API_KEYS` the routes
+>   are not mounted at all.
 
 ```
 POST /admin/reservations/:id/cancel        (refund-as-cancel)

@@ -1849,6 +1849,51 @@ Exposed groups (full list in the file):
 
 ---
 
+### `internal/admin/` — the support/ops API
+
+Four endpoints, all behind one HMAC verifier:
+
+```
+GET  /admin/reservations/lookup?user_id=…   support lookup
+GET  /admin/reservations/{id}                support lookup
+POST /admin/reservations/{id}/cancel         cancel a held reservation
+POST /admin/reservations/{id}/release-seat   put a seat back on sale
+```
+
+**The signature.** `HMAC-SHA256(secret, method + "\n" + uri + "\n" + body + "\n" + timestamp)`,
+sent as `X-Admin-Key` (hex) + `X-Admin-Timestamp` (unix seconds). The URI includes the
+query string — a signature that did not cover it could be replayed against a different
+`user_id`, which would turn a support lookup into a data-exfiltration tool.
+
+Why an HMAC and not a bearer token: a bearer token travels with every request and a
+captured one is replayable forever. A signature over the request is good for one request,
+one body, and the five-minute replay window.
+
+The verifier tries every configured key and returns the **fingerprint** of the one that
+matched — the first 8 hex characters of the key's SHA-256. That is the actor id written
+to the audit trail, so the trail records *which* key acted without the secret being
+stored anywhere.
+
+**The power is bounded by the state machine.** A `CONFIRMED` reservation is REFUNDED,
+not cancelled: there is no `CONFIRMED → CANCELLED` edge, and the `409 already_paid`
+points at the refund path instead of inventing one. Each forbidden status has its own
+code, and an already-cancelled reservation is a `200` — idempotent, so a retried admin
+call is not a failure.
+
+**The seat release is atomic.** `internal/redis/scripts/release_seat.lua` makes the
+"is it still held?" check and the release one Redis operation, so two operators
+releasing the same seat at the same time cannot count it twice. The hold key is the
+guard: a missing hold means the seat is *already* back on sale, and releasing it again
+would oversell.
+
+The user-facing cancel does not need that guard — its compare-and-set on the reservation
+status arbitrates between the cancel and the expiry. The admin release-seat path changes
+no status, so nothing else arbitrates.
+
+**Lookups are logged, not audited.** `reservation_events` is a state-transition trail,
+and a read is not a transition. "Support looked up this customer's data" is worth
+recording, so it goes to the structured log with the actor.
+
 ### `internal/e2e/` — the end-to-end test
 
 One test, `TestReserveToConfirmed`, behind the `e2e` build tag. It boots nothing itself —
