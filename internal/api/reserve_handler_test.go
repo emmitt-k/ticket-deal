@@ -33,9 +33,27 @@ type testPublisher struct {
 	lastBody []byte
 	failNext bool // when true, the next Publish returns an error
 	err      error
+
+	// beforePublish, when non-nil, is called at the top of Publish —
+	// BEFORE the mutex is taken, so a test may block inside it without
+	// deadlocking Calls().
+	//
+	// It exists to make concurrency tests DETERMINISTIC. The reserve
+	// handler holds the Idempotency-Key in-flight lock across Publish,
+	// so a test that blocks here knows the lock is still held and can
+	// observe what a competing request sees. Without it, a test that
+	// asserts "the loser gets 409 in_flight" is really asserting a
+	// timing window: on a fast machine the winner can finish, cache its
+	// response and release the lock before the loser even looks — and
+	// then the loser correctly gets a 200 replay instead. Both outcomes
+	// are correct behaviour; only the 409 exercises the in-flight path.
+	beforePublish func()
 }
 
 func (p *testPublisher) Publish(_ context.Context, body []byte) error {
+	if p.beforePublish != nil {
+		p.beforePublish()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++

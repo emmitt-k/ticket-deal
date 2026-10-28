@@ -3,16 +3,16 @@
 //
 // Per the spec:
 //
-//   1. On request, GET idempotency:<key>. If the cached body_hash
-//      matches the current request body, return the cached response
-//      with its recorded HTTP status.
-//   2. On the first call, run the underlying operation (reserve, etc.).
-//      On success, SETEX the response under the key with a long TTL
-//      (24h by default — long enough for retries, short enough to
-//      self-clean).
-//   3. Same key + DIFFERENT body → 409 idempotency_key_mismatch. The
-//      safe Stripe behaviour: catches client bugs that retry with a
-//      different request without bumping the key.
+//  1. On request, GET idempotency:<key>. If the cached body_hash
+//     matches the current request body, return the cached response
+//     with its recorded HTTP status.
+//  2. On the first call, run the underlying operation (reserve, etc.).
+//     On success, SETEX the response under the key with a long TTL
+//     (24h by default — long enough for retries, short enough to
+//     self-clean).
+//  3. Same key + DIFFERENT body → 409 idempotency_key_mismatch. The
+//     safe Stripe behaviour: catches client bugs that retry with a
+//     different request without bumping the key.
 //
 // Concurrent retries against the same key (network blip + impatient
 // client) are handled via a short-TTL SETNX "in-flight" lock, so a
@@ -21,11 +21,11 @@
 //
 // Storage shape (a single Redis STRING per key — one round-trip):
 //
-//   {
-//     "body_hash": "<sha256 hex of request body>",
-//     "status":    <http status code>,
-//     "response":  <original response body as JSON>
-//   }
+//	{
+//	  "body_hash": "<sha256 hex of request body>",
+//	  "status":    <http status code>,
+//	  "response":  <original response body as JSON>
+//	}
 //
 // Body-hash co-storage prevents the "user retries with a different
 // body under the same key" footgun; status-co-storage lets the API
@@ -66,12 +66,12 @@ type cachedRecord struct {
 
 // IdempotencyConfig tunes the wrapper's two TTLs:
 //
-//   CacheTTL:  spec-mandated 24 h (long enough to span retries across
-//              user-network blips, short enough to self-clean the keyspace).
-//   LockTTL:   short — only needs to outlast the underlying operation
-//              (Lua reserve + SQS publish = ~30 ms typical). 5 s is
-//              generous; covers a paused API process (e.g. SIGSTOP)
-//              without permanently blocking retries.
+//	CacheTTL:  spec-mandated 24 h (long enough to span retries across
+//	           user-network blips, short enough to self-clean the keyspace).
+//	LockTTL:   short — only needs to outlast the underlying operation
+//	           (Lua reserve + SQS publish = ~30 ms typical). 5 s is
+//	           generous; covers a paused API process (e.g. SIGSTOP)
+//	           without permanently blocking retries.
 type IdempotencyConfig struct {
 	CacheTTL time.Duration
 	LockTTL  time.Duration
@@ -130,13 +130,13 @@ func HashBody(body []byte) string {
 
 // Look up a cached response. Three outcomes (sentinel error + bool):
 //
-//   hit=true,  err=nil        — cached, body matched. Status + Response
-//                               populated from the cached entry.
-//   hit=false, err=nil        — no cached entry (Redis nil), OR
-//                               cache-corrupt (treat the same as miss).
-//   hit=false, err wraps ErrIdempotencyBodyMismatch
-//                             — cached but body differs → caller
-//                               returns 409 idempotency_key_mismatch.
+//	hit=true,  err=nil        — cached, body matched. Status + Response
+//	                            populated from the cached entry.
+//	hit=false, err=nil        — no cached entry (Redis nil), OR
+//	                            cache-corrupt (treat the same as miss).
+//	hit=false, err wraps ErrIdempotencyBodyMismatch
+//	                          — cached but body differs → caller
+//	                            returns 409 idempotency_key_mismatch.
 //
 // Body-mismatch detection is built-in; saves the caller from having to
 // compare hashes after a hit.

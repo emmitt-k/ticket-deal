@@ -32,7 +32,7 @@ func TestDrainer_StartsOnNotify(t *testing.T) {
 			RefillRate:      100.0, // fast refill so we promote in first tick
 			QueueTTLSeconds: 60,
 		},
-		JWTSecret:   make([]byte, 32),
+		JWTSecret:    make([]byte, 32),
 		TickInterval: 50 * time.Millisecond,
 	}
 
@@ -87,7 +87,7 @@ func TestDrainer_PromotesAndIssuesValidJWT(t *testing.T) {
 			RefillRate:      10.0,
 			QueueTTLSeconds: 60,
 		},
-		JWTSecret:   make([]byte, 32),
+		JWTSecret:    make([]byte, 32),
 		TickInterval: 20 * time.Millisecond,
 	}
 
@@ -129,7 +129,7 @@ func TestDrainer_CleansUpAfterEmpty(t *testing.T) {
 			RefillRate:      10.0,
 			QueueTTLSeconds: 60,
 		},
-		JWTSecret:   make([]byte, 32),
+		JWTSecret:    make([]byte, 32),
 		TickInterval: 20 * time.Millisecond,
 	}
 

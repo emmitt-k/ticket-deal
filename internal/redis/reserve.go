@@ -20,9 +20,9 @@ var reserveScript = redisclient.NewScript(reserveScriptSrc)
 type Status int
 
 const (
-	StatusReserved       Status = 1  // seat allocated, hold key set
-	StatusRejected       Status = 0  // see RejectionReason (sold_out | already_holding)
-	StatusEventNotFound  Status = -1 // inventory key never seeded for this event_id
+	StatusReserved      Status = 1  // seat allocated, hold key set
+	StatusRejected      Status = 0  // see RejectionReason (sold_out | already_holding)
+	StatusEventNotFound Status = -1 // inventory key never seeded for this event_id
 )
 
 // RejectionReason disambiguates StatusRejected.
@@ -46,7 +46,7 @@ type Result struct {
 
 // InventoryKey is the canonical Redis key for an event's available-seat counter.
 //
-//   "inventory:event:42"
+//	"inventory:event:42"
 func InventoryKey(eventID int64) string {
 	return fmt.Sprintf("inventory:event:%d", eventID)
 }
@@ -68,7 +68,7 @@ func AvailableSeats(ctx context.Context, c *redisclient.Client, eventID int64) (
 
 // HoldKey is the canonical Redis key for a per-user hold lock.
 //
-//   "hold:event:42:user:u1"
+//	"hold:event:42:user:u1"
 //
 // Acts as: (1) anti-double-book, (2) auto-release on abandonment, (3) cleanup-free TTL.
 // See docs/architecture.md §4 "The hold key".

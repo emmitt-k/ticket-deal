@@ -1,7 +1,6 @@
 package queue
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -112,9 +111,6 @@ func TestReservation_Parse_AcceptsOffset(t *testing.T) {
 
 // TestMessageHandlerFunc — the function-shaped adapter must satisfy
 // the MessageHandler interface. Compile-time check via assignment.
-func TestMessageHandlerFunc(t *testing.T) {
-	var h MessageHandler = MessageHandlerFunc(func(_ context.Context, _ []byte) error {
-		return nil
-	})
-	require.NotNil(t, h)
-}
+// The MessageHandlerFunc adapter's behaviour — that it forwards the
+// call and the error — is covered in sqs_test.go, next to the consumer
+// it belongs to. This stub only pinned that the value is non-nil.

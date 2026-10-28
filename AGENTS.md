@@ -596,6 +596,7 @@ about who owns the seat). We alert: `stripe_payment_after_expiry_total` (should 
 │   ├── metrics/                # Prometheus catalog (all counters/gauges/histograms)
 │   ├── payment/                # The Stripe payment state machine (the consumer side)
 │   ├── queue/                  # SQS publisher + consumer (aws-sdk-go-v2)
+│   ├── e2e/                   # the end-to-end test (build tag `e2e`): the whole stack, one reservation
 │   ├── redis/                  # Redis client, Lua scripts, seat locking, Idempotency-Key store
 │   ├── stripe/                 # The Stripe client: create a PaymentIntent, verify a webhook, snapshot an event
 │   ├── tracing/                # OpenTelemetry Init + shutdown flush
@@ -691,9 +692,70 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 ## CI/CD
 
 ### GitHub Actions (`.github/workflows/ci.yml`)
-- Runs on: push to `main` + all PRs
-- Job: `go vet` → `go test -race -coverprofile` → `go build`
-- Artifact: coverage report (14-day retention)
+
+Runs on: push to `main` + all PRs. **Three** jobs, all on GitHub-hosted runners.
+
+**`Test`** — the gate. It runs against a **real** Postgres, a **real** Redis and a
+**real** SQS broker:
+
+```
+services:
+  postgres:  postgres:16-alpine        → localhost:5432  (the DSN the tests already default to)
+  redis:     redis:7-alpine            → localhost:6379
+  elasticmq: softwaremill/elasticmq    → localhost:9324  (the SQS-compatible broker)
+```
+
+The queues (`reservations`, `stripe-events`) are created in a workflow step, because a
+bare ElasticMQ starts with none. `internal/queue`'s publisher and consumer tests need a
+real broker to be worth anything: the behaviours worth checking — a published message
+arrives, a handled message is deleted, a failed handler's message comes back — are
+**broker** behaviours, and no fake can reproduce them.
+
+| Step | What it does |
+|---|---|
+| `go vet` | the static checks |
+| **Apply migrations** | `psql -v ON_ERROR_STOP=1 -f migrations/0*.sql`, in order, on the fresh database — the same order `make migrate` uses. `ON_ERROR_STOP` matters: without it `psql` exits 0 on a failed statement and a broken migration looks like it worked |
+| `go test -race -coverprofile` | the whole suite, with the race detector |
+| **Enforce the coverage floor** | the total must be **≥ 45%**. A coverage number that is printed but never enforced is a number that quietly goes down |
+| `go build` | all five binaries compile |
+| Upload coverage artifact | 14-day retention |
+
+**Why the service containers are not optional.** The state machine's correctness — the
+compare-and-set, the audit row in the same transaction, the seat release on a refund —
+is only provable against a real database. Without these two containers, **146 of the
+236 tests skip themselves** (`t.Skipf("Postgres unavailable: …")`) and the job reports
+**15.4%** coverage while looking green. With them: **236 tests, 48.5%**. The ports are
+mapped to the runner's `localhost`, which is exactly where the tests look, so no
+test-side change was needed.
+
+**`Lint`** — `gofmt -l` (fails on any drift) → `go mod tidy` (fails if `go.mod`/`go.sum`
+are not tidy) → `govulncheck ./...` (known CVEs in the stdlib and the dependencies).
+
+**`E2E`** — the job that proves the SYSTEM works, not the packages. It boots the real
+Docker Compose stack (api + worker + stripe-worker and their dependencies) and drives one
+reservation all the way through:
+
+```
+reserve ──► SQS ──► worker ──► Postgres (PENDING_PAYMENT)
+signed webhook ──► SQS ──► stripe-worker ──► Postgres (CONFIRMED)
+```
+
+then checks the audit trail recorded both transitions with the right actors. The test
+lives in `internal/e2e/` behind the `e2e` build tag, so `go test ./...` does not run it
+and the coverage number is unaffected. It skips (rather than fails) when the stack is not
+there, so `go test -tags=e2e ./...` is safe to run anywhere.
+
+The webhook is signed with the Stripe SDK's own `webhook.ComputeSignature`, so the API's
+verification is exercised for real — not a hand-rolled approximation of the format.
+
+> `govulncheck` earned its place the day it was added: it found **14** vulnerabilities —
+> 12 in the Go standard library (fixed in go1.27.2/1.27.3) and one in
+> `golang.org/x/net` (fixed in v0.60.0). The fix was a toolchain bump in `go.mod` plus
+> `go get golang.org/x/net@v0.60.0`. It is now **clean**, and it stays clean because the
+> step is a gate.
+
+A `concurrency` group cancels the in-flight run for a branch when a new push lands, so a
+rapid series of pushes does not queue up N runners.
 
 ### Dependabot (`.github/dependabot.yml`)
 - Go modules: weekly Monday 09:00 BKK
@@ -701,7 +763,8 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 - Labels: `dependencies`, `go`, `ci`
 
 ### Branch Strategy
-- `main`: stable, protected
+- `main`: stable, **protected** — the `Test` check is a required status check, so a PR
+  cannot merge on a red build
 - Feature work: branch from main → PR → merge
 - **Major changes get their own branch.** New features and significant refactors: `git checkout -b feature/<short-name>` first, off `main` (or off the previous feature branch — see below). Small edits, bug fixes, doc tweaks and one-off tasks can be done on the current branch.
 - **Always push to the remote when done.** After every commit, push to the remote feature branch immediately — `git push origin feature/<name>`. Never leave commits unpushed: an unpushed branch is work that exists on exactly one machine, and it is invisible to CI, to a reviewer, and to `git fetch`.
@@ -760,7 +823,8 @@ Before starting new feature work, check whether that has landed. If it has, bran
 17. **The webhook handler verifies, snapshots and queues — it never changes a status.** Every status change happens in `internal/payment`, behind the `stripe-events` queue. The webhook endpoint must stay fast (Stripe has a short timeout) and it must publish BEFORE returning 200 — otherwise "the event was accepted but the publish failed" loses a payment confirmation permanently. A 500 makes Stripe retry; the state machine is idempotent, so a retry is safe.
 18. **The idempotency key for a PaymentIntent is the `reservation_id`.** Never a random value and never a timestamp: a random key turns every retry into a new charge. The `payment_intents.reservation_id` UNIQUE constraint makes a second `/pay` a no-op at the database level, and the idempotency key makes it a no-op at Stripe's level. Together they close the crash window between "we wrote the row" and "Stripe answered".
 19. **Stripe is OPTIONAL, but HALF-configured is a startup error.** Both secret keys absent → the payment routes answer 503 and the rest of the system works unchanged. Exactly one present → `config.Load()` fails fast, because an API that can create PaymentIntents but cannot verify webhooks is exactly the state where payments get silently stuck. A MALFORMED key is also a startup error; an ABSENT key is not — the reservation core does not need Stripe.
-20. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
+20. **A concurrency test must CONTROL the schedule, not hope for it.** A test that fires two goroutines and asserts a particular interleaving is asserting a timing window, not a contract — and it will pass on your machine and fail on a busy CI runner. The fix is to park one participant at a known point (a hook inside the code under test) until the test says go. `internal/api`'s `testPublisher.beforePublish` hook is the worked example: it parks the winner inside `Publish`, where the Idempotency-Key in-flight lock is provably still held, so the loser is *guaranteed* to meet the lock. And assert the **error code**, not just the status: with the lock broken, the loser falls through to the Lua script and gets `409 already_holding` — the same status, a different fact. A test that cannot fail is not a test.
+21. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
 
 ---
 

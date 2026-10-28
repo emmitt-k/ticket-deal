@@ -30,12 +30,12 @@ type Claims struct {
 // with errors.Is rather than poking at the underlying jwt library, so
 // switching implementations later requires no caller changes.
 var (
-	ErrTokenMalformed      = errors.New("auth: token malformed")
-	ErrTokenSignature      = errors.New("auth: token signature invalid")
-	ErrTokenExpired        = errors.New("auth: token expired")
-	ErrTokenNotYetValid    = errors.New("auth: token not yet valid")
-	ErrTokenAlgUnexpected  = errors.New("auth: unexpected signing method")
-	ErrClaimsMissing       = errors.New("auth: required claim missing")
+	ErrTokenMalformed     = errors.New("auth: token malformed")
+	ErrTokenSignature     = errors.New("auth: token signature invalid")
+	ErrTokenExpired       = errors.New("auth: token expired")
+	ErrTokenNotYetValid   = errors.New("auth: token not yet valid")
+	ErrTokenAlgUnexpected = errors.New("auth: unexpected signing method")
+	ErrClaimsMissing      = errors.New("auth: required claim missing")
 )
 
 // Issue signs a new JWT for the given user and event, valid for ttl.

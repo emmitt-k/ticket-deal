@@ -204,9 +204,9 @@ func TestContextHandler_Enabled(t *testing.T) {
 // TestLevelFromString covers the parser.
 func TestLevelFromString(t *testing.T) {
 	cases := []struct {
-		in     string
-		want   slog.Level
-		errOk  bool // true if an error is expected
+		in    string
+		want  slog.Level
+		errOk bool // true if an error is expected
 	}{
 		{"", slog.LevelInfo, false},
 		{"info", slog.LevelInfo, false},
@@ -220,7 +220,7 @@ func TestLevelFromString(t *testing.T) {
 		{"error", slog.LevelError, false},
 		{"ERROR", slog.LevelError, false},
 		{"trace", slog.LevelInfo, true}, // unknown
-		{"fatal", slog.LevelInfo, true},  // unknown (Go's slog has no fatal)
+		{"fatal", slog.LevelInfo, true}, // unknown (Go's slog has no fatal)
 		{"verbose", slog.LevelInfo, true},
 	}
 	for _, c := range cases {

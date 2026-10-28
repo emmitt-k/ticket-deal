@@ -500,9 +500,43 @@ queue design scales to a second consumer, but it is the least differentiating �
 so it goes third, unless the demo needs the MailHog inbox to look busy.
 
 **Before any of them, two chores** that are cheap and make the repo honest:
-CI does not currently run the `internal/db` tests (they skip without a
-Postgres, and the CI job has no Postgres service), and ~15 untouched files
-carry gofmt drift. A reviewer spots both in five seconds.
+CI did not run the `internal/db` tests (they skip without a Postgres, and the CI
+job had no Postgres service), and ~24 untouched files carried gofmt drift. A
+reviewer spots both in five seconds.
+
+> **Both are done** (branch `feature/ci-hardening`): the CI job now has a real
+> Postgres, a real Redis and a real SQS broker, so all the tests run instead of
+> 146 skipping — and the coverage it reports went from **15.4%** to **49.3%**. The
+> gofmt drift is gone, and a `gofmt` step now keeps it gone. The same change added a
+> coverage floor and a `govulncheck` gate — which found 14 real CVEs on the way in
+> (12 in the Go standard library, one in `golang.org/x/net`) and is now clean.
+>
+> **And the safety net grew to match the system.** Three more things came out of
+> the same pass:
+>
+> - `internal/config` went from **0% to 100%** — it is where the both-or-neither
+>   Stripe rule lives, and a bug there is a *production crash loop*. It had only
+>   ever been verified by running the binary by hand.
+> - `internal/queue` went from **27% to 90%** — the layer both critical paths
+>   (reserve and payment) depend on. The SQS publisher and consumer now have real
+>   tests against a real broker: a published message arrives, a handled message is
+>   deleted, a failed handler's message comes back.
+> - A third CI job, **E2E**, boots the whole Docker Compose stack and drives one
+>   reservation all the way through — reserve → SQS → worker → Postgres, then a
+>   signed Stripe webhook → SQS → stripe-worker → CONFIRMED — and checks the audit
+>   trail. It is the only thing that can catch "every package passes and the
+>   system does not work".
+>
+> **And it paid for itself on the first run.** The new CI caught a flaky test
+> immediately: `TestReserveHandler_Idempotency_ParallelRetries` asserted that the
+> loser of the Idempotency-Key race gets `409 in_flight`, but the handler holds the
+> in-flight lock across publish → cache → respond → release — so if the winner
+> finishes first, the loser correctly gets a 200 with the *cached response* instead.
+> The test was asserting a timing window, not a contract. It had never been executed
+> by anything but a developer sitting in front of the machine, so it stayed invisible
+> for the life of the project. It is now deterministic (the winner is parked inside
+> `Publish` until the loser has reported) and asserts the error *code*, so it fails
+> when the lock is broken.
 
 ## The strategic question
 

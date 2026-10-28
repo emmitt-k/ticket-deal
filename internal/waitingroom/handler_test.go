@@ -16,7 +16,7 @@ import (
 // bucketKeyForTest and queueKeyForTest mirror the private functions in
 // internal/redis/waitingroom.go so tests can clean up.
 func bucketKeyForTest(eventID int64) string { return fmt.Sprintf("bucket:event:%d", eventID) }
-func queueKeyForTest(eventID int64) string { return fmt.Sprintf("queue:event:%d", eventID) }
+func queueKeyForTest(eventID int64) string  { return fmt.Sprintf("queue:event:%d", eventID) }
 
 func TestEnterHandler_IPReject(t *testing.T) {
 	rdb := testClient(t)
@@ -27,7 +27,7 @@ func TestEnterHandler_IPReject(t *testing.T) {
 		},
 		WaitRoom: config.WaitRoomConfig{
 			Capacity:        100,
-			RefillRate:     10.0,
+			RefillRate:      10.0,
 			QueueTTLSeconds: 60,
 		},
 	}
@@ -69,7 +69,7 @@ func TestEnterHandler_AdmitAndQueue(t *testing.T) {
 		},
 		WaitRoom: config.WaitRoomConfig{
 			Capacity:        1, // 1 token → first user admitted, rest queued
-			RefillRate:     0.001,
+			RefillRate:      0.001,
 			QueueTTLSeconds: 60,
 		},
 		JWTSecret: make([]byte, 32), // dummy 32-byte secret
@@ -133,11 +133,11 @@ func TestQueueSSEHandler_BadParams(t *testing.T) {
 	tests := []struct {
 		query string
 	}{
-		{"/api/tickets/queue"},                       // missing both
-		{"/api/tickets/queue?event_id=42"},           // missing user_id
-		{"/api/tickets/queue?user_id=u1"},           // missing event_id
+		{"/api/tickets/queue"},                         // missing both
+		{"/api/tickets/queue?event_id=42"},             // missing user_id
+		{"/api/tickets/queue?user_id=u1"},              // missing event_id
 		{"/api/tickets/queue?event_id=abc&user_id=u1"}, // bad event_id
-		{"/api/tickets/queue?event_id=-1&user_id=u1"}, // negative event_id
+		{"/api/tickets/queue?event_id=-1&user_id=u1"},  // negative event_id
 	}
 	for _, tc := range tests {
 		req := httptest.NewRequest(http.MethodGet, tc.query, nil)
@@ -167,7 +167,7 @@ func TestEnterHandler_QueueURLFormat(t *testing.T) {
 		IPLimit: config.IPLimitConfig{Capacity: 100, RefillRate: 100.0},
 		WaitRoom: config.WaitRoomConfig{
 			Capacity:        0, // queue everyone
-			RefillRate:     0.001,
+			RefillRate:      0.001,
 			QueueTTLSeconds: 60,
 		},
 		JWTSecret: make([]byte, 32),

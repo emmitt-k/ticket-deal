@@ -3,17 +3,79 @@ name: CI
 on:
   push:
     branches: [main]
+  # ANY base branch, not just `main`. This repo uses STACKED branches
+  # (a feature branch based on the previous feature branch), so a PR
+  # whose base is `feature/…` must get CI too. Filtering on `main` here
+  # meant a stacked PR ran NO checks at all — and no check means no
+  # required status check can be satisfied on it.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
+
+# One run per ref: a new push cancels the run still in flight for that
+# branch, so a rapid series of pushes does not queue up N runners.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    # ── The live dependencies ────────────────────────────────────────
+    #
+    # The tests talk to a REAL Postgres and a REAL Redis — the state
+    # machine's correctness (CAS, the audit row, the seat release on a
+    # refund) is only provable against a real database. Without these
+    # two service containers, 146 of the 236 tests skip themselves and
+    # the suite reports 15% coverage while looking green.
+    #
+    # The ports are mapped to the runner's localhost, which is exactly
+    # where the tests look: postgres://tickets:tickets@localhost:5432
+    # and localhost:6379. No test-side change is needed.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tickets
+          POSTGRES_PASSWORD: tickets
+          POSTGRES_DB: tickets
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U tickets -d tickets"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      # The SQS-compatible broker. internal/queue's publisher and
+      # consumer tests need a REAL broker to be worth anything — the
+      # behaviours worth checking (a published message arrives, a
+      # handled message is deleted, a failed handler's message comes
+      # back) are broker behaviours.
+      elasticmq:
+        image: softwaremill/elasticmq:latest
+        ports:
+          - 9324:9324
+
+    env:
+      DATABASE_URL: postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable
+      REDIS_ADDR: localhost:6379
+      SQS_ENDPOINT_URL: http://localhost:9324
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
 
     steps:
       - uses: actions/checkout@v7
@@ -30,10 +92,65 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # The schema the tests expect. Applied to the fresh database in
+      # order, the same way `make migrate` does it locally. ON_ERROR_STOP
+      # matters: without it psql exits 0 on a failed statement and a
+      # broken migration would look like it worked.
+      - name: Apply migrations
+        run: |
+          # Idempotent: the service container's database is empty on a
+          # fresh runner, but this step must also survive a re-run on a
+          # runner that already has the schema.
+          if psql "$DATABASE_URL" -tAc \
+               "SELECT 1 FROM information_schema.tables WHERE table_name='reservations'" \
+               | grep -q 1; then
+            echo "schema already present — skipping"
+          else
+            for f in migrations/0*.sql; do
+              echo "→ $f"
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+            done
+          fi
+
+      # ElasticMQ starts with no queues. The queue tests create their
+      # own per-test queues, but the shared ones (reservations,
+      # stripe-events) are created here so the addresses match what
+      # docker/elasticmq.conf pre-creates locally.
+      - name: Wait for ElasticMQ and create the queues
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "$SQS_ENDPOINT_URL/?Action=ListQueues" >/dev/null 2>&1; then
+              break
+            fi
+            echo "waiting for ElasticMQ ($i)…"
+            sleep 2
+          done
+          curl -sf "$SQS_ENDPOINT_URL/?Action=ListQueues" >/dev/null \
+            || { echo "::error::ElasticMQ never became reachable"; exit 1; }
+          for q in reservations stripe-events; do
+            curl -sf "$SQS_ENDPOINT_URL/?Action=CreateQueue&QueueName=$q" >/dev/null
+            echo "✓ queue $q"
+          done
+
       - name: go test (race + coverage)
         run: |
           go test -race -coverprofile=coverage.out -covermode=atomic ./...
           go tool cover -func=coverage.out | tail -1
+
+      # A coverage number that is printed but never enforced is a number
+      # that quietly goes down. The floor is 3 points below today's real
+      # number (48.5%), so an accidental drop is caught and a deliberate
+      # one is a conscious bump of this line.
+      - name: Enforce the coverage floor
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN {
+            if (t + 0 < 45) {
+              printf "::error::coverage %.1f%% is below the 45%% floor\n", t
+              exit 1
+            }
+          }'
 
       - name: go build
         run: go build ./...
@@ -45,3 +162,175 @@ jobs:
           name: coverage
           path: coverage.out
           retention-days: 14
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: true
+          cache-dependency-path: go.sum
+
+      # gofmt is not a style preference — it is the one tool every Go
+      # reviewer expects to be already applied, so an unformatted file in
+      # a diff is noise the reviewer has to read past.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # A go.sum that has drifted from go.mod is a build that breaks on
+      # someone else's machine and not on yours.
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum || {
+            echo "::error::go.mod / go.sum are not tidy — run 'go mod tidy' and commit"
+            exit 1
+          }
+
+      # Known CVEs in the standard library and in the dependencies. This
+      # step found 14 (12 in the stdlib on go1.27.1, plus one in
+      # golang.org/x/net) and is what keeps them from coming back.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # ── The end-to-end job ────────────────────────────────────────────
+  #
+  # The Test job proves the PACKAGES work. This one proves the SYSTEM
+  # works — that the API, the queue, the workers, Postgres and Redis
+  # are actually wired together, which no unit test can show.
+  #
+  # It boots the real Docker Compose stack and drives one reservation
+  # all the way through:
+  #
+  #   reserve ──► SQS ──► worker ──► Postgres (PENDING_PAYMENT)
+  #   signed webhook ──► SQS ──► stripe-worker ──► Postgres (CONFIRMED)
+  #
+  # and then checks the audit trail recorded both transitions.
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      API_BASE_URL: http://localhost:8080
+      DATABASE_URL: postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable
+      REDIS_ADDR: localhost:6379
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          cache: true
+          cache-dependency-path: go.sum
+
+      # The stack's env. .env.docker is gitignored, so it has to be
+      # written here. The two Stripe values are FAKE — the e2e signs
+      # its own webhook with the same secret, and never calls Stripe.
+      # They must be present in BOTH, or config.Load() refuses to boot
+      # the API (the both-or-neither rule).
+      - name: Write .env.docker
+        run: |
+          JWT=$(openssl rand -hex 32)
+          echo "JWT_SECRET=$JWT" >> "$GITHUB_ENV"
+          echo "STRIPE_WEBHOOK_SECRET=whsec_test_e2e_fake" >> "$GITHUB_ENV"
+          cp .env.docker.example .env.docker
+          {
+            echo "JWT_SECRET=$JWT"
+            echo "STRIPE_SECRET_KEY=sk_test_e2e_fake"
+            echo "STRIPE_WEBHOOK_SECRET=whsec_test_e2e_fake"
+            # The workers long-poll for 20 seconds by default, so a
+            # message published mid-poll waits for that poll to end.
+            # The e2e does not care about throughput, so it asks for a
+            # 2-second poll and finishes in seconds instead of half a
+            # minute.
+            echo "WORKER_LONG_POLL_SECONDS=2"
+          } >> .env.docker
+
+      # The schema. Applied to the container's Postgres, in order —
+      # the same files `make migrate` uses.
+      - name: Apply migrations
+        run: |
+          docker compose --env-file .env.docker up -d postgres
+          # Wait until the DATABASE is queryable, not merely until the
+          # server answers. During the image's init phase the server
+          # listens on the Unix socket only, so pg_isready succeeds
+          # before the `tickets` database exists — and the first
+          # migration would fail with 'database "tickets" does not
+          # exist'. That is exactly how this job failed the first time.
+          for i in $(seq 1 60); do
+            if docker exec ticket-postgres psql -U tickets -d tickets -c "SELECT 1" >/dev/null 2>&1; then
+              echo "✓ postgres is ready"
+              break
+            fi
+            echo "waiting for postgres ($i)…"
+            sleep 2
+          done
+          docker exec ticket-postgres psql -U tickets -d tickets -c "SELECT 1" >/dev/null 2>&1 || {
+            echo "::error::postgres never became usable"
+            exit 1
+          }
+          if docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
+               "SELECT 1 FROM information_schema.tables WHERE table_name='reservations'" \
+               | grep -q 1; then
+            echo "schema already present — skipping"
+          else
+            for f in migrations/0*.sql; do
+              echo "→ $f"
+              docker exec -i ticket-postgres psql -U tickets -d tickets -v ON_ERROR_STOP=1 -q < "$f"
+            done
+          fi
+
+      # api + worker + stripe-worker, and their dependencies (redis,
+      # postgres, elasticmq, jaeger). The expiration-watcher and the
+      # dashboard are not part of this flow, so they are left out.
+      - name: Build and start the stack
+        run: docker compose --env-file .env.docker up -d --build api worker stripe-worker
+
+      - name: Wait for the API to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/readyz >/dev/null 2>&1; then
+              echo "✓ ready"
+              exit 0
+            fi
+            echo "waiting for the API ($i)…"
+            sleep 2
+          done
+          echo "::error::the API never became ready"
+          docker compose --env-file .env.docker logs --tail 100 api
+          exit 1
+
+      - name: Run the end-to-end test
+        run: go test -tags=e2e -count=1 -v -timeout 180s ./internal/e2e/...
+
+      # When the e2e fails, the service logs are the only way to see
+      # WHY. The API writes to ./logs/*.log inside the container, so
+      # both are dumped.
+      - name: Dump the logs on failure
+        if: failure()
+        run: |
+          docker compose --env-file .env.docker logs --tail 200
+          for f in logs/*.log; do
+            [ -f "$f" ] && echo "─── $f ───" && tail -100 "$f"
+          done
+
+      - name: Tear down
+        if: always()
+        run: docker compose --env-file .env.docker down -v
+

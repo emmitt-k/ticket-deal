@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,6 +158,19 @@ func TestReserveHandler_Idempotency_InvalidKey(t *testing.T) {
 // requests with the same key. One wins, the other gets 409 in_flight.
 // The "winner" path runs the reserve; the "loser" path returns
 // immediately without consuming a seat.
+//
+// The test is DETERMINISTIC, and that took a fix. The winner holds the
+// in-flight lock across the whole reserve — publish, cache the
+// response, respond, release. If the winner finishes before the loser
+// even looks, the loser correctly gets a 200 replay (the cached
+// response) instead of a 409. Both outcomes are correct behaviour, but
+// only the 409 exercises the in-flight path, and a test that asserts
+// it without controlling the schedule is really asserting a timing
+// window.
+//
+// So: the winner is parked inside Publish (where the lock is provably
+// still held) until the loser has reported. See testPublisher's
+// beforePublish hook.
 func TestReserveHandler_Idempotency_ParallelRetries(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
@@ -169,6 +183,15 @@ func TestReserveHandler_Idempotency_ParallelRetries(t *testing.T) {
 	cleanupReserveKeys(t, rdb, eventID, owner)
 
 	key := freshIdemKey(t, rdb)
+
+	// The winner parks here, inside Publish, holding the in-flight
+	// lock, until we release it.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	pub.beforePublish = func() {
+		close(entered)
+		<-release
+	}
 
 	// Two concurrent HTTP requests through the handler. They race
 	// for the in-flight lock; one wins, one loses. We don't care
@@ -189,32 +212,52 @@ func TestReserveHandler_Idempotency_ParallelRetries(t *testing.T) {
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Idempotency-Key", key)
 			handler.ServeHTTP(rec, req)
-			results <- result{code: rec.Code}
+			var body map[string]any
+			_ = json.Unmarshal(rec.Body.Bytes(), &body)
+			results <- result{code: rec.Code, body: body}
 		}()
 	}
 
-	var sawOK, sawInFlight bool
-	for i := 0; i < 2; i++ {
-		r := <-results
-		switch r.code {
-		case http.StatusOK:
-			sawOK = true
-		case http.StatusConflict:
-			// 409 is also a valid conflict for the held-status code path;
-			// but for this test, the in-flight one matters. The other
-			// possible 409 here would be sold_out (impossible, we have
-			// seats) or already_holding (impossible, same key/middleware
-			// is fresh per-request). So 409 == in_flight here.
-			sawInFlight = true
-		default:
-			t.Fatalf("unexpected status %d", r.code)
-		}
+	// Wait until one request has won the lock and parked in Publish.
+	// The lock is held from here until we close(release), so the OTHER
+	// request is guaranteed to meet the in-flight lock rather than a
+	// cached response.
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the lock winner to reach Publish")
 	}
 
-	require.True(t, sawOK, "one of the parallel calls must succeed")
-	require.True(t, sawInFlight, "the other must get 409 in_flight")
+	// The first result to arrive must be the loser's 409 — the winner
+	// is still parked. Read it BEFORE releasing the winner, or the
+	// window closes and the loser would see the cached response.
+	loser := <-results
+	require.Equal(t, http.StatusConflict, loser.code,
+		"the loser must get 409 while the winner holds the in-flight lock")
 
-	// Only one publish happened.
+	// The 409 must be the IN-FLIGHT one. Asserting the status alone is
+	// not enough: a broken lock (AcquireLock always succeeding) would
+	// let the loser through to the Lua script, which rejects it with
+	// 409 already_holding instead — the same status, a different fact.
+	// The error code is what distinguishes "your retry is already being
+	// processed" from "you already hold a seat".
+	require.Equal(t, "in_flight", loser.body["error"],
+		"the loser must be rejected by the in-flight lock, not by already_holding")
+
+	// Now let the winner finish.
+	close(release)
+	winner := <-results
+	require.Equal(t, http.StatusOK, winner.code, "the winner must succeed")
+	require.NotEmpty(t, winner.body["reservation_id"], "the winner gets a reservation_id")
+
+	// Exactly one seat was consumed. The loser returned before the
+	// reserve, so it must not have taken a seat of its own.
+	inv, err := rdb.Get(context.Background(), redis.InventoryKey(eventID)).Int()
+	require.NoError(t, err)
+	require.Equal(t, 9, inv, "exactly one seat is consumed — the loser took none")
+
+	// Only one publish happened — the loser returned before the seat
+	// was published, so it never reserved.
 	require.Equal(t, 1, pub.Calls(), "only the lock winner publishes to SQS")
 }
 
