@@ -6,8 +6,9 @@ buys a seat that doesn't exist.
 
 [![CI](https://github.com/emmitt-k/ticket-deal/actions/workflows/ci.yml/badge.svg)](https://github.com/emmitt-k/ticket-deal/actions/workflows/ci.yml)
 
-> Design rationale → [`docs/architecture.md`](docs/architecture.md) · What's next →
-> [`docs/product-roadmap.md`](docs/product-roadmap.md)
+> Design rationale → [`docs/architecture.md`](docs/architecture.md) · **The load-bearing
+> decisions and why** → [`docs/design-decisions.md`](docs/design-decisions.md) · What's next
+> → [`docs/product-roadmap.md`](docs/product-roadmap.md)
 
 ---
 

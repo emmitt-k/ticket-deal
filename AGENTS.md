@@ -676,6 +676,7 @@ mounted at all** — off, not open.
 │   └── mintjwt.go             # Untracked smoke-test scratch helper
 ├── docs/
 │   ├── architecture.md         # Full architecture deep-dive (design + per-file reference)
+│   ├── design-decisions.md     # The load-bearing calls and why — one page, the "why" behind each
 │   ├── product-roadmap.md      # WHAT'S NEXT — numbered layers, per-item specs, gap list. Source of truth
 │   ├── tracing-crashcourse.md  # Learn OpenTelemetry from scratch (background reading)
 │   ├── comprehensive-go.md     # Go language tour
