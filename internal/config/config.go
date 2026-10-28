@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -52,6 +53,46 @@ type Config struct {
 	// a few hundred ms behind Redis (the system of record during
 	// sell-time).
 	Postgres PostgresConfig
+
+	// Stripe is the payment integration (Layer 2, item 7). It is
+	// OPTIONAL: with no keys set, the feature is off and the Stripe
+	// routes answer 503. The reservation core does not need Stripe,
+	// and making a ticket server refuse to boot without a payment
+	// account is a strange dependency.
+	Stripe StripeConfig
+}
+
+// StripeConfig groups the Stripe knobs.
+//
+// The two secret values are validated together, and their ABSENCE is
+// allowed while their half-presence is not:
+//
+//   - neither set   → the feature is off (Enabled = false)
+//   - both set      → the feature is on, and the values are validated
+//   - exactly one   → a configuration error, and Load() fails fast
+//
+// A half-configured Stripe is a bug, not a choice: it would mean an
+// API that can create PaymentIntents but cannot verify webhooks (or
+// the reverse), which is exactly the state where payments get
+// silently stuck.
+type StripeConfig struct {
+	// SecretKey is the Stripe API key (sk_test_… / sk_live_…).
+	SecretKey string
+	// WebhookSecret is the signing secret for THIS endpoint + mode
+	// (whsec_…). Never logged, never returned to a client.
+	WebhookSecret string
+	// PublishableKey is the client-side key (pk_test_… / pk_live_…).
+	// It is safe to expose to a browser — the client needs it to
+	// confirm a payment with Stripe Elements.
+	PublishableKey string
+	// EventsQueueURL is the SQS queue that carries Stripe webhook
+	// events from the API to the stripe-worker. Separate from the
+	// reservations queue: three queues, three concerns.
+	EventsQueueURL string
+	// Enabled is true when both secret values are present. When
+	// false, the Stripe routes answer 503 rather than pretending to
+	// work.
+	Enabled bool
 }
 
 // PostgresConfig is the subset of db.Config the API server needs to
@@ -155,6 +196,36 @@ func Load() (*Config, error) {
 			// documents.
 			DSN: getEnv("DATABASE_URL", buildPostgresDSNFromEnv()),
 		},
+	}
+
+	stripeSecret := os.Getenv("STRIPE_SECRET_KEY")
+	stripeWebhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
+	switch {
+	case stripeSecret == "" && stripeWebhookSecret == "":
+		// Stripe is not configured. The feature is off and the Stripe
+		// routes answer 503. This is deliberate — see StripeConfig's
+		// doc comment.
+	case stripeSecret == "" || stripeWebhookSecret == "":
+		return nil, errors.New(
+			"STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET must be set together (both present, or neither)")
+	}
+	if stripeSecret != "" {
+		// Fail fast on a MALFORMED key, even though an absent key is
+		// allowed. A key that cannot possibly work should be caught
+		// at startup, not at the first /pay request.
+		if !strings.HasPrefix(stripeSecret, "sk_") {
+			return nil, errors.New("STRIPE_SECRET_KEY must look like sk_test_... or sk_live_...")
+		}
+		if !strings.HasPrefix(stripeWebhookSecret, "whsec_") {
+			return nil, errors.New("STRIPE_WEBHOOK_SECRET must look like whsec_...")
+		}
+	}
+	cfg.Stripe = StripeConfig{
+		SecretKey:      stripeSecret,
+		WebhookSecret:  stripeWebhookSecret,
+		PublishableKey: getEnv("STRIPE_PUBLISHABLE_KEY", ""),
+		EventsQueueURL: getEnv("STRIPE_EVENTS_QUEUE_URL", ""),
+		Enabled:        stripeSecret != "",
 	}
 
 	return cfg, nil

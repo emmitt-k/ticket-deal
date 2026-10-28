@@ -11,6 +11,7 @@ This document complements the [README](../README.md). The README is the project 
 | Dockerization | `feature/dockerize-go-services` | All 4 long-running Go services (api, worker, expiration-watcher, dashboard-server) moved from host into Docker. Shared parameterized `Dockerfile` (distroless/static, `SERVICE` build arg → binary at constant path `/app/server`). `docker-compose.yml` grew from 8 → **12 services**. `LOG_FILE` env support added to `internal/logging`. Prometheus scrape targets switched from `host.docker.internal` → service names. `.env.docker.example` + `scripts/setup-docker-env.sh` (idempotent, migrates the host `.env`'s `JWT_SECRET`). |
 | Layer 1 — the product surface | `feature/get-reservations` → `feature/cancel-reservation` → `feature/readyz` → `feature/idempotency-key` | 5 items, one branch each (linear chain): typed state-machine helper + read endpoints + cancel endpoint + `/readyz` + `Idempotency-Key` on `/reserve`. Layer 1 is what turns the core reservation machinery into something a user can actually operate. See [`product-roadmap.md`](./product-roadmap.md) for the item-by-item breakdown. |
 | Layer 2 item 6 — the audit log | `feature/audit-log` | The append-only `reservation_events` table, written in the **same transaction** as every status change. Three model fixes landed with it: `REFUNDED` split out of `CANCELLED` (a refund is not a cancel), the seat price (`events.price_cents` + a frozen snapshot on the reservation), and a double-INCRBY oversell race in the expiry path (§9). |
+| Layer 2 item 7 — the payment integration | `feature/stripe-integration` | Stripe test mode: `POST /pay`, `POST /webhooks/stripe`, the `stripe-events` queue, and the payment state machine behind a new `cmd/stripe-worker` binary. The system can now take money — and `CONFIRMED` and `REFUNDED` are reachable (§9b). |
 
 **What Layer 1 added at a glance:**
 
@@ -29,6 +30,15 @@ This document complements the [README](../README.md). The README is the project 
 - `migrations/007_event_price.sql` — the price of a seat: `events.price_cents` + `events.currency`, and the frozen snapshot the reservation carries (§8).
 - `db.TransitionStatus` now takes a **mandatory** `db.Audit`. An empty actor is rejected before any SQL runs, so *"a transition happened but nobody recorded it"* is not a state the code can reach.
 
+**What Layer 2 item 7 added at a glance:**
+
+- `internal/stripe/` — three operations over the Stripe SDK: create a PaymentIntent, verify a webhook signature, snapshot an event. The SDK's types do not cross the package boundary.
+- `internal/payment/` — the payment state machine. It runs in `cmd/stripe-worker`, behind the `stripe-events` queue — the webhook handler only verifies and queues (§9b).
+- `migrations/008_stripe_payments.sql` — `payment_intents`, one row per reservation, with a **nullable** `stripe_payment_intent_id`.
+- `POST /api/reservations/{id}/pay` — creates the PaymentIntent and returns the `client_secret`. It does NOT confirm the payment; the client confirms, and the server learns the outcome from the webhook.
+- `POST /webhooks/stripe` — verifies Stripe's signature over the **raw** bytes, snapshots the event, publishes it, and only then answers 200.
+- `cmd/stripe-worker` — a fifth binary. It consumes `stripe-events` and applies the events.
+
 The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) still produces exactly 100 × 200 + 900 × 409 — and now every one of those requests shows up in all three observability sinks, joined by `trace_id`. See §14 for the story.
 
 ---
@@ -44,6 +54,7 @@ The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) still pro
 7. [The Two-State Model](#7-the-two-state-model)
 8. [Reservation Lifecycle](#8-reservation-lifecycle)
 9. [Handling Expirations](#9-handling-expirations)
+9b. [The Stripe payment flow](#9b-the-stripe-payment-flow)
 10. [Why SQS Standard (Not FIFO)](#10-why-sqs-standard-not-fifo)
 11. [Failure Modes & Mitigations](#11-failure-modes--mitigations)
 12. [Known Development Sharp Edges](#12-known-development-sharp-edges)
@@ -58,6 +69,7 @@ The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) still pro
 graph TB
     subgraph Client["Client"]
         User["User Browser<br/>(or k6 VU)"]
+        Stripe["Stripe<br/>(test mode)"]
     end
 
     subgraph HotPath["Hot Path — request-time, target < 50 ms"]
@@ -71,6 +83,11 @@ graph TB
     subgraph AsyncPath["Async Path — post-reservation"]
         SQS["AWS SQS Standard<br/>(ElasticMQ locally)"]
         Worker["Go Worker<br/>(SQS consumer + 60s sweep)"]
+    end
+
+    subgraph PaymentPath["Payment Path — Layer 2, item 7"]
+        SQSE["SQS: stripe-events<br/>(a SECOND queue)"]
+        StripeWorker["Go Stripe Worker<br/>(SQS consumer)"]
     end
 
     subgraph ColdPath["Cold Path — durable, no SLA"]
@@ -94,6 +111,12 @@ graph TB
     API -->|"SendMessage<br/>(+ traceparent)"| SQS
     SQS -->|"ReceiveMessage<br/>(propagate ctx)"| Worker
     Worker -->|"INSERT ... ON CONFLICT<br/>RETURNING seats"| PG
+    API -->|"CreatePaymentIntent<br/>(idempotency key =<br/>the reservation_id)"| Stripe
+    Stripe -->|"signed webhook<br/>POST /webhooks/stripe"| API
+    API -->|"publish the event<br/>SNAPSHOT"| SQSE
+    SQSE -->|"ReceiveMessage<br/>(propagate ctx)"| StripeWorker
+    StripeWorker -->|"PENDING_PAYMENT → CONFIRMED<br/>CONFIRMED → REFUNDED"| PG
+    StripeWorker -.->|"INCR (a refund<br/>releases the seat)"| RI
     RI -.->|"hold key TTL expires"| Watcher
     Watcher -.->|"Compensate:<br/>UPDATE EXPIRED + INCRBY"| PG
     Watcher -.->|"INCR"| RI
@@ -103,15 +126,18 @@ graph TB
     API -.->|"/metrics"| Prom
     Worker -.->|"/metrics"| Prom
     Watcher -.->|"/metrics"| Prom
+    StripeWorker -.->|"/metrics"| Prom
     Prom --> Grafana
 
     API -.->|"OTLP gRPC :4317"| Jaeger
     Worker -.->|"OTLP gRPC :4317"| Jaeger
     Watcher -.->|"OTLP gRPC :4317"| Jaeger
+    StripeWorker -.->|"OTLP gRPC :4317"| Jaeger
 
     API -.->|"slog (stdout → file)"| Logs
     Worker -.->|"slog (stdout → file)"| Logs
     Watcher -.->|"slog (stdout → file)"| Logs
+    StripeWorker -.->|"slog (stdout → file)"| Logs
     Logs -.->|"tail"| Promtail
     Promtail -->|"push"| Loki
     Loki --> Grafana
@@ -542,10 +568,10 @@ Phase 7 closes the asymmetry: Postgres's truth can *correct* Redis's truth (swee
 stateDiagram-v2
     [*] --> PENDING_PAYMENT: Lua reserves seat<br/>+ API publishes SQS message<br/>(worker INSERTs row)
 
-    PENDING_PAYMENT --> CONFIRMED: Payment webhook<br/>(Stripe, future — Layer 2)
+    PENDING_PAYMENT --> CONFIRMED: Payment webhook<br/>(Stripe — Layer 2, item 7)
     PENDING_PAYMENT --> EXPIRED: Hold key TTL fires<br/>(watcher OR sweep,<br/>within 60s)
     PENDING_PAYMENT --> CANCELLED: POST /cancel<br/>(internal/api/cancel_<br/>reservation_handler.go)
-    CONFIRMED --> REFUNDED: Refund<br/>(Stripe, future — Layer 2)
+    CONFIRMED --> REFUNDED: Refund<br/>(Stripe — Layer 2, item 7)
 
     CONFIRMED --> [*]: Order complete
     EXPIRED --> [*]: Seat released<br/>via INCRBY inventory
@@ -787,9 +813,128 @@ This is the documented edge case from `internal/expire/compensate.go`. To close 
 
 ---
 
+## 9b. The Stripe payment flow
+
+Layer 2, item 7. The shape is **verify → queue → apply**, and the ORDER is the whole
+design.
+
+```mermaid
+sequenceDiagram
+    participant S as Stripe
+    participant API as API<br/>(POST /webhooks/stripe)
+    participant Q as SQS<br/>stripe-events
+    participant W as cmd/stripe-worker
+    participant DB as PostgreSQL
+
+    S->>API: payment_intent.succeeded (signed body)
+    API->>API: verify the signature over the RAW bytes
+    Note over API: a bad signature → 400.<br/>Stripe does not retry a 4xx.
+    API->>Q: publish the event SNAPSHOT
+    Note over API,Q: publish BEFORE the 200 —<br/>a publish failure → 500,<br/>so Stripe retries.
+    API-->>S: 200
+    Q->>W: long-poll delivery
+    W->>DB: PENDING_PAYMENT → CONFIRMED<br/>(+ the audit row, in one transaction)
+    W->>W: a full refund: INCR the inventory<br/>(the seat goes back on sale)
+```
+
+**The webhook handler touches no database and changes no status.** Every status change
+happens in `internal/payment`, behind the queue — the same shape as the reservation path
+(`reserve → SQS → worker`). That keeps the webhook fast (Stripe has a short timeout and
+retries anything that isn't a 2xx) and keeps every state change in one place.
+
+**The failure mode this design has to get right** is "event accepted but the publish
+failed". The fix is ordering: publish FIRST, then return 200. If the publish fails we
+return 500 and Stripe retries. The window between "we said 200" and "the event is
+durable" therefore does not exist.
+
+### The three events
+
+| Event | What happens |
+|---|---|
+| `payment_intent.succeeded` | `PENDING_PAYMENT → CONFIRMED` — the only path to CONFIRMED |
+| `payment_intent.payment_failed` | Nothing changes. The seat is still held and the customer can retry. A failed payment is a **signal**, not a state, so it writes no audit row |
+| `charge.refunded` (full) | `CONFIRMED → REFUNDED`, and the seat goes back on sale (Redis INCRBY) |
+| `charge.refunded` (partial) | **An event, not a state.** The status stays `CONFIRMED`, the seat is NOT released, and the refund is recorded in the audit trail with `old_status == new_status` |
+
+The partial refund is the case that proves the audit EVENT and the reservation STATUS
+are separate concepts: the event records what was DONE (money came back), the status
+records where the reservation ended up (still a valid ticket). Only a full refund becomes
+a state.
+
+### The idempotency key
+
+`POST /api/reservations/{id}/pay` passes the **reservation_id** as Stripe's
+Idempotency-Key. That is the whole reason the crash window is survivable: the payment
+row is written *before* Stripe is called, so if the process dies in between there is a
+row with a NULL `stripe_payment_intent_id` — and the retry, carrying the same
+idempotency key, gets the SAME PaymentIntent back instead of creating a second one. A
+random key would turn every retry into a new charge.
+
+The `payment_intents.reservation_id` UNIQUE constraint covers the same ground on the
+database side: two concurrent `/pay` calls cannot create two payment rows, so they
+cannot create two PaymentIntents.
+
+### `POST /api/reservations/{id}/pay`
+
+The endpoint that starts a payment. Five steps, in order:
+
+1. The JWT must match the row's `user_id` → `403` otherwise.
+2. The status must be `PENDING_PAYMENT` → `409`, with a **different code per state**
+   (`already_paid`, `already_expired`, `already_cancelled`, `already_refunded`) because
+   they are different facts and the client renders them differently.
+3. The amount is computed from the reservation's **price snapshot** —
+   `unit_price_cents × seats`. Never from the request: a client that could send its own
+   price could ask for a free ticket. An event with no price is `409 event_not_priced`.
+4. The payment row is written — **before** Stripe is called.
+5. `CreatePaymentIntent` with the `reservation_id` as the idempotency key, and the
+   Stripe id is written back onto the row.
+
+**It does NOT confirm the payment.** Confirmation happens on the client with the
+`client_secret` (Stripe Elements), and the server learns the outcome from the webhook —
+because a client that confirms and then never reports back is a case the server must not
+depend on.
+
+### The configuration
+
+Stripe is **optional**. `internal/config/config.go` treats the two secret values like
+this:
+
+| Env | Result |
+|---|---|
+| Neither set | The feature is off. The payment routes answer `503 stripe_not_configured`, and the rest of the system works unchanged. |
+| Both set | The feature is on. The values are validated (a key that cannot possibly work is a startup error). |
+| Exactly one set | **A startup error.** `config.Load()` fails fast. |
+
+The half-configured case is the one that matters: an API that can create PaymentIntents
+but cannot verify webhooks is exactly the state where payments get silently stuck. An
+absent key is a choice; a half-present one is a bug.
+
+### The race
+
+The customer sat on the payment page for longer than the hold TTL. The hold expired, the
+seat went back on sale, and then the payment succeeded.
+
+We do **not** confirm (the seat may be sold) and we do **not** auto-refund (a refund on
+a race is its own class of bug — it moves money on a path that did not reason about
+partial refunds or about who owns the seat). We alert:
+`stripe_payment_after_expiry_total` (should always be 0), an ERROR log line, and the
+payment row saying `SUCCEEDED` while the reservation says `EXPIRED` — which is exactly
+the mismatch to look for.
+
+---
+
 ## 10. Why SQS Standard (Not FIFO)
 
 The original design used SQS FIFO. We switched. Here's why.
+
+**The Stripe events ride the same trade-off.** `stripe-events` is SQS Standard too:
+the payment events do not need ordering either — a `payment_intent.succeeded` and a
+`charge.refunded` for the same reservation can arrive in either order, and the
+state machine handles both (the refund of a not-yet-confirmed reservation is
+counted and alerted, not applied). What matters is that the transitions are
+compare-and-set, which they are. And at-least-once delivery is not a problem
+here either: every transition is idempotent, so a redelivered event lands on the
+"already done" branch.
 
 ```mermaid
 graph TB
@@ -861,6 +1006,12 @@ graph TB
 | 23 | Cancel: Redis INCRBY fails after the DB transition succeeded | DB says CANCELLED, Redis still counts the seat as sold — "phantom seat" | `slog.WarnContext` + still `200` to the client. Deliberate: DB is the system-of-record for *intent*; returning 5xx would make the client retry into `409 already_cancelled` and confuse the user. Operator reconciles inventory via a manual INCRBY (same runbook as row 13). The divergence window is the Redis outage duration. |
 | 24 | Cancel: hold-key `DEL` fails | User is briefly `409 already_holding` on their next `/reserve` | Best-effort by design — the key has a TTL, so it self-heals. Never a 5xx; the user's cancellation already succeeded. |
 | 25 | Postgres unreachable, API alive | `/readyz` returns `503`; the Layer 1 read endpoints (`GET /api/reservations/:id`, `/me/reservations`, `POST /cancel`) all fail | `/readyz` surfaces it so a load balancer stops routing traffic here. `/reserve` itself is **unaffected** — the hot path is Redis-only by design (the asymmetry is the point; see §7). A failed readiness check pulls the pod from rotation without triggering a restart loop, which is why `/readyz` is separate from `/healthz`. |
+| 26 | Stripe webhook publish fails (SQS down) | The payment confirmation is not durable | The webhook handler publishes **before** returning 200, so a publish failure is a `500` — Stripe retries the delivery. The window between "we said 200" and "the event is durable" does not exist (§9b). |
+| 27 | Stripe webhook signature does not verify | A forged or tampered request | `400 invalid_signature`. Stripe does not retry a 4xx, so a forged request cannot make Stripe hammer the endpoint. The raw bytes are what get signed — a body parsed and re-serialised would not verify. |
+| 28 | The customer's payment lands after the hold expired | We have money for a seat that may already be sold | **Alert, don't auto-refund.** `stripe_payment_after_expiry_total` (should always be 0), an ERROR log line, and the payment row saying `SUCCEEDED` while the reservation says `EXPIRED` — the mismatch to look for. A refund on a race is its own class of bug (§9b). |
+| 29 | Stripe is unreachable when `/pay` is called | The client cannot start a payment | `502 payment_provider_error`. The retry is **safe**: the idempotency key is the `reservation_id`, so a retried `Create` returns the same PaymentIntent instead of charging twice. The payment row is already durable, so the crash window is a retry, not a double-charge. |
+| 30 | Stripe's webhook endpoint uses an older API version than the SDK | Every event would be rejected — payments never confirm | The API-version check is a **serialization** check, not a security check, so it is ignored deliberately; the signature is still verified strictly. A mismatch is logged as a warning. Taking it literally would mean Stripe retrying a webhook we keep 400ing, with logs saying "signature invalid" instead of "wrong API version" (§9b). |
+| 31 | A refund arrives for a reservation that is not CONFIRMED | Money came back for a ticket we do not think was paid for | `stripe_payment_after_terminal_total` (should always be 0) + an ERROR log line. No automatic state change — the operator decides. |
 
 ---
 
@@ -1189,7 +1340,9 @@ Project landing page. Current Status table (Phases 0–9), Tech Stack table, Pro
 
 #### `.env.example`
 
-Template for `.env` (gitignored). Every env var consumed by the project lives here: API_PORT, JWT_SECRET, REDIS_ADDR, IP/WAIT_ROOM limits, RESERVE_HOLD_TTL, DATABASE_URL (or the `POSTGRES_*` family, which `config.Load()` composes into a DSN), SQS_* (ElasticMQ URL + queue name + URL), SWEEP_INTERVAL_SECONDS, AWS_* (region + dummy creds for ElasticMQ). Comments explain each value.
+Template for `.env` (gitignored). Every env var consumed by the project lives here: API_PORT, JWT_SECRET, REDIS_ADDR, IP/WAIT_ROOM limits, RESERVE_HOLD_TTL, DATABASE_URL (or the `POSTGRES_*` family, which `config.Load()` composes into a DSN), SQS_* (ElasticMQ URL + queue name + URL), SWEEP_INTERVAL_SECONDS, AWS_* (region + dummy creds for ElasticMQ), and — since Layer 2 item 7 — `STRIPE_EVENTS_QUEUE_URL` plus the three `STRIPE_*` keys.
+
+The Stripe keys are **optional**: leave both secret values empty and the payment routes answer 503 while the rest of the system works unchanged. The comment in the file spells out the both-or-neither rule, because exactly one of them is a startup error.
 
 Host-mode `.env` — used by `make api-bg` / `make worker-bg` and by the k6 wrappers. Values point at `localhost`.
 
@@ -1205,12 +1358,12 @@ Standard Go ignores (`*.test`, `coverage.out`), editor cruft (`.vscode/`, `.idea
 
 #### `Dockerfile`
 
-One shared multi-stage Dockerfile, parameterised by a `SERVICE` build arg. Building any of the 4 Go services is `docker build --build-arg SERVICE=api .` (same for `worker`, `expiration-watcher`, `dashboard-server`).
+One shared multi-stage Dockerfile, parameterised by a `SERVICE` build arg. Building any of the 5 Go services is `docker build --build-arg SERVICE=api .` (same for `worker`, `stripe-worker`, `expiration-watcher`, `dashboard-server`).
 
 - **Stage 1** — `golang:1.27-alpine`, compiles `cmd/$SERVICE` with CGO disabled (static binary, no libc dependency at runtime).
-- **Stage 2** — `gcr.io/distroless/static-debian12:nonroot`. Binary copied to the constant path `/app/server` for every service, so the compose `command:` is identical across all four (`["/app/server"]`) regardless of which service was built.
+- **Stage 2** — `gcr.io/distroless/static-debian12:nonroot`. Binary copied to the constant path `/app/server` for every service, so the compose `command:` is identical across all five (`["/app/server"]`) regardless of which service was built.
 
-The constant-path trick is what lets one Dockerfile serve four services without per-service paths leaking into compose. The `SERVICE` arg only ever affects the *build*; at runtime the container just runs `/app/server`.
+The constant-path trick is what lets one Dockerfile serve five services without per-service paths leaking into compose. The `SERVICE` arg only ever affects the *build*; at runtime the container just runs `/app/server`.
 
 `.dockerignore` keeps the build context lean (excludes `.git/`, `logs/`, `bin/`, `loadtest/results/`) so a rebuild doesn't invalidate the layer cache on every log line.
 
@@ -1240,13 +1393,17 @@ Notes:
 - `./logs` is bind-mounted **read-write** into each Go service (so each writes to `logs/<service>.log` via the `LOG_FILE` env var) and **read-only** into promtail. One path, two mounts, one log file per service.
 - `redis` is started with `--notify-keyspace-events Ex` (Phase 7) + `--appendonly yes` (durability) + `--maxmemory 512mb` + `--maxmemory-policy allkeys-lru`.
 - `postgres` env from `POSTGRES_USER/PASSWORD/DB` (default `tickets/tickets/tickets`).
-- `elasticmq` mounts `./docker/elasticmq.conf` so the `reservations` queue is auto-created with 30 s visibility + 20 s long-poll.
+- `elasticmq` mounts `./docker/elasticmq.conf` so the `reservations` queue is auto-created with 30 s visibility + 20 s long-poll — and, since Layer 2 item 7, the `stripe-events` queue too.
 - `jaeger` accepts OTLP/gRPC on `:4317` and OTLP/HTTP on `:4318`.
 - `promtail` uses `restart: always` rather than `unless-stopped` — a compose v5.5.1 / engine 29.8.2 quirk that rejects the latter policy for this service specifically. Left with a `TODO(investigate)` comment to re-test once upstream sorts it out.
 
 #### `docker/elasticmq.conf`
 
 Pre-creates the `reservations` queue on boot — saves the dev the `aws --endpoint-url=... sqs create-queue` step. Standard type (no max-receive-count → no DLQ).
+
+Since Layer 2 item 7 it also pre-creates **`stripe-events`** — a **second** queue, deliberately. The two carry unrelated message types (a reservation vs a payment event), and a queue that mixes them forces a type switch in the consumer. Three queues, three concerns — and when item 8 adds `reservations-notifications`, the pattern already holds.
+
+**Recreating the container is required** to pick up a change to this file: `docker compose up -d --force-recreate elasticmq`. A plain `up` reuses the running container with its old config, and the worker then logs `QueueDoesNotExist` on every poll.
 
 ---
 
@@ -1319,6 +1476,8 @@ The whole HTTP server bootstrap. **Order of init matters** (later depends on ear
 5. The chi router is wrapped in `otelhttp.NewHandler(router, "api")` — every HTTP request becomes a parent span automatically.
 6. `slogmw.NewSlogAccessLog()` replaces `chi/middleware.Logger` — every request gets an access log line with the OTel `trace_id` auto-injected by the `ContextHandler`.
 7. Mounts `/healthz` + `/readyz` + the Prometheus `/metrics` endpoint + `/api/tickets/{enter,queue,reserve}` (reserve is behind `auth.Middleware()`).
+   - `POST /api/reservations/{id}/pay` — behind `auth.Middleware()` like the rest of `/api`. Creates the Stripe PaymentIntent and returns the `client_secret`.
+   - `POST /webhooks/stripe` — **not** behind `auth.Middleware()`: Stripe's signature IS the authentication. It verifies the signature over the raw bytes, snapshots the event, publishes it to `stripe-events`, and only then answers 200 (§9b).
    - `/healthz` — process-alive only, returns 200 unconditionally (used by K8s livenessProbe).
    - `/readyz` — deep dep checks (Redis ping, Postgres ping, SQS GetQueueAttributes). Three goroutines each with a 500ms per-check timeout, fan-in via buffered channel. Returns `200 + {ready:true,...}` if all checks are "ok" or "not_configured", `503 + {ready:false,...}` otherwise. Dev mode (no `SQS_QUEUE_URL` configured) reports sqs:"not_configured" and still counts as healthy.
 8. Layer 1 (product-roadmap.md): mounts three reservation routes under a new top-level `/api` group, all behind `auth.Middleware()`:
@@ -1332,6 +1491,14 @@ The whole HTTP server bootstrap. **Order of init matters** (later depends on ear
 #### `cmd/worker/main.go`
 
 The SQS consumer + Phase 7 sweep goroutine. Loads worker env vars (DATABASE_URL, SQS_QUEUE_URL, REDIS_ADDR, SWEEP_INTERVAL_SECONDS) — including a `_ = godotenv.Load()` at the top of `loadConfig()` so the binary runs from a `.env` in dev with no shell exports — opens a Postgres pool, opens a Redis client, runs `expire.RunSweep` as a goroutine, then blocks on `queue.Poll` for SQS messages. The Poll handler unmarshals `queue.Reservation` and calls `db.InsertIfAbsent` (which now writes the `seats` column).
+
+#### `cmd/stripe-worker/main.go`
+
+Layer 2 item 7. The SQS consumer for the `stripe-events` queue — the consumer side of the Stripe payment flow (§9b). Same shape as `cmd/worker`: its own env-var config (`DATABASE_URL`, `STRIPE_EVENTS_QUEUE_URL`, `REDIS_ADDR`, `AWS_*`), a `godotenv.Load()` shim, a Postgres pool, a Redis client, a metrics-only HTTP server on `:8084`, then `queue.Poll`.
+
+The Poll handler unmarshals the event snapshot and hands it to `payment.Handler`. The ctx arriving there already carries the API's `trace_id` (the consumer extracted it from the SQS message attributes), so the worker's span is a **child of the API's webhook span** — the end-to-end waterfall works across the queue, verified in the local e2e (the worker's log line carries the API's trace id).
+
+Redis is needed for exactly one thing: putting a **refunded** seat back on sale.
 
 #### `cmd/expiration-watcher/main.go`
 
@@ -1490,6 +1657,12 @@ The two scalar subqueries take the **price snapshot** in the same statement that
 Returns nil whether or not a row was created. The duplicate case now shows up as `pgx.ErrNoRows` from the `RETURNING` (an `ON CONFLICT DO NOTHING` insert returns no row), not as `tag.RowsAffected() == 0` — and it is *not* an error: the worker's contract is "eventually at least one row exists for this reservation_id", so a duplicate delivery returns nil and the SQS message gets deleted instead of looping forever.
 
 `GetReservation(ctx, pool, id)` reads back a row by ID. Returns `pgx.ErrNoRows` for missing rows; `IsNoRows(err)` wraps that for callers that don't want to import pgx. LEFT-JOINs `events` to populate `EventName`, so API callers render a human-readable title without a second round-trip.
+
+#### `internal/db/payment_intents.go`
+
+Layer 2 item 7. The payment record: `InsertPaymentIntent` (ON CONFLICT DO NOTHING on `reservation_id`, so a replay creates no second row), `SetStripePaymentIntentID`, `UpdatePaymentIntentStatus`, `GetPaymentIntentByReservation`, `GetPaymentIntentByStripeID`.
+
+**`NormalizePaymentStatus` is where Stripe's vocabulary becomes ours.** Stripe speaks lowercase (`requires_payment_method`); the column uses uppercase, like the reservation statuses. The translation lives next to the CHECK constraint it has to satisfy, so no caller has to remember which vocabulary a field is in — and the two cannot drift.
 
 #### `internal/db/types.go`
 
@@ -1692,6 +1865,48 @@ Tests both propagation paths. (1) Publisher injects the `traceparent` MessageAtt
 
 ---
 
+### `internal/stripe/` — the Stripe client
+
+#### `internal/stripe/client.go`
+
+Three operations, and nothing else: `CreatePaymentIntent`, `VerifyWebhook`, and the snapshot. The SDK's types do not cross this package boundary — everything outside works with the small structs defined here.
+
+**The idempotency key is required.** `CreatePaymentIntent` refuses a call without one, because a missing key would silently turn "retry" into "charge twice". The caller supplies it; `/pay` passes the reservation id.
+
+**The API-version mismatch is ignored deliberately.** The SDK's strict `ConstructEvent` rejects any event whose API version is not on the SDK's own release train. A Stripe account whose webhook endpoint was created against an older API version would then have **every** event rejected — payments never confirm, Stripe keeps retrying a webhook we keep 400ing, and the logs say "signature invalid" rather than "wrong API version". The version check is a serialization check, not a security check; the signature is still verified strictly, and the fields we read do not change shape across versions. A mismatch is logged as a warning so it stays visible.
+
+#### `internal/stripe/events.go`
+
+`Event` is the **snapshot** of a Stripe webhook event: eight fields, in a shape we control, JSON-serialisable end to end. Stripe sends whole objects; this app needs about eight fields. The snapshot keeps the queue carrying a readable, version-stable message — and means a Stripe API version bump cannot silently change the meaning of a message already sitting in the queue.
+
+`SnapshotEvent` switches on the event type and returns `*UnhandledEventError` (wrapping `ErrUnhandledEventType`) for a type we do not act on. The webhook handler tells that apart from a signature failure with `errors.Is` — which is what lets it answer **200** for an unhandled type (so Stripe stops sending it) and **400** for a forged request.
+
+`IsFullRefund()` decides the partial-vs-full refund question: `amount_refunded >= amount` (or an unknown amount) is full.
+
+#### `internal/stripe/client_test.go`
+
+11 tests. The signature ones matter most — missing header, tampered payload, wrong secret, stale timestamp, and the API-version case. `webhook.ComputeSignature` (the SDK's own function) signs the fixtures, so the tests exercise the real format rather than a hand-rolled approximation of it.
+
+---
+
+### `internal/payment/` — the Stripe payment state machine
+
+#### `internal/payment/handler.go`
+
+The consumer side of the Stripe flow (§9b). `HandleMessage` unmarshals the snapshot and applies it; `HandleEvent` switches on the type.
+
+- `payment_intent.succeeded` → `db.TransitionStatus(PENDING_PAYMENT → CONFIRMED)` with the Stripe actor. A lost CAS re-reads the row to find out why: `CONFIRMED` is a duplicate delivery (idempotent), `EXPIRED` is **the race** (alert, do not confirm, do not auto-refund), anything else is also an alert.
+- `payment_intent.payment_failed` → nothing changes. The seat is still held and the customer can retry. A failed payment is a **signal**, not a state — so it writes no audit row.
+- `charge.refunded` → a **full** refund transitions `CONFIRMED → REFUNDED` and INCRBYs the inventory; a **partial** refund writes an audit row with `old_status == new_status` and leaves the status alone.
+
+A malformed message is **dropped**, not redelivered: SQS redelivers a message whose handler errors, forever, and a poison message would block the queue behind it.
+
+#### `internal/payment/handler_test.go`
+
+11 tests against a live Postgres + Redis (skipped when unreachable). The ones that matter: the partial refund leaves the status CONFIRMED and does NOT release the seat; the full refund releases the seat **exactly once** across two deliveries (a double INCRBY there would be a phantom seat); and the expiry race confirms nothing.
+
+---
+
 ### `internal/redis/` — Lua scripts + Go wrappers
 
 #### `internal/redis/client.go`
@@ -1806,6 +2021,7 @@ Creates the two tables every phase needs:
 
 - `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `created_at TIMESTAMPTZ DEFAULT NOW()` — the two money columns are added by `007_event_price.sql` and are the single source of truth for what a seat costs
 - `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `seats INTEGER CHECK (1..10)`, `unit_price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`; `007_event_price.sql` adds the price snapshot (`unit_price_cents` + `currency`), frozen at hold time
+- `payment_intents` — `id BIGSERIAL PRIMARY KEY`, `reservation_id UUID UNIQUE FK → reservations(reservation_id)`, `user_id TEXT`, `stripe_payment_intent_id TEXT UNIQUE` (**nullable** — the row is written before Stripe's `Create` returns), `amount_cents BIGINT CHECK (> 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `status TEXT CHECK (~ '^[A-Z][A-Z_]*$')` — added by `008_stripe_payments.sql`. The two UNIQUE constraints are what make `POST /pay` safely replayable: one reservation, one PaymentIntent, enforced by the database rather than by application discipline
 - Indexes: `idx_reservations_event_status (event_id, status)` for "how many PENDING does this event have?" queries; partial `idx_reservations_pending_expiry (expires_at) WHERE status = 'PENDING_PAYMENT'` powers the sweep job's WHERE clause.
 
 #### `migrations/002_seed.sql`

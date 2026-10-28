@@ -73,6 +73,71 @@ var (
 		},
 	)
 
+	// Stripe payment outcomes (Layer 2, item 7). Incremented by the
+	// stripe-worker as it applies webhook events.
+	//
+	// The two "after terminal" counters are the important ones: they
+	// fire when money arrived for a reservation that was no longer
+	// payable (the hold expired, or the customer cancelled while the
+	// payment was in flight). We alert on those rather than
+	// auto-refunding, because a refund on a race is its own class of
+	// bug. They should always be 0.
+	StripePaymentsSucceeded = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_payments_succeeded_total",
+			Help: "Total Stripe payments that confirmed a reservation.",
+		},
+	)
+
+	StripePaymentsFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_payments_failed_total",
+			Help: "Total Stripe payment attempts that failed. The reservation stays held and the customer can retry.",
+		},
+	)
+
+	StripeRefunds = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_refunds_total",
+			Help: "Total full refunds — the reservation became REFUNDED and the seat went back on sale.",
+		},
+	)
+
+	StripePartialRefunds = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_partial_refunds_total",
+			Help: "Total partial refunds — the money came back, the reservation stayed CONFIRMED.",
+		},
+	)
+
+	StripePaymentAfterExpiry = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_payment_after_expiry_total",
+			Help: "Total payments that succeeded AFTER the hold expired. Should always be 0; a refund is needed and the seat may be oversold.",
+		},
+	)
+
+	StripePaymentAfterTerminal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_payment_after_terminal_total",
+			Help: "Total payments or refunds for a reservation that was already cancelled or refunded. Should always be 0.",
+		},
+	)
+
+	StripePaymentsUnknown = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_payments_unknown_total",
+			Help: "Total Stripe events for a payment intent this system has no record of.",
+		},
+	)
+
+	StripeEventsMalformed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "stripe_events_malformed_total",
+			Help: "Total Stripe events that could not be parsed and were dropped.",
+		},
+	)
+
 	// Idempotency-Key cache outcomes (Layer 1 item 5). Lets ops see
 	// replay traffic vs fresh reserves at a glance, plus catch any
 	// upward drift on body-mismatch (which usually signals a client

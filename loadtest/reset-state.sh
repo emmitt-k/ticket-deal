@@ -23,15 +23,19 @@ EXPECTED_INV=${EXPECTED_INV:-100}
 PG="docker exec -i ticket-postgres psql -v ON_ERROR_STOP=1 -U tickets -d tickets"
 REDIS="docker exec -i ticket-redis redis-cli"
 
-echo "▶ Deleting reservations for event_id=$EVENT_ID (and their audit rows)..."
-# The audit log (reservation_events) references reservations through a
-# FOREIGN KEY, so the audit rows have to go FIRST — and the table is
-# append-only, so the delete needs the documented escape hatch:
+echo "▶ Deleting reservations for event_id=$EVENT_ID (and their audit + payment rows)..."
+# Three tables reference reservations, so they have to go FIRST — in
+# this order, because each one references the row the next one needs:
 #
-#   SET LOCAL ticket_deal.audit_purge = 'on'
-#
-# SET LOCAL is transaction-scoped, so the override cannot leak to
-# another connection. See migrations/005_audit_log.sql.
+#   reservation_events  the audit log. Append-only, so the delete needs
+#                       the documented escape hatch:
+#                         SET LOCAL ticket_deal.audit_purge = 'on'
+#                       SET LOCAL is transaction-scoped, so the
+#                       override cannot leak to another connection.
+#                       See migrations/005_audit_log.sql.
+#   payment_intents     the Stripe payment record. No trigger, just a
+#                       FOREIGN KEY to reservations.
+#   reservations        last.
 #
 # (A load-test reset is a legitimate purge: it wipes the whole event's
 # history on purpose. Production code never sets this GUC.)
@@ -43,6 +47,10 @@ DELETE FROM reservation_events
           SELECT reservation_id FROM reservations WHERE event_id = $EVENT_ID
       );
 COMMIT;
+DELETE FROM payment_intents
+      WHERE reservation_id IN (
+          SELECT reservation_id FROM reservations WHERE event_id = $EVENT_ID
+      );
 DELETE FROM reservations WHERE event_id = $EVENT_ID;
 SQL
 
@@ -63,6 +71,8 @@ echo -n "  reservations (event $EVENT_ID): "
 echo "SELECT COUNT(*) FROM reservations WHERE event_id = $EVENT_ID;" | $PG -tA
 echo -n "  audit rows (event $EVENT_ID)  : "
 echo "SELECT COUNT(*) FROM reservation_events;" | $PG -tA
+echo -n "  payment rows (event $EVENT_ID): "
+echo "SELECT COUNT(*) FROM payment_intents;" | $PG -tA
 echo -n "  inventory:event:$EVENT_ID       : "
 $REDIS GET "inventory:event:$EVENT_ID"
 echo -n "  hold keys (event $EVENT_ID)     : "

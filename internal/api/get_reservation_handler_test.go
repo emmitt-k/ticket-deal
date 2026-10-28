@@ -136,6 +136,14 @@ func apiCleanupReservation(t *testing.T, pool *db.Pool, reservationID string) {
 			_, _ = tx.Exec(ctx, "DELETE FROM reservation_events WHERE reservation_id = $1", reservationID)
 			_ = tx.Commit(ctx)
 		}
+		// The payment row references the reservation, so it has to go
+		// FIRST — otherwise the FK blocks the reservation delete, the
+		// delete fails silently (the error is ignored above), and the
+		// EVENT row leaks too (it references the reservation as well).
+		// A leaked event breaks the next test run: event ids are
+		// globally unique, so the seed INSERT hits a duplicate key.
+		_, _ = pool.Exec(ctx,
+			"DELETE FROM payment_intents WHERE reservation_id = $1", reservationID)
 		_, _ = pool.Exec(ctx,
 			"DELETE FROM reservations WHERE reservation_id = $1", reservationID)
 	})

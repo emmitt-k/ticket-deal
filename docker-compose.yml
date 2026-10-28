@@ -237,6 +237,30 @@ services:
       - "host.docker.internal:host-gateway"   # macOS/Windows host escape
     restart: unless-stopped
 
+  stripe-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: stripe-worker
+    image: ticket-deal-stripe-worker:dev
+    container_name: ticket-stripe-worker
+    environment:
+      LOG_FILE: /app/logs/stripe-worker.log
+    env_file: .env.docker
+    ports:
+      - "8084:8084"     # Prometheus scrapes /metrics
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_healthy
+    restart: unless-stopped
+
   worker:
     build:
       context: .

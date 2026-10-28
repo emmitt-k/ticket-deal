@@ -36,15 +36,15 @@
 | Log search | Grafana Loki 3.3 + Promtail 3.3 |
 | Load testing | k6 (Go + JavaScript) |
 | Service scripts | Bash + curl |
-| Container runtime | Docker Compose (12 services: 8 infra + 4 Go) |
+| Container runtime | Docker Compose (13 services: 8 infra + 5 Go) |
 | CI | GitHub Actions |
 | Dependabot | Go modules + GitHub Actions (weekly, Mondays 09:00 BKK) |
 
 **Product surface status:** Layer 1 of [`docs/product-roadmap.md`](docs/product-roadmap.md)
-is shipped 5/5. Layer 2 item 6 (the append-only audit log) is shipped on
-`feature/audit-log`; items 7-10 (Stripe payment + webhook receiver, notifications, admin
-API, anti-bot) are unstarted. Check the roadmap before assuming an endpoint exists — it is
-the source of truth for what is built vs planned.
+is shipped 5/5 and merged. Layer 2 item 6 (the append-only audit log) is merged into
+`main`. Layer 2 item 7 (the Stripe integration) is on `feature/stripe-integration`;
+items 8-10 (notifications, admin API, anti-bot) are unstarted. Check the roadmap before
+assuming an endpoint exists — it is the source of truth for what is built vs planned.
 
 ---
 
@@ -82,6 +82,8 @@ Observability:
 | `GET /api/reservations/{id}` | JWT | Fetch one reservation. 403 if it belongs to another user |
 | `GET /api/me/reservations` | JWT | List the caller's own reservations. `?status=`, `?limit=`, `?offset=` |
 | `POST /api/reservations/{id}/cancel` | JWT | Cancel a `PENDING_PAYMENT` reservation; releases the seat |
+| `POST /api/reservations/{id}/pay` | JWT | Create the Stripe PaymentIntent; returns the `client_secret` |
+| `POST /webhooks/stripe` | Stripe signature | Stripe's callback. Verifies, snapshots, queues — no state change here |
 
 **Key correctness invariants:**
 - 100 tickets per event (hardcoded seed in `migrations/002_seed.sql`)
@@ -513,6 +515,62 @@ back together, with no extra round-trip.
 insert without duplicating the column list, the trace extraction, or the metadata
 marshalling.
 
+### Item 7 — The Stripe integration
+
+`internal/stripe/` + `internal/payment/` + `migrations/008_stripe_payments.sql`.
+
+The design is **verify → queue → apply**, and the order is the whole point:
+
+```
+POST /webhooks/stripe
+  → verify Stripe's signature over the RAW body   → 400 on failure
+  → snapshot the event into our own struct
+  → publish the snapshot to the `stripe-events` queue → 200
+                                        │
+                                        ▼
+                             cmd/stripe-worker consumes it
+                               → internal/payment applies it
+```
+
+**The webhook handler touches no database and changes no status.** The state machine
+lives in `internal/payment`, behind a queue — the same shape as the reservation path
+(`reserve → SQS → worker`). That keeps the webhook fast (Stripe has a short timeout and
+retries anything that isn't a 2xx) and keeps every status change in one place.
+
+**The failure mode this has to get right is "event accepted but the publish failed".**
+The fix is ordering: **publish FIRST, then return 200**. If the publish fails we return
+500 and Stripe retries the delivery. The window between "we said 200" and "the event is
+durable" therefore does not exist.
+
+| Event | What happens |
+|---|---|
+| `payment_intent.succeeded` | `PENDING_PAYMENT → CONFIRMED` (the only path to CONFIRMED) |
+| `payment_intent.payment_failed` | Nothing changes. The seat is still held; the customer can retry. A failed payment is a **signal**, not a state — so it writes no audit row |
+| `charge.refunded` (full) | `CONFIRMED → REFUNDED`, and the seat goes back on sale |
+| `charge.refunded` (partial) | **An event, not a state.** The status stays `CONFIRMED`, the seat is NOT released, and the refund is recorded in the audit trail with `old_status == new_status` |
+
+**`POST /api/reservations/{id}/pay`** creates the PaymentIntent and returns the
+`client_secret`. It does NOT confirm the payment — the client confirms with the
+client_secret (Stripe Elements), and the server learns the outcome from the webhook,
+because a client that confirms and then never reports back is a case the server must not
+depend on.
+
+**The idempotency key is the `reservation_id`.** That is what makes the crash window
+between "we wrote the payment row" and "Stripe answered" a *retry* rather than a
+*double-charge*: a retried `Create` returns the SAME PaymentIntent. A random key would
+make every retry a new charge.
+
+**The amount is the server's number** — `unit_price_cents × seats` from the reservation's
+price snapshot. The client never names an amount (Convention #16).
+
+**The race.** The customer sat on the payment page for longer than the hold TTL; the
+hold expired, the seat went back on sale, and then the payment succeeded. We do **not**
+confirm (the seat may be sold) and we do **not** auto-refund (a refund on a race is its
+own class of bug — it moves money on a path that did not reason about partial refunds or
+about who owns the seat). We alert: `stripe_payment_after_expiry_total` (should always be
+0), an ERROR log line, and the payment row saying `SUCCEEDED` while the reservation says
+`EXPIRED` — which is exactly the mismatch to look for.
+
 ---
 
 ## Key Files & Directories
@@ -522,12 +580,13 @@ marshalling.
 ├── cmd/
 │   ├── api/                    # HTTP API server (:8080)
 │   ├── worker/                 # SQS consumer → Postgres writer
+│   ├── stripe-worker/          # SQS consumer → the Stripe payment state machine
 │   ├── expiration-watcher/     # Redis keyspace notifications → expire holds
 │   ├── dashboard-server/       # Live k6 dashboard web server (:8082)
 │   ├── mintjwt/                # JWT minting tool (used by load tests)
 │   └── seed-inventory/         # Seeds Postgres with event + 100 seats
 ├── internal/
-│   ├── api/                    # HTTP handlers: reserve, get, list, cancel, readyz, publisher seam
+│   ├── api/                    # HTTP handlers: reserve, get, list, cancel, readyz, pay, stripe webhook, publisher seam
 │   ├── auth/                   # JWT middleware, JWT minting
 │   ├── config/                 # Env var config (incl. PostgresConfig/DSN composition)
 │   ├── db/                     # pgx pool, reservation writes, TransitionStatus, list queries, audit log
@@ -535,8 +594,10 @@ marshalling.
 │   ├── iplimit/                # Redis IP rate-limiter (token bucket)
 │   ├── logging/                # slog Init + ContextHandler (trace_id/span_id injection)
 │   ├── metrics/                # Prometheus catalog (all counters/gauges/histograms)
+│   ├── payment/                # The Stripe payment state machine (the consumer side)
 │   ├── queue/                  # SQS publisher + consumer (aws-sdk-go-v2)
 │   ├── redis/                  # Redis client, Lua scripts, seat locking, Idempotency-Key store
+│   ├── stripe/                 # The Stripe client: create a PaymentIntent, verify a webhook, snapshot an event
 │   ├── tracing/                # OpenTelemetry Init + shutdown flush
 │   ├── waitingroom/            # Waiting room queue + SSE stream
 │   └── apiutil/                # HTTP response helpers + slog access-log middleware
@@ -585,12 +646,13 @@ marshalling.
 │   ├── 004_user_lookup_index.sql  # Composite (user_id, created_at DESC) for GET /api/me/reservations
 │   ├── 005_audit_log.sql         # Layer 2 item 6: append-only reservation_events + append-only trigger
 │   ├── 006_refunded_status.sql   # Adds the REFUNDED status (a refund is not a cancel)
-│   └── 007_event_price.sql       # The price of a seat: events.price_cents + the reservation's snapshot
+│   ├── 007_event_price.sql       # The price of a seat: events.price_cents + the reservation's snapshot
+│   └── 008_stripe_payments.sql   # The payment_intents table (one reservation, one PaymentIntent)
 ├── docker/
 │   └── elasticmq.conf         # Pre-creates the reservations queue on boot
-├── docker-compose.yml         # 12 services: 8 infra (redis, postgres, elasticmq, prometheus,
-│                              #   grafana, jaeger, loki, promtail) + 4 Go (api, worker,
-│                              #   expiration-watcher, dashboard-server)
+├── docker-compose.yml         # 13 services: 8 infra (redis, postgres, elasticmq, prometheus,
+│                              #   grafana, jaeger, loki, promtail) + 5 Go (api, worker,
+│                              #   stripe-worker, expiration-watcher, dashboard-server)
 ├── Dockerfile                 # Multi-stage, distroless/static; SERVICE build arg → /app/server
 ├── .dockerignore              # Keeps build context tight (.git, logs, bin, monitoring, …)
 ├── .env.example               # Template for .env        (host mode — NEVER commit .env)
@@ -654,9 +716,9 @@ Global identity (for other repos): `Emmitt Kaewkarn <emmitt.kaewkarn@krungsri.co
 get-reservations → cancel-reservation → readyz → idempotency-key), and so are the
 four Dependabot PRs (#17-#20).
 
-**Layer 2 item 6 (the audit log) is on `feature/audit-log`** (PR #21) — the
-append-only audit trail, the `REFUNDED` status split, and three bugs the trail
-exposed along the way:
+**Layer 2 item 6 (the audit log) is merged** (PRs #21 and #22) — the append-only audit
+trail, the `REFUNDED` status split, the seat price, and three bugs the trail exposed
+along the way:
 
 - `fix(db)`: `ListReservationsByUser` returned a nil slice instead of an empty one.
   This left **`main` red** for anyone with a local Postgres — CI only stayed green
@@ -668,12 +730,12 @@ exposed along the way:
 - `fix(expire)`: a **double-INCRBY oversell race** in the watcher's expire path — see
   Convention #13
 
-**The seat price is on `feature/seat-price`** (PR #22, stacked on #21) — the price of a
-seat and the frozen snapshot the reservation carries. Merge #21 first; #22's diff
-collapses to its own 5 commits once #21 lands.
+**Layer 2 item 7 (the Stripe integration) is on `feature/stripe-integration`** — the
+payment table, the Stripe client, `POST /pay`, `POST /webhooks/stripe`, the
+`stripe-events` queue, and the payment state machine behind `cmd/stripe-worker`.
 
-Before starting new feature work, check whether those have landed. If they have,
-branch from `main`; if not, branch from the tip and extend the stack.
+Before starting new feature work, check whether that has landed. If it has, branch from
+`main`; if not, branch from its tip and extend the stack.
 
 ---
 
@@ -683,7 +745,7 @@ branch from `main`; if not, branch from the tip and extend the stack.
 2. **Reset state between load test runs** — `make loadtest-state && make loadtest-jwts`
 3. **No external services in unit tests** — all tests use in-memory fakes; `go test ./...` passes without any docker services running. Tests that *want* a live dependency (`internal/db`, live-Redis tests) `t.Skip` when it's unreachable, so the suite is green either way
 4. **JWT TTL** — default 600s (10 min); set via `JWT_TTL_SECONDS` env var in `loadtest/mint-jwts.sh`
-5. **Ports** — *services*: API :8080, Worker :8081, Dashboard :8082, Expiration-watcher :8083 · *infra*: Redis :6379, Postgres :5432, ElasticMQ **:9324** (its native SQS REST port — **not** 4566) + :9325 (web UI) · *observability*: Prometheus :9090, Grafana :3000, Jaeger :16686 (UI) + :4317 (OTLP gRPC) + :4318 (OTLP HTTP) + :14268 (thrift), Loki :3100, Promtail :9080
+5. **Ports** — *services*: API :8080, Worker :8081, Dashboard :8082, Expiration-watcher :8083, Stripe-worker :8084 · *infra*: Redis :6379, Postgres :5432, ElasticMQ **:9324** (its native SQS REST port — **not** 4566) + :9325 (web UI) · *observability*: Prometheus :9090, Grafana :3000, Jaeger :16686 (UI) + :4317 (OTLP gRPC) + :4318 (OTLP HTTP) + :14268 (thrift), Loki :3100, Promtail :9080
 6. **Corporate proxy** — `http.proxy` is set globally in `~/.gitconfig`; SSH bypasses it, HTTPS does not. SSH is used for github.com pushes.
 7. **Commit style** — Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `ci:`)
 8. **Always use `make build` (or `go build -o bin/<name> ./cmd/<name>`)** — never raw `go build ./cmd/<name>/...`. Without `-o`, Go writes the binary to the CWD named after the cmd dir (`./api`, `./worker`, etc.), polluting the repo root. The strays are .gitignored so they won't be committed, but they clutter `ls` and confuse tooling. `make build` always uses `-o $(BIN_DIR)/<name>`, so it can't make this mistake.
@@ -695,7 +757,10 @@ branch from `main`; if not, branch from the tip and extend the stack.
 14. **Every status transition writes an audit row, in the same transaction.** `db.TransitionStatus` takes a mandatory `db.Audit` (actor + metadata) and writes `reservation_events` atomically with the status change. The actor is required — an empty actor type is rejected with `db.ErrInvalidAudit` before any SQL runs. The expire paths are the deliberate exception (their audit `INSERT` is a data-modifying CTE in the same statement — see the Layer 2 section above). **Never write a status change without its audit row, and never write an audit row without the status change.**
 15. **`CANCELLED` and `REFUNDED` are different facts — never merge them.** `CANCELLED` = cancelled before payment; `REFUNDED` = paid, then reversed. The only edge out of `CONFIRMED` is `CONFIRMED → REFUNDED`. If you find yourself wanting to write `status = 'CANCELLED'` on a paid reservation, you want `REFUNDED`. The `?status=` filter, the DB CHECK constraint, and `db.StatusRefunded` all exist for this.
 16. **The price of a seat is a server-side SNAPSHOT, and the client never names it.** `events.price_cents` (plus `events.currency`) is the single source of truth for what a seat costs; `reservations.unit_price_cents` + `reservations.currency` are a frozen copy of it, taken in the *same statement* that creates the reservation row (`db.InsertIfAbsent` reads them with scalar subqueries). The total owed is `unit_price_cents × seats` — computed in SQL from the two frozen columns, so it can never disagree with them. Why a snapshot and not a live lookup: an organizer changing the price must never retroactively alter a seat that is already held or already paid. No endpoint accepts a price field — a client that could send one could ask for a free ticket. The price is also recorded in the CREATED audit row's metadata, so the money is in the audit trail.
-17. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
+17. **The webhook handler verifies, snapshots and queues — it never changes a status.** Every status change happens in `internal/payment`, behind the `stripe-events` queue. The webhook endpoint must stay fast (Stripe has a short timeout) and it must publish BEFORE returning 200 — otherwise "the event was accepted but the publish failed" loses a payment confirmation permanently. A 500 makes Stripe retry; the state machine is idempotent, so a retry is safe.
+18. **The idempotency key for a PaymentIntent is the `reservation_id`.** Never a random value and never a timestamp: a random key turns every retry into a new charge. The `payment_intents.reservation_id` UNIQUE constraint makes a second `/pay` a no-op at the database level, and the idempotency key makes it a no-op at Stripe's level. Together they close the crash window between "we wrote the row" and "Stripe answered".
+19. **Stripe is OPTIONAL, but HALF-configured is a startup error.** Both secret keys absent → the payment routes answer 503 and the rest of the system works unchanged. Exactly one present → `config.Load()` fails fast, because an API that can create PaymentIntents but cannot verify webhooks is exactly the state where payments get silently stuck. A MALFORMED key is also a startup error; an ABSENT key is not — the reservation core does not need Stripe.
+20. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
 
 ---
 

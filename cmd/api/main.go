@@ -34,11 +34,12 @@ import (
 	slogmw "github.com/emmitt-k/ticket-deal/internal/apiutil/middleware"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
+	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/logging"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
-	"github.com/emmitt-k/ticket-deal/internal/db"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
+	"github.com/emmitt-k/ticket-deal/internal/stripe"
 	"github.com/emmitt-k/ticket-deal/internal/tracing"
 	"github.com/emmitt-k/ticket-deal/internal/waitingroom"
 )
@@ -121,7 +122,7 @@ func run() error {
 			RefillRate:      cfg.WaitRoom.RefillRate,
 			QueueTTLSeconds: cfg.WaitRoom.QueueTTLSeconds,
 		},
-		JWTSecret:   cfg.JWTSecret,
+		JWTSecret:    cfg.JWTSecret,
 		TickInterval: 100 * time.Millisecond,
 	}
 	// drainerCtx is derived from the server ctx so shutting down the
@@ -148,6 +149,19 @@ func run() error {
 		metricsEventID,
 		5*time.Second,
 	)
+
+	// ── Stripe (Layer 2, item 7) ──────────────────────────────────
+	//
+	// Stripe is OPTIONAL. Without the keys the feature is off and
+	// both routes answer 503: the reservation core does not need
+	// Stripe, and making a ticket server refuse to boot without a
+	// payment account is a strange dependency.
+	//
+	// (A HALF-configured Stripe is a startup error, not a choice —
+	// see config.Load. An API that can create PaymentIntents but
+	// cannot verify webhooks is exactly the state where payments get
+	// silently stuck.)
+	payHandler, stripeWebhookHandler := buildStripeHandlers(pool, *cfg)
 
 	// ── HTTP router ────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -234,7 +248,22 @@ func run() error {
 		// status-machine flow + partial-failure policy.
 		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reservations/{id}/cancel",
 			api.CancelReservationHandler(pool, rdb))
+
+		// POST /api/reservations/{id}/pay  — Layer 2, item 7. Creates
+		// the Stripe PaymentIntent and returns the client_secret.
+		r.With(auth.Middleware(cfg.JWTSecret)).Post("/reservations/{id}/pay",
+			payHandler)
 	})
+
+	// POST /webhooks/stripe  — Layer 2, item 7.
+	//
+	// NOT behind auth.Middleware: Stripe's signature IS the
+	// authentication. There is no bearer token to check, and adding
+	// one would be a second, weaker secret.
+	//
+	// The handler only verifies and queues — the state machine lives
+	// in cmd/stripe-worker, behind the stripe-events queue.
+	r.Post("/webhooks/stripe", stripeWebhookHandler)
 
 	// ── HTTP server ────────────────────────────────────────────────
 	// otelhttp.NewHandler wraps the router so every incoming request
@@ -364,6 +393,52 @@ func buildPublisher(cfg config.Config) api.ReservationPublisher {
 		"queue", cfg.SQS.QueueURL,
 	)
 	return queue.NewReservationAPIPublisher(queue.NewSQSPublisher(sqsClient, cfg.SQS.QueueURL))
+}
+
+// buildStripeHandlers returns the /pay handler and the
+// /webhooks/stripe handler.
+//
+// When Stripe is not configured, both are the same "not configured"
+// handler, which answers 503. The ROUTES still exist — a client that
+// asks for a payment gets a clear "this server does not take
+// payments", not a 404 that looks like a wrong URL.
+func buildStripeHandlers(pool *db.Pool, cfg config.Config) (http.HandlerFunc, http.HandlerFunc) {
+	notConfigured := func(w http.ResponseWriter, _ *http.Request) {
+		apiutil.WriteError(w, http.StatusServiceUnavailable,
+			"stripe_not_configured", "payments are not configured on this server")
+	}
+
+	if !cfg.Stripe.Enabled {
+		slog.Info("Stripe not configured — the payment routes answer 503")
+		return notConfigured, notConfigured
+	}
+	if cfg.Stripe.EventsQueueURL == "" {
+		// The webhook handler needs somewhere to put the event. With
+		// no queue there is nowhere to put it, and dropping payment
+		// confirmations silently is the worst possible outcome — so
+		// this is a startup error, not a degraded mode.
+		slog.Error("STRIPE_EVENTS_QUEUE_URL is not set — Stripe cannot work without it")
+		os.Exit(1)
+	}
+
+	sqsClient, err := queue.NewSQSClient(context.Background(), queue.AWSConfig{
+		Region:      cfg.SQS.Region,
+		EndpointURL: cfg.SQS.EndpointURL,
+		QueueURL:    cfg.Stripe.EventsQueueURL,
+	})
+	if err != nil {
+		slog.Error("build SQS client for stripe events", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("Stripe wired",
+		"events_queue", cfg.Stripe.EventsQueueURL,
+		"publishable_key_set", cfg.Stripe.PublishableKey != "",
+	)
+
+	client := stripe.NewClient(cfg.Stripe.SecretKey, cfg.Stripe.WebhookSecret)
+	eventPublisher := queue.NewEventAPIPublisher(queue.NewSQSPublisher(sqsClient, cfg.Stripe.EventsQueueURL))
+
+	return api.PayHandler(pool, client), api.StripeWebhookHandler(client, eventPublisher)
 }
 
 // metricsMiddleware returns a chi-compatible middleware that records
