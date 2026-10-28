@@ -86,6 +86,15 @@ const (
 	// recorded here too — it leaves the status at CONFIRMED, because a
 	// partial refund is an event, not a state.
 	AuditEventRefundInitiated = "REFUND_INITIATED"
+
+	// AuditEventSeatReleased — an admin put a seat back on sale
+	// without changing the reservation's status (Layer 2, item 9, the
+	// admin/ops API). It is an EVENT and not a state: the inventory
+	// changed, the reservation did not. The row carries
+	// old_status == new_status, exactly like a partial refund.
+	//
+	// The migration that allows it is 009_admin_audit.sql.
+	AuditEventSeatReleased = "SEAT_RELEASED"
 )
 
 // ── Actor types ────────────────────────────────────────────────────────
