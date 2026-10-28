@@ -29,6 +29,7 @@ import (
 	"github.com/redis/go-redis/extra/redisotel/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/emmitt-k/ticket-deal/internal/admin"
 	"github.com/emmitt-k/ticket-deal/internal/api"
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	slogmw "github.com/emmitt-k/ticket-deal/internal/apiutil/middleware"
@@ -163,6 +164,15 @@ func run() error {
 	// silently stuck.)
 	payHandler, stripeWebhookHandler := buildStripeHandlers(pool, *cfg)
 
+	// ── Admin / ops API (Layer 2, item 9) ────────────────────────
+	//
+	// Also OPTIONAL: with no ADMIN_API_KEYS the routes are not
+	// mounted at all and the API answers 503 for them. The admin
+	// surface is authenticated with an HMAC over the request rather
+	// than a bearer token — see internal/admin for why.
+	adminVerifier := admin.NewVerifier(cfg.Admin.Keys)
+	adminHandlers := &admin.Handlers{Pool: pool, Rdb: rdb, Verifier: adminVerifier}
+
 	// ── HTTP router ────────────────────────────────────────────────
 	r := chi.NewRouter()
 	// Replace chi/middleware.Logger with our slog-based access log
@@ -264,6 +274,14 @@ func run() error {
 	// The handler only verifies and queues — the state machine lives
 	// in cmd/stripe-worker, behind the stripe-events queue.
 	r.Post("/webhooks/stripe", stripeWebhookHandler)
+
+	// ── Admin / ops API (Layer 2, item 9) ────────────────────────
+	//
+	// Register() is a no-op when no admin key is configured, so the
+	// /admin tree simply does not exist. A request to it gets chi's
+	// 404, and the /readyz-style "is this feature available" answer
+	// is "no admin keys are configured".
+	adminHandlers.Register(r)
 
 	// ── HTTP server ────────────────────────────────────────────────
 	// otelhttp.NewHandler wraps the router so every incoming request
