@@ -2294,6 +2294,9 @@ The two load-test targets pre-flight a `curl -sf -m 2 http://localhost:8080/heal
 
 ## See also
 
+- [`design-decisions.md`](design-decisions.md) — the load-bearing calls in one page:
+  each decision, the obvious alternative, and the failure that alternative invites.
+
 - [README](../README.md) — project landing page (status table, tech stack, quick start)
 - [AGENTS.md](../AGENTS.md) — canonical AI-assistant context (project layout, conventions, env vars)
 - [`/docs/product-roadmap.md`](product-roadmap.md) — **what's next**: numbered layers, per-item specs, gap list
