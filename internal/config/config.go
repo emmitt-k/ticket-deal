@@ -54,6 +54,12 @@ type Config struct {
 	// sell-time).
 	Postgres PostgresConfig
 
+	// Admin is the support/ops API (Layer 2, item 9). It is OPTIONAL
+	// in the same way Stripe is: with no keys the admin routes are not
+	// mounted at all and the API answers 503 for them. The rest of
+	// the system is unaffected.
+	Admin AdminConfig
+
 	// Stripe is the payment integration (Layer 2, item 7). It is
 	// OPTIONAL: with no keys set, the feature is off and the Stripe
 	// routes answer 503. The reservation core does not need Stripe,
@@ -92,6 +98,21 @@ type StripeConfig struct {
 	// Enabled is true when both secret values are present. When
 	// false, the Stripe routes answer 503 rather than pretending to
 	// work.
+	Enabled bool
+}
+
+// AdminConfig groups the admin/ops API knobs.
+//
+// The keys are SHARED SECRETS used to sign admin requests with an
+// HMAC. More than one may be configured so a key can be rotated: add
+// the new one, deploy, remove the old one. The audit trail records
+// the FINGERPRINT of the key that acted (the first 8 hex characters
+// of its SHA-256), so the two are distinguishable without the secret
+// ever being stored.
+type AdminConfig struct {
+	// Keys are the configured shared secrets.
+	Keys []string
+	// Enabled is true when at least one key is configured.
 	Enabled bool
 }
 
@@ -198,6 +219,16 @@ func Load() (*Config, error) {
 		},
 	}
 
+	// The admin/ops API keys. A comma-separated list, so a key can be
+	// rotated without a flag day. Empty means the feature is off and
+	// the admin routes are not mounted — the same shape as the
+	// optional Stripe integration.
+	adminKeys := splitKeys(os.Getenv("ADMIN_API_KEYS"))
+	cfg.Admin = AdminConfig{
+		Keys:    adminKeys,
+		Enabled: len(adminKeys) > 0,
+	}
+
 	stripeSecret := os.Getenv("STRIPE_SECRET_KEY")
 	stripeWebhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
 	switch {
@@ -229,6 +260,27 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// splitKeys parses a comma-separated list of secrets, trimming the
+// whitespace around each and dropping the empties. An empty string
+// yields an empty list — which is how "the feature is off" is
+// expressed.
+func splitKeys(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if k := strings.TrimSpace(p); k != "" {
+			out = append(out, k)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // atoiOr parses s as int, returns def on error or empty string.

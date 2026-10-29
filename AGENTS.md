@@ -41,10 +41,11 @@
 | Dependabot | Go modules + GitHub Actions (weekly, Mondays 09:00 BKK) |
 
 **Product surface status:** Layer 1 of [`docs/product-roadmap.md`](docs/product-roadmap.md)
-is shipped 5/5 and merged. Layer 2 item 6 (the append-only audit log) is merged into
-`main`. Layer 2 item 7 (the Stripe integration) is on `feature/stripe-integration`;
-items 8-10 (notifications, admin API, anti-bot) are unstarted. Check the roadmap before
-assuming an endpoint exists — it is the source of truth for what is built vs planned.
+is shipped 5/5 and merged. Layer 2 item 6 (the append-only audit log) and item 7 (the
+Stripe integration) are merged into `main`. Layer 2 item 9 (the admin/ops API) is on
+`feature/admin-api`. Items 8 and 10 (notifications, anti-bot) are unstarted. Check the
+roadmap before assuming an endpoint exists — it is the source of truth for what is built
+vs planned.
 
 ---
 
@@ -84,6 +85,10 @@ Observability:
 | `POST /api/reservations/{id}/cancel` | JWT | Cancel a `PENDING_PAYMENT` reservation; releases the seat |
 | `POST /api/reservations/{id}/pay` | JWT | Create the Stripe PaymentIntent; returns the `client_secret` |
 | `POST /webhooks/stripe` | Stripe signature | Stripe's callback. Verifies, snapshots, queues — no state change here |
+| `GET /admin/reservations/lookup?user_id=` | HMAC | Support lookup — a user's reservations |
+| `GET /admin/reservations/{id}` | HMAC | Support lookup — one reservation |
+| `POST /admin/reservations/{id}/cancel` | HMAC | Cancel a held reservation; releases the seat |
+| `POST /admin/reservations/{id}/release-seat` | HMAC | Put a seat back on sale; the status does not change |
 
 **Key correctness invariants:**
 - 100 tickets per event (hardcoded seed in `migrations/002_seed.sql`)
@@ -564,12 +569,64 @@ make every retry a new charge.
 price snapshot. The client never names an amount (Convention #16).
 
 **The race.** The customer sat on the payment page for longer than the hold TTL; the
-hold expired, the seat went back on sale, and then the payment succeeded. We do **not**
+hold expired, the seat went on sale, and then the payment succeeded. We do **not**
 confirm (the seat may be sold) and we do **not** auto-refund (a refund on a race is its
 own class of bug — it moves money on a path that did not reason about partial refunds or
 about who owns the seat). We alert: `stripe_payment_after_expiry_total` (should always be
 0), an ERROR log line, and the payment row saying `SUCCEEDED` while the reservation says
 `EXPIRED` — which is exactly the mismatch to look for.
+
+### Item 9 — The admin / ops API
+
+`internal/admin/` + `migrations/009_admin_audit.sql`. Every real product has a support
+override, and usually glosses over it. This one is small and deliberately bounded:
+
+```
+GET  /admin/reservations/lookup?user_id=…   support lookup
+GET  /admin/reservations/{id}                support lookup
+POST /admin/reservations/{id}/cancel         cancel a held reservation
+POST /admin/reservations/{id}/release-seat   put a seat back on sale
+```
+
+**The authentication is an HMAC over the REQUEST, not a bearer token.** A bearer token
+travels with every request and a captured one is replayable forever. The signature covers
+the method, the path, the body and a timestamp, so a captured signature is good for one
+request, one body, five minutes:
+
+```
+X-Admin-Key:       <hex hmac-sha256>
+X-Admin-Timestamp: <unix seconds>
+
+signature = HMAC-SHA256(secret, method + "\n" + uri + "\n" + body + "\n" + timestamp)
+```
+
+**The signature covers the FULL URI INCLUDING THE QUERY STRING.** A signature that did
+not cover it could be replayed against a different `user_id`, which would turn a support
+lookup into a data-exfiltration tool.
+
+**The actor id in the audit trail is the FINGERPRINT of the key** (the first 8 hex
+characters of the key's SHA-256), never the secret — so the trail records *which* key
+acted without storing it. More than one key may be configured (`ADMIN_API_KEYS` is a
+comma-separated list), so a key can be rotated.
+
+**The power is bounded by the state machine.** A `CONFIRMED` reservation is REFUNDED, not
+cancelled — there is no `CONFIRMED → CANCELLED` edge, and the `409` says so. Each
+forbidden status gets its own code (`already_paid`, `already_refunded`, `already_expired`)
+because they are different facts. An already-cancelled reservation is a `200`
+(idempotent), so a retried admin call is not a failure.
+
+**The seat release is atomic** (`internal/redis/scripts/release_seat.lua`). The hold key
+is the guard: a missing hold means the seat is *already* back on sale, and releasing it
+again would oversell. The admin path needs that guard because it changes no status, so
+nothing else arbitrates between two operators doing it at once.
+
+**Lookups are logged, not audited.** The audit table is a state-transition trail, and a
+read is not a transition. "Support looked up this customer's data" is worth recording, so
+it goes to the structured log with the actor — a deliberate deviation from the roadmap's
+"every admin call writes to the audit log".
+
+**The feature is OPTIONAL, like Stripe.** With no `ADMIN_API_KEYS` the routes are **not
+mounted at all** — off, not open.
 
 ---
 
@@ -586,6 +643,7 @@ about who owns the seat). We alert: `stripe_payment_after_expiry_total` (should 
 │   ├── mintjwt/                # JWT minting tool (used by load tests)
 │   └── seed-inventory/         # Seeds Postgres with event + 100 seats
 ├── internal/
+│   ├── admin/                  # The admin/ops API — HMAC-signed, audited, bounded
 │   ├── api/                    # HTTP handlers: reserve, get, list, cancel, readyz, pay, stripe webhook, publisher seam
 │   ├── auth/                   # JWT middleware, JWT minting
 │   ├── config/                 # Env var config (incl. PostgresConfig/DSN composition)
@@ -648,7 +706,8 @@ about who owns the seat). We alert: `stripe_payment_after_expiry_total` (should 
 │   ├── 005_audit_log.sql         # Layer 2 item 6: append-only reservation_events + append-only trigger
 │   ├── 006_refunded_status.sql   # Adds the REFUNDED status (a refund is not a cancel)
 │   ├── 007_event_price.sql       # The price of a seat: events.price_cents + the reservation's snapshot
-│   └── 008_stripe_payments.sql   # The payment_intents table (one reservation, one PaymentIntent)
+│   ├── 008_stripe_payments.sql   # The payment_intents table (one reservation, one PaymentIntent)
+│   └── 009_admin_audit.sql       # The SEAT_RELEASED audit event (the admin API)
 ├── docker/
 │   └── elasticmq.conf         # Pre-creates the reservations queue on boot
 ├── docker-compose.yml         # 13 services: 8 infra (redis, postgres, elasticmq, prometheus,
@@ -793,12 +852,15 @@ along the way:
 - `fix(expire)`: a **double-INCRBY oversell race** in the watcher's expire path — see
   Convention #13
 
-**Layer 2 item 7 (the Stripe integration) is on `feature/stripe-integration`** — the
-payment table, the Stripe client, `POST /pay`, `POST /webhooks/stripe`, the
-`stripe-events` queue, and the payment state machine behind `cmd/stripe-worker`.
+**Layer 2 item 7 (the Stripe integration) is MERGED** (PR #23) — the payment table, the
+Stripe client, `POST /pay`, `POST /webhooks/stripe`, the `stripe-events` queue, and the
+payment state machine behind `cmd/stripe-worker`.
 
-Before starting new feature work, check whether that has landed. If it has, branch from
-`main`; if not, branch from its tip and extend the stack.
+**Layer 2 item 9 (the admin/ops API) is on `feature/admin-api`** — the HMAC-signed
+support endpoints, the atomic seat release, and the `SEAT_RELEASED` audit event.
+
+Before starting new feature work, check whether those have landed. If they have, branch
+from `main`; if not, branch from the tip and extend the stack.
 
 ---
 
@@ -824,7 +886,8 @@ Before starting new feature work, check whether that has landed. If it has, bran
 18. **The idempotency key for a PaymentIntent is the `reservation_id`.** Never a random value and never a timestamp: a random key turns every retry into a new charge. The `payment_intents.reservation_id` UNIQUE constraint makes a second `/pay` a no-op at the database level, and the idempotency key makes it a no-op at Stripe's level. Together they close the crash window between "we wrote the row" and "Stripe answered".
 19. **Stripe is OPTIONAL, but HALF-configured is a startup error.** Both secret keys absent → the payment routes answer 503 and the rest of the system works unchanged. Exactly one present → `config.Load()` fails fast, because an API that can create PaymentIntents but cannot verify webhooks is exactly the state where payments get silently stuck. A MALFORMED key is also a startup error; an ABSENT key is not — the reservation core does not need Stripe.
 20. **A concurrency test must CONTROL the schedule, not hope for it.** A test that fires two goroutines and asserts a particular interleaving is asserting a timing window, not a contract — and it will pass on your machine and fail on a busy CI runner. The fix is to park one participant at a known point (a hook inside the code under test) until the test says go. `internal/api`'s `testPublisher.beforePublish` hook is the worked example: it parks the winner inside `Publish`, where the Idempotency-Key in-flight lock is provably still held, so the loser is *guaranteed* to meet the lock. And assert the **error code**, not just the status: with the lock broken, the loser falls through to the Lua script and gets `409 already_holding` — the same status, a different fact. A test that cannot fail is not a test.
-21. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
+21. **The admin API's power is BOUNDED by the state machine, and every write is audited.** An admin override is not a licence to skip the rules — it is the same rules with a different actor. So: a `CONFIRMED` reservation is REFUNDED, not cancelled (there is no `CONFIRMED → CANCELLED` edge, and the `409 already_paid` says so); the cancel's audit row is written by `db.TransitionStatus` in the SAME transaction, with `actor_type='admin'`; and the actor id is the FINGERPRINT of the signing key, never the secret. The authentication is an HMAC over the request — the method, the FULL URI (query string included), the body and a timestamp — so a captured signature is good for one request, one body, five minutes. Signing only the path would let a captured signature be replayed against a different `user_id`.
+22. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
 
 ---
 
