@@ -33,7 +33,13 @@ Reserve a seat:
 
 ```bash
 make env
-JWT=$(USER=demo EVENT=1 make -s mintjwt)
+
+# The event id is a UUID minted by the app — there is no seeded event,
+# so ask the database which one to sell.
+export EVENT_ID=$(docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
+  "SELECT id FROM events LIMIT 1")
+
+JWT=$(USER_ID=demo EVENT_ID=$EVENT_ID make -s mintjwt)
 
 curl -s -X POST localhost:8080/api/tickets/reserve \
   -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
@@ -162,6 +168,16 @@ make loadtest-burst   # 1,000 VUs at once — the thundering herd
 
 Both reset the state, mint the JWTs and run themselves. The live k6 dashboard is on
 `:8082` while they run.
+
+They need an `EVENT_ID` — there is no seeded event, so pick the one you want to sell:
+
+```bash
+export EVENT_ID=$(docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
+  "SELECT id FROM events LIMIT 1")
+
+make loadtest-ramp    # 0 → 50 → 200 → 1,000 VUs, ~90 s
+make loadtest-burst   # 1,000 VUs at once — the thundering herd
+```
 
 ---
 

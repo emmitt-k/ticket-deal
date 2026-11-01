@@ -5,9 +5,14 @@
 # is documented via `##` after the colon; `make help` lists them.
 #
 # Common overrides (any target):
-#   make loadtest-burst VUS=500
-#   make seed-inventory EVENT_ID=2
-#   make mintjwt USER=alice EVENT=42
+#   make loadtest-burst VUS=500 EVENT_ID=<uuid>
+#   make seed-inventory
+#
+# EVENT_ID is the event's UUID and is REQUIRED for the load-test
+# targets — no event is seeded any more, so there is no default. Get
+# the id with:
+#   docker exec -i ticket-postgres psql -U tickets -d tickets \
+#     -c "SELECT id FROM events LIMIT 1"
 # ──────────────────────────────────────────────────────────────────────
 
 # ─── Variables ────────────────────────────────────────────────────────
