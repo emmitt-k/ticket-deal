@@ -72,7 +72,7 @@ const (
 // INCRBY failures are logged but don't fail the call (DB row is the
 // durable state and is already EXPIRED).
 func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
-	eventID int64, userID string,
+	eventID string, userID string,
 ) error {
 	// Manual span around the watcher-driven compensation path. This
 	// is a ROOT span (no upstream trace context) because the trigger
@@ -82,7 +82,7 @@ func Compensate(ctx context.Context, pool *db.Pool, rdb *redis.Client,
 	ctx, span := tracer.Start(ctx, "expire.compensate",
 		trace.WithSpanKind(trace.SpanKindInternal),
 		trace.WithAttributes(
-			attribute.Int64("expire.event_id", eventID),
+			attribute.String("expire.event_id", eventID),
 			attribute.Int64("expire.user_id_hash", hashUserID(userID)),
 		),
 	)
@@ -176,7 +176,7 @@ func hashUserID(s string) int64 {
 // through the helper would trade one atomicity for another — and this
 // is the one path where a subtle race means overselling.
 func expireRowIfPending(ctx context.Context, pool *db.Pool,
-	userID string, eventID int64,
+	userID string, eventID string,
 ) (int, error) {
 	auditSQL, auditParams, err := db.AuditInsertSelect(ctx, "updated", db.AuditEntry{
 		EventType: db.AuditEventExpired,

@@ -247,10 +247,10 @@ func Handler() http.Handler {
 // these up to the concrete Redis-backed implementations.
 type (
 	SeatsAvailableGetter interface {
-		GetAvailableSeats(ctx context.Context, eventID int64) (int, error)
+		GetAvailableSeats(ctx context.Context, eventID string) (int, error)
 	}
 	QueueSizeGetter interface {
-		GetQueueSize(ctx context.Context, eventID int64) (int, error)
+		GetQueueSize(ctx context.Context, eventID string) (int, error)
 	}
 )
 
@@ -268,7 +268,7 @@ func StartStateUpdater(
 	ctx context.Context,
 	seats SeatsAvailableGetter,
 	queue QueueSizeGetter,
-	eventID int64,
+	eventID string,
 	interval time.Duration,
 ) {
 	go func() {
@@ -293,7 +293,7 @@ func updateOnce(
 	ctx context.Context,
 	seats SeatsAvailableGetter,
 	queue QueueSizeGetter,
-	eventID int64,
+	eventID string,
 ) {
 	// Use a short timeout per scrape so a slow Redis doesn't pile up
 	// goroutines if the ticker fires faster than Redis responds.

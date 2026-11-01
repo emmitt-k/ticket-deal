@@ -15,13 +15,19 @@
 // Usage:
 //
 //	go run ./cmd/mintjwt
-//	# mints for user="alice" (default), event=42 (default)
+//	# mints for user="alice" (default), event=EVENT_ID (required)
 //
-//	USER_ID=smoke-user EVENT_ID=1 go run ./cmd/mintjwt
-//	# mints a 2-minute token for smoke-user on event 1
+//	USER_ID=smoke-user EVENT_ID=<uuid> go run ./cmd/mintjwt
+//	# mints a 2-minute token for smoke-user on that event
 //
-//	JWT=$(USER_ID=u1 EVENT_ID=1 go run ./cmd/mintjwt)
+//	JWT=$(USER_ID=u1 EVENT_ID=<uuid> go run ./cmd/mintjwt)
 //	curl -H "Authorization: Bearer $JWT" http://localhost:8080/api/tickets/reserve
+//
+// EVENT_ID is the event's UUID. There is no default: the event id is
+// minted by the application, and no event is seeded, so the only way
+// to know the id is to ask the database:
+//
+//	SELECT id FROM events;
 //
 // TTL defaults to 120 s (matching the auth.Middleware cap set by
 // POST /api/tickets/enter). Override with TTL_SECONDS=N for longer
@@ -39,6 +45,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/emmitt-k/ticket-deal/internal/auth"
+	"github.com/emmitt-k/ticket-deal/internal/eventid"
 )
 
 func main() {
@@ -66,12 +73,24 @@ func run() error {
 			len(secret))
 	}
 
-	// ── Optional: USER_ID (default alice), EVENT_ID (default 42) ──
+	// ── Optional: USER_ID (default alice), EVENT_ID (required) ───────────
+	//
+	// EVENT_ID is REQUIRED. The event id is a UUID minted by the
+	// application (see internal/eventid), and there is no longer a
+	// seeded event to fall back on — so there is no sensible default.
+	// A default here would silently mint a token for an event that does
+	// not exist, and the failure would show up much later as a puzzling
+	// "event_not_found" on the reserve call.
 	userID := getEnv("USER_ID", "alice")
-	eventIDStr := getEnv("EVENT_ID", "42")
-	eventID, err := strconv.ParseInt(eventIDStr, 10, 64)
-	if err != nil || eventID <= 0 {
-		return fmt.Errorf("EVENT_ID must be a positive integer (got %q)", eventIDStr)
+	eventIDStr := os.Getenv("EVENT_ID")
+	if eventIDStr == "" {
+		return errors.New(
+			"EVENT_ID is required — it is the UUID of the event " +
+				"(see: SELECT id FROM events)")
+	}
+	eventID, err := eventid.Parse(eventIDStr)
+	if err != nil {
+		return fmt.Errorf("EVENT_ID: %w", err)
 	}
 
 	// ── Optional: TTL_SECONDS (default 120) ───────────────────────
@@ -96,7 +115,7 @@ func run() error {
 	// (e.g. `JWT=$(go run ./cmd/mintjwt)`). Status / hints go to
 	// stderr so they don't pollute the captured value.
 	fmt.Fprintln(os.Stderr,
-		fmt.Sprintf("mintjwt: issued for user=%s event=%d ttl=%s (len=%d)",
+		fmt.Sprintf("mintjwt: issued for user=%s event=%s ttl=%s (len=%d)",
 			userID, eventID, ttl, len(tok)))
 	fmt.Print(tok) // no trailing newline — pipe-friendly
 	return nil

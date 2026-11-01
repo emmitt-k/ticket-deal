@@ -104,7 +104,7 @@ func GetReservationHandler(pool *db.Pool) http.HandlerFunc {
 		span.SetAttributes(
 			attribute.String("lookup.outcome", "ok"),
 			attribute.String("reservation.status", row.Status),
-			attribute.Int64("reservation.event_id", row.EventID),
+			attribute.String("reservation.event_id", row.EventID),
 		)
 		apiutil.WriteJSON(w, http.StatusOK, row)
 	}

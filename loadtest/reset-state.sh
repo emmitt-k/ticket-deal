@@ -2,18 +2,42 @@
 # Reset the system to a known clean state for the load test.
 #
 # Steps (idempotent — safe to re-run between test runs):
-#   1. Delete the reservations for event_id=1 (the seed event), plus
-#      their audit-log rows
-#   2. Delete all hold:* keys in Redis
-#   3. Re-seed inventory:event:1 = 100 from Postgres via cmd/seed-inventory
+#   1. Delete the reservations for $EVENT_ID, plus their audit + payment rows
+#   2. Delete all hold:* keys for that event in Redis
+#   3. Re-seed inventory:event:$EVENT_ID from Postgres via cmd/seed-inventory
 #   4. Print a one-line summary so you can eyeball it
 #
 # Run from the repo root.
+#
+# ── EVENT_ID is REQUIRED ──────────────────────────────────────────────
+#
+# There is no seeded event any more: the event id is a UUID minted by
+# the application, and events are created through the admin API. So
+# there is no id to default to — a default would silently reset an
+# event that does not exist, and the burst test would then measure
+# nothing while looking like it worked.
+#
+# Get the id from the database:
+#
+#   docker exec -i ticket-postgres psql -U tickets -d tickets \
+#     -c "SELECT id FROM events LIMIT 1"
+#
+# or pass it in:
+#
+#   EVENT_ID=<uuid> ./loadtest/reset-state.sh
 
 set -euo pipefail
 
-EVENT_ID=${EVENT_ID:-1}
+EVENT_ID=${EVENT_ID:-}
 EXPECTED_INV=${EXPECTED_INV:-100}
+
+if [ -z "$EVENT_ID" ]; then
+    echo "ERROR: EVENT_ID is required — it is the UUID of the event to reset." >&2
+    echo "" >&2
+    echo "  Get it with:" >&2
+    echo "    docker exec -i ticket-postgres psql -U tickets -d tickets -c \"SELECT id FROM events LIMIT 1\"" >&2
+    exit 1
+fi
 
 # ON_ERROR_STOP=1 matters here: without it psql exits 0 even when a
 # statement fails, so `set -e` never fires and a broken reset looks
@@ -44,14 +68,14 @@ BEGIN;
 SET LOCAL ticket_deal.audit_purge = 'on';
 DELETE FROM reservation_events
       WHERE reservation_id IN (
-          SELECT reservation_id FROM reservations WHERE event_id = $EVENT_ID
+          SELECT reservation_id FROM reservations WHERE event_id = '$EVENT_ID'
       );
 COMMIT;
 DELETE FROM payment_intents
       WHERE reservation_id IN (
-          SELECT reservation_id FROM reservations WHERE event_id = $EVENT_ID
+          SELECT reservation_id FROM reservations WHERE event_id = '$EVENT_ID'
       );
-DELETE FROM reservations WHERE event_id = $EVENT_ID;
+DELETE FROM reservations WHERE event_id = '$EVENT_ID';
 SQL
 
 echo "▶ Deleting all hold: keys..."
@@ -68,7 +92,7 @@ go run ./cmd/seed-inventory
 echo ""
 echo "--------------- STATE ---------------"
 echo -n "  reservations (event $EVENT_ID): "
-echo "SELECT COUNT(*) FROM reservations WHERE event_id = $EVENT_ID;" | $PG -tA
+echo "SELECT COUNT(*) FROM reservations WHERE event_id = '$EVENT_ID';" | $PG -tA
 echo -n "  audit rows (event $EVENT_ID)  : "
 echo "SELECT COUNT(*) FROM reservation_events;" | $PG -tA
 echo -n "  payment rows (event $EVENT_ID): "

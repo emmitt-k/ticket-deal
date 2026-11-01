@@ -14,13 +14,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/emmitt-k/ticket-deal/internal/apiutil"
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
+	"github.com/emmitt-k/ticket-deal/internal/eventid"
 	"github.com/emmitt-k/ticket-deal/internal/iplimit"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
@@ -32,11 +32,19 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			UserID  string `json:"user_id"`
-			EventID int64  `json:"event_id"`
+			EventID string `json:"event_id"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" || req.EventID <= 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" {
 			apiutil.WriteError(w, http.StatusBadRequest, "invalid_request",
-				"body must be {user_id: string, event_id: positive integer}")
+				"body must be {user_id: string, event_id: uuid}")
+			return
+		}
+		// The event id is a UUID (see internal/eventid). Validating it
+		// here means a malformed id is rejected at the edge, before it
+		// reaches a Redis key or a signed token.
+		if _, err := eventid.Parse(req.EventID); err != nil {
+			apiutil.WriteError(w, http.StatusBadRequest, "invalid_event_id",
+				"event_id must be a UUID")
 			return
 		}
 
@@ -120,7 +128,7 @@ func EnterHandler(cfg config.Config, rdb *redis.Client) http.HandlerFunc {
 
 		eta := etaSeconds(pos, cfg.WaitRoom.RefillRate)
 		apiutil.WriteJSON(w, http.StatusTooManyRequests, map[string]any{
-			"queue_url":   fmt.Sprintf("/api/tickets/queue?event_id=%d&user_id=%s", req.EventID, req.UserID),
+			"queue_url":   fmt.Sprintf("/api/tickets/queue?event_id=%s&user_id=%s", req.EventID, req.UserID),
 			"position":    pos,
 			"eta_seconds": eta,
 			"message":     "event is at capacity, you are in the queue",
@@ -134,10 +142,10 @@ func QueueSSEHandler(rdb *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		eventIDStr := r.URL.Query().Get("event_id")
 		userID := r.URL.Query().Get("user_id")
-		eventID, err := strconv.ParseInt(eventIDStr, 10, 64)
-		if err != nil || eventID <= 0 || userID == "" {
+		eventID, err := eventid.Parse(eventIDStr)
+		if err != nil || userID == "" {
 			apiutil.WriteError(w, http.StatusBadRequest, "invalid_request",
-				"event_id (positive integer) and user_id (string) are required")
+				"event_id (uuid) and user_id (string) are required")
 			return
 		}
 
@@ -199,7 +207,7 @@ func QueueSSEHandler(rdb *redis.Client) http.HandlerFunc {
 // It exits when ctx is cancelled (client disconnected) or the
 // admission channel fires (user was promoted).
 func streamSSE(ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
-	admissionCh chan string, rdb *redis.Client, eventID int64, userID string,
+	admissionCh chan string, rdb *redis.Client, eventID string, userID string,
 ) {
 	defer func() {
 		if r := recover(); r != nil {

@@ -91,7 +91,14 @@ Observability:
 | `POST /admin/reservations/{id}/release-seat` | HMAC | Put a seat back on sale; the status does not change |
 
 **Key correctness invariants:**
-- 100 tickets per event (hardcoded seed in `migrations/002_seed.sql`)
+- The event id is a **UUID, minted by the application** (`internal/eventid`) — not a guessable
+  counter. `events.id` has NO column default on purpose: there is exactly one way an event
+  id comes into existence.
+- **NO event is seeded.** There is no `002_seed.sql`. Events are created through the admin
+  API (item 9b, not yet built) — so until then, a fresh database has zero events and the
+  load test needs an `EVENT_ID` passed in.
+- A seat's price is the event's `price_cents` COLUMN DEFAULT (2500 = $25.00), so an event
+  created without an explicit price is sellable out of the box.
 - 200ms HTTP timeout on /reserve
 - Redis atomic Lua scripts for seat locking (no oversell)
 - Waiting room: VUs queued in Redis, released in FIFO order
@@ -148,6 +155,16 @@ make stop-loadtest         # Kill any running k6 process (burst or ramp)
 ```
 
 **Both `loadtest-burst` and `loadtest-ramp` auto-reset state and mint JWTs before launching k6.** No need to call `loadtest-state` / `loadtest-jwts` first. Override the JWT count with `VUS=500` (Makefile) or as a positional arg to the wrapper script.
+
+**`EVENT_ID` is REQUIRED for every load-test target.** There is no seeded event any more, so
+there is no default to fall back on — and a default would silently test an event that does not
+exist (the burst would report zero reservations and still look like a pass). Get the id first:
+
+```bash
+docker exec -i ticket-postgres psql -U tickets -d tickets -c "SELECT id FROM events LIMIT 1"
+
+make loadtest-burst EVENT_ID=<uuid>
+```
 
 **Load test logs** (never overwritten, timestamped):
 - `logs/burst/TS-burst.log`
@@ -641,13 +658,14 @@ mounted at all** — off, not open.
 │   ├── expiration-watcher/     # Redis keyspace notifications → expire holds
 │   ├── dashboard-server/       # Live k6 dashboard web server (:8082)
 │   ├── mintjwt/                # JWT minting tool (used by load tests)
-│   └── seed-inventory/         # Seeds Postgres with event + 100 seats
+│   └── seed-inventory/         # Mirrors each event's inventory into Redis
 ├── internal/
 │   ├── admin/                  # The admin/ops API — HMAC-signed, audited, bounded
 │   ├── api/                    # HTTP handlers: reserve, get, list, cancel, readyz, pay, stripe webhook, publisher seam
 │   ├── auth/                   # JWT middleware, JWT minting
 │   ├── config/                 # Env var config (incl. PostgresConfig/DSN composition)
 │   ├── db/                     # pgx pool, reservation writes, TransitionStatus, list queries, audit log
+│   ├── eventid/                # The event id: a UUID, minted by the app, validated in ONE place
 │   ├── expire/                 # Expiration watcher, sweep, compensate
 │   ├── iplimit/                # Redis IP rate-limiter (token bucket)
 │   ├── logging/                # slog Init + ContextHandler (trace_id/span_id injection)
@@ -701,14 +719,14 @@ mounted at all** — off, not open.
 │           └── ticket-deal-logs.json        # "Ticket Deal — Logs" (Loki)
 ├── migrations/
 │   ├── 001_init.sql           # events + reservations schema, status CHECK, expiry partial index
-│   ├── 002_seed.sql           # Seed data (event id=1, inventory 100)
 │   ├── 003_add_seats.sql      # Adds seats column (Phase 7 INCRBY sizing)
 │   ├── 004_user_lookup_index.sql  # Composite (user_id, created_at DESC) for GET /api/me/reservations
 │   ├── 005_audit_log.sql         # Layer 2 item 6: append-only reservation_events + append-only trigger
 │   ├── 006_refunded_status.sql   # Adds the REFUNDED status (a refund is not a cancel)
 │   ├── 007_event_price.sql       # The price of a seat: events.price_cents + the reservation's snapshot
 │   ├── 008_stripe_payments.sql   # The payment_intents table (one reservation, one PaymentIntent)
-│   └── 009_admin_audit.sql       # The SEAT_RELEASED audit event (the admin API)
+│   ├── 009_admin_audit.sql       # The SEAT_RELEASED audit event (the admin API)
+│   └── 010_event_id_uuid.sql     # The event id becomes a UUID (app-minted, no default)
 ├── docker/
 │   └── elasticmq.conf         # Pre-creates the reservations queue on boot
 ├── docker-compose.yml         # 13 services: 8 infra (redis, postgres, elasticmq, prometheus,
@@ -889,6 +907,11 @@ from `main`; if not, branch from the tip and extend the stack.
 20. **A concurrency test must CONTROL the schedule, not hope for it.** A test that fires two goroutines and asserts a particular interleaving is asserting a timing window, not a contract — and it will pass on your machine and fail on a busy CI runner. The fix is to park one participant at a known point (a hook inside the code under test) until the test says go. `internal/api`'s `testPublisher.beforePublish` hook is the worked example: it parks the winner inside `Publish`, where the Idempotency-Key in-flight lock is provably still held, so the loser is *guaranteed* to meet the lock. And assert the **error code**, not just the status: with the lock broken, the loser falls through to the Lua script and gets `409 already_holding` — the same status, a different fact. A test that cannot fail is not a test.
 21. **The admin API's power is BOUNDED by the state machine, and every write is audited.** An admin override is not a licence to skip the rules — it is the same rules with a different actor. So: a `CONFIRMED` reservation is REFUNDED, not cancelled (there is no `CONFIRMED → CANCELLED` edge, and the `409 already_paid` says so); the cancel's audit row is written by `db.TransitionStatus` in the SAME transaction, with `actor_type='admin'`; and the actor id is the FINGERPRINT of the signing key, never the secret. The authentication is an HMAC over the request — the method, the FULL URI (query string included), the body and a timestamp — so a captured signature is good for one request, one body, five minutes. Signing only the path would let a captured signature be replayed against a different `user_id`.
 22. **`reservation_events` is append-only, and the database enforces it.** A `BEFORE UPDATE OR DELETE` trigger refuses `DELETE` and refuses every `UPDATE` except rewriting `user_id` (the GDPR anonymisation path). The only way past it is `SET LOCAL ticket_deal.audit_purge = 'on'` — test fixtures and future retention policies use it; production code must not.
+23. **The event id is a UUID, and `internal/eventid` is the ONLY place that knows it.** The id is app-minted (`eventid.New()`), carried as a plain `string`, and validated with `eventid.Parse` at every edge where it enters the system: the JWT claim, the waiting-room request body, the SSE query string, and the hold-key parser. `events.id` has **no column DEFAULT** — one convention for one idea, matching `reservation_id`.
+    - **Why a UUID and not a counter:** a `BIGINT` id is guessable. A customer could walk `id=1, 2, 3…` and enumerate the whole catalogue — every drop's name, price and inventory with it. It also had to be allocated by hand, so an event could not be created without inventing an id.
+    - **Why the validation is STRICTER than "parses as a uuid":** exactly ONE spelling is accepted — the canonical 36-character hyphenated lowercase form. `urn:uuid:…`, `{…}` and the unhyphenated form all name the same event but spell it differently, and a Redis key built from one spelling would not match a key built from another. A hold key that does not match its hold is a **seat that leaks silently** — nothing crashes, the watcher just skips it.
+    - **The hold-key parser is the sharp edge.** `expire.ParseHoldKey` reads the event id back out of an expired key, and the keyspace channel fires for EVERY expired key — so the parser distinguishes `ErrNotHoldKey` (not ours, skip silently) from `ErrMalformedHoldKey` (ours but broken, log at ERROR — a seat may be held against an event we cannot identify). `TestParseHoldKey_RoundTripsHoldKey` is the test that catches a key-format/parser mismatch.
+    - **No event is seeded.** There is no `002_seed.sql` — events are created through the admin API. A fresh database has zero events, so the load-test targets require `EVENT_ID` to be passed in rather than defaulting to a number that no longer exists.
 
 ---
 
@@ -898,6 +921,11 @@ from `main`; if not, branch from the tip and extend the stack.
 ```bash
 scripts/setup-docker-env.sh                                # one-time per clone
 docker compose --env-file .env.docker up -d --build        # bring full stack up
+
+# There is no seeded event, so pick one to load-test against.
+export EVENT_ID=$(docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
+  "SELECT id FROM events LIMIT 1")
+
 make loadtest-state && make loadtest-jwts                  # Reset + seed JWTs
 make loadtest-burst                                        # Smoke test
 make loadtest-ramp                                         # Full stress test
@@ -908,6 +936,8 @@ docker compose --env-file .env.docker restart api worker   # Rebuild + restart G
 ### Full local dev loop (host mode — legacy)
 ```bash
 make all-services   # Start everything (Go on host, infra in Docker)
+export EVENT_ID=$(docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
+  "SELECT id FROM events LIMIT 1")
 make loadtest-state && make loadtest-jwts   # Reset + seed JWTs
 make loadtest-burst  # Smoke test
 make loadtest-ramp   # Full stress test
@@ -924,7 +954,7 @@ make test
 
 ### Quick correctness check (1 second)
 ```bash
-make loadtest-state && make loadtest-jwts && make loadtest-burst
+make loadtest-state && make loadtest-jwts && make loadtest-burst   # needs $EVENT_ID
 ```
 
 ### Clean log files (start fresh for a new debugging session or load test)

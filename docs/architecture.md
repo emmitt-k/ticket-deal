@@ -39,7 +39,7 @@ This document complements the [README](../README.md). The README is the project 
 - `POST /webhooks/stripe` — verifies Stripe's signature over the **raw** bytes, snapshots the event, publishes it, and only then answers 200.
 - `cmd/stripe-worker` — a fifth binary. It consumes `stripe-events` and applies the events.
 
-The headline test (`loadtest/burst.js`, 1000 VUs, event_id=1, inv=100) still produces exactly 100 × 200 + 900 × 409 — and now every one of those requests shows up in all three observability sinks, joined by `trace_id`. See §14 for the story.
+The headline test (`loadtest/burst.js`, 1000 VUs, one event, inv=100) still produces exactly 100 × 200 + 900 × 409 — and now every one of those requests shows up in all three observability sinks, joined by `trace_id`. See §14 for the story.
 
 ---
 
@@ -304,7 +304,7 @@ The drainer and the SSE goroutines communicate via an in-process `map[eventID:us
 When queued, the user receives `429 {queue_url}` and opens an SSE stream:
 
 ```
-GET /api/tickets/queue?event_id=42&user_id=alice HTTP/1.1
+GET /api/tickets/queue?event_id=9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b&user_id=alice HTTP/1.1
 Accept: text/event-stream
 ```
 
@@ -681,7 +681,7 @@ sequenceDiagram
 
     Note over Hold,Watch: Path A — event-driven, fast
     Hold-->>Watch: PSUBSCRIBE __keyevent@0__:expired
-    Watch->>Watch: ParseHoldKey<br/>(event=42, user=abc)
+    Watch->>Watch: ParseHoldKey<br/>(event=9f8c1e2a-…-4a5b, user=abc)
     Watch->>DB: Compensate():<br/>WITH target AS (...PENDING)<br/>UPDATE ... SET status='EXPIRED'<br/>  AND status='PENDING_PAYMENT'<br/>RETURNING seats + audit row
     alt CAS winner (rows updated)
         DB-->>Watch: seats=2
@@ -1506,7 +1506,7 @@ Phase 7's event-driven path. Loads `DATABASE_URL` + `REDIS_ADDR` (also via `godo
 
 #### `cmd/seed-inventory/main.go`
 
-Dev-tool: copies `events.initial_inventory` from Postgres into the canonical Redis key (`redis.InventoryKey(id)` = `inventory:event:<id>`) so the `POST /reserve` Lua script can read it. Idempotent (hard `SET`, not `INCR`), safe to re-run between dev sessions. Pairs with the `002_seed.sql` migration: that creates the Postgres row, this mirrors it into Redis. Required because the API's reserve path expects Redis to already be populated; the seeder is the missing bootstrap step. Run via `go run ./cmd/seed-inventory` (or `./bin/seed-inventory` after `go build`). Refuses to run without `DATABASE_URL`.
+Dev-tool: copies `events.initial_inventory` from Postgres into the canonical Redis key (`redis.InventoryKey(id)` = `inventory:event:<uuid>`) so the `POST /reserve` Lua script can read it. Idempotent (hard `SET`, not `INCR`), safe to re-run between dev sessions. Mirrors whatever events exist in Postgres into Redis — there is no seeded event, so on a fresh database it seeds zero rows and says so. Required because the API's reserve path expects Redis to already be populated; the seeder is the missing bootstrap step. Run via `go run ./cmd/seed-inventory` (or `./bin/seed-inventory` after `go build`). Refuses to run without `DATABASE_URL`.
 
 #### `cmd/mintjwt/main.go`
 
@@ -2112,14 +2112,30 @@ Coverage for handler paths, drainer token calculations, and the in-process chann
 
 Creates the two tables every phase needs:
 
-- `events` — `id BIGINT PRIMARY KEY`, `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `created_at TIMESTAMPTZ DEFAULT NOW()` — the two money columns are added by `007_event_price.sql` and are the single source of truth for what a seat costs
-- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id BIGINT FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `seats INTEGER CHECK (1..10)`, `unit_price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`; `007_event_price.sql` adds the price snapshot (`unit_price_cents` + `currency`), frozen at hold time
+- `events` — `id UUID PRIMARY KEY` (**app-minted, no DEFAULT** — see `010_event_id_uuid.sql`), `name TEXT`, `initial_inventory INTEGER CHECK (>= 0)`, `price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `created_at TIMESTAMPTZ DEFAULT NOW()` — the two money columns are added by `007_event_price.sql` and are the single source of truth for what a seat costs
+- `reservations` — `reservation_id UUID PRIMARY KEY` (idempotency key), `user_id TEXT`, `event_id UUID FK → events(id)`, `status TEXT CHECK IN ('PENDING_PAYMENT','CONFIRMED','EXPIRED','CANCELLED')`, `seats INTEGER CHECK (1..10)`, `unit_price_cents BIGINT CHECK (>= 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `expires_at TIMESTAMPTZ`, `created_at`/`updated_at TIMESTAMPTZ DEFAULT NOW()` — the `status` CHECK is widened by `006_refunded_status.sql` to add `REFUNDED`; `007_event_price.sql` adds the price snapshot (`unit_price_cents` + `currency`), frozen at hold time
 - `payment_intents` — `id BIGSERIAL PRIMARY KEY`, `reservation_id UUID UNIQUE FK → reservations(reservation_id)`, `user_id TEXT`, `stripe_payment_intent_id TEXT UNIQUE` (**nullable** — the row is written before Stripe's `Create` returns), `amount_cents BIGINT CHECK (> 0)`, `currency TEXT CHECK (~ '^[a-z]{3}$')`, `status TEXT CHECK (~ '^[A-Z][A-Z_]*$')` — added by `008_stripe_payments.sql`. The two UNIQUE constraints are what make `POST /pay` safely replayable: one reservation, one PaymentIntent, enforced by the database rather than by application discipline
 - Indexes: `idx_reservations_event_status (event_id, status)` for "how many PENDING does this event have?" queries; partial `idx_reservations_pending_expiry (expires_at) WHERE status = 'PENDING_PAYMENT'` powers the sweep job's WHERE clause.
 
-#### `migrations/002_seed.sql`
+#### `migrations/010_event_id_uuid.sql`
 
-Idempotent (`ON CONFLICT DO NOTHING`). Inserts event id=1 with name "Dev Test Event" and 100 inventory. The default target for k6 loadtest in Phase 8.
+The event id becomes a UUID. It was a `BIGINT` running counter, which was wrong twice over: it was **guessable** (a customer could walk `id=1, 2, 3…` and enumerate the whole catalogue — every drop's name, price and inventory with it), and it was **allocated by hand**, so an event could not be created without inventing an id first.
+
+The id is now minted by the **application** (`internal/eventid`), exactly like `reservation_id` already is — so `events.id` has **no DEFAULT**. The Go representation is a plain `string`, consistent with the rest of the project.
+
+The migration swaps the column rather than altering it in place: add a `UUID` column, map every row, backfill the reservations from that mapping, **abort if anything is unmapped**, then drop the old column and re-establish the PK and the FK — all in one transaction.
+
+The mapping is **deterministic**:
+
+```
+new_uuid = md5(old_id::text || ':ticket-deal:event')::uuid
+```
+
+Deterministic rather than random because a re-run of a half-finished migration must land on the *same* mapping — a random uuid would silently re-point every reservation at a different event on the second run. It is also reproducible by hand from the old id, without reading a table.
+
+The migration handles **both** database shapes: an existing one (BIGINT → UUID) and a fresh one (where `001_init.sql` already declares the column as UUID and the migration has nothing to swap). The branch is on `pg_typeof` inside a `DO` block, because Postgres resolves a cast at parse time — a `CASE` containing `id::uuid` is rejected outright on a bigint column, even in a branch that would never be taken.
+
+**No event is seeded.** `migrations/002_seed.sql` is gone: events are created through the admin API, so a fresh database has zero events and the load-test targets require `EVENT_ID` to be passed in.
 
 #### `migrations/003_add_seats.sql`
 
@@ -2176,12 +2192,12 @@ A `CHECK` change only — no rows are rewritten. The idempotent `DO` block is wh
 
 Layer 2 item 7's prerequisite. Four columns:
 
-- `events.price_cents BIGINT NOT NULL DEFAULT 0 CHECK (price_cents >= 0)` — the price of one seat
+- `events.price_cents BIGINT NOT NULL DEFAULT 2500 CHECK (price_cents >= 0)` — the price of one seat
 - `events.currency TEXT NOT NULL DEFAULT 'usd' CHECK (currency ~ '^[a-z]{3}$')`
 - `reservations.unit_price_cents BIGINT NOT NULL DEFAULT 0 CHECK (unit_price_cents >= 0)` — the snapshot
 - `reservations.currency TEXT NOT NULL DEFAULT 'usd' CHECK (currency ~ '^[a-z]{3}$')`
 
-Plus a demo price (`2500`) for the dev seed event — because `002_seed.sql` runs *before* this file and therefore cannot reference a column that does not exist yet. The `UPDATE` is guarded by `price_cents = 0`, so a deliberately-priced event keeps its price and a re-run is a no-op.
+The event's price default is `2500` ($25.00), not `0`. There is no seeded event to price any more, so the default has to be a *usable* price — a $0.00 event is a dead end for Stripe, which rejects amounts below $0.50. Putting the default on the **column** (rather than in a data-fixing `UPDATE`) means every event created from now on — including the ones a future CRUD API creates — is sellable without anyone remembering to price it.
 
 Cents, not a float — money in binary floating point is a bug waiting for the wrong invoice. §8 covers the snapshot semantics.
 

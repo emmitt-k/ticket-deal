@@ -37,7 +37,7 @@ func doCancelReservation(t *testing.T, pool *db.Pool, rdb *redis.Client,
 	url := "/api/reservations/" + reservationID + "/cancel"
 	req := httptest.NewRequest(http.MethodPost, url, nil)
 	if userID != "" {
-		token, err := auth.Issue(userID, 1, testSecret, 2*time.Minute)
+		token, err := auth.Issue(userID, "9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b", testSecret, 2*time.Minute)
 		require.NoError(t, err, "Issue test JWT")
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -54,7 +54,7 @@ func doCancelReservation(t *testing.T, pool *db.Pool, rdb *redis.Client,
 
 // inventoryCount reads the current value of the event's inventory key.
 // Used to assert that cancel incremented it by the expected amount.
-func inventoryCount(t *testing.T, rdb *redis.Client, eventID int64) int {
+func inventoryCount(t *testing.T, rdb *redis.Client, eventID string) int {
 	t.Helper()
 	v, err := rdb.Get(context.Background(), redis.InventoryKey(eventID)).Int()
 	if err != nil {
@@ -69,7 +69,7 @@ func inventoryCount(t *testing.T, rdb *redis.Client, eventID int64) int {
 
 // hasHoldKey reports whether the hold key for (eventID, userID) currently
 // exists in Redis. Used to assert that cancel cleaned it up.
-func hasHoldKey(t *testing.T, rdb *redis.Client, eventID int64, userID string) bool {
+func hasHoldKey(t *testing.T, rdb *redis.Client, eventID string, userID string) bool {
 	t.Helper()
 	n, err := rdb.Exists(context.Background(), redis.HoldKey(eventID, userID)).Result()
 	if err != nil {
@@ -103,7 +103,7 @@ func TestCancel_HappyPath(t *testing.T) {
 	require.Equal(t, db.StatusCancelled, body["status"])
 	require.Equal(t, owner, body["user_id"])
 	require.Equal(t, rid, body["reservation_id"])
-	require.Equal(t, float64(eventID), body["event_id"])
+	require.Equal(t, eventID, body["event_id"])
 
 	// Inventory went from 99 → 100 (1 seat returned).
 	require.Equal(t, 100, inventoryCount(t, rdb, eventID),
@@ -120,7 +120,7 @@ func TestCancel_HappyPath(t *testing.T) {
 func TestCancel_MultipleSeats(t *testing.T) {
 	const owner = "u-cancel-multi-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64111)
+	const eventID = "00000000-0000-4000-8000-00000000fa6f"
 	apiSeedEvent(t, pool, eventID)
 	rdb := newTestClient(t)
 	require.NoError(t, rdb.Set(context.Background(),
@@ -291,7 +291,7 @@ func TestCancel_WritesAuditRow(t *testing.T) {
 	const owner = "u-cancel-audit-1"
 	pool, _, rid := newGetReservationPool(t, owner)
 	rdb := newTestClient(t)
-	cleanupReserveKeys(t, rdb, 64001, owner)
+	cleanupReserveKeys(t, rdb, "00000000-0000-4000-8000-00000000fa01", owner)
 
 	rec, _ := doCancelReservation(t, pool, rdb, owner, rid)
 	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
@@ -316,7 +316,7 @@ func TestCancel_ForbiddenWritesNoAuditRow(t *testing.T) {
 	const other = "u-cancel-audit-other"
 	pool, _, rid := newGetReservationPool(t, owner)
 	rdb := newTestClient(t)
-	cleanupReserveKeys(t, rdb, 64001, other)
+	cleanupReserveKeys(t, rdb, "00000000-0000-4000-8000-00000000fa01", other)
 
 	rec, _ := doCancelReservation(t, pool, rdb, other, rid)
 	require.Equal(t, http.StatusForbidden, rec.Code)

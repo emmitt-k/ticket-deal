@@ -45,26 +45,26 @@ var admissionChannels = struct {
 
 // eventCallback is the drainer's hook to learn about new event queues.
 // Set once by StartDrainer via RegisterEventCallback.
-var eventCallback func(eventID int64)
+var eventCallback func(eventID string)
 
 // RegisterEventCallback registers a function the queue package calls
 // whenever a user enters a new event's queue. Used by the drainer to
 // lazily start a drain goroutine for each event.
-func RegisterEventCallback(fn func(eventID int64)) {
+func RegisterEventCallback(fn func(eventID string)) {
 	eventCallback = fn
 }
 
 // NotifyEvent tells the drainer that a user has entered the queue for
 // eventID. No-op if no callback is registered.
-func NotifyEvent(eventID int64) {
+func NotifyEvent(eventID string) {
 	if eventCallback != nil {
 		eventCallback(eventID)
 	}
 }
 
 // queueKey builds the registry key for a user's SSE channel.
-func queueKey(eventID int64, userID string) string {
-	return fmt.Sprintf("%d:%s", eventID, userID)
+func queueKey(eventID string, userID string) string {
+	return fmt.Sprintf("%s:%s", eventID, userID)
 }
 
 // Register opens a new admission channel for a user who is connecting to
@@ -74,7 +74,7 @@ func queueKey(eventID int64, userID string) string {
 // If a channel already exists for this user (e.g. user opened multiple
 // SSE tabs), the existing channel is returned — only one SSE stream per
 // event per user is supported.
-func Register(eventID int64, userID string) chan string {
+func Register(eventID string, userID string) chan string {
 	key := queueKey(eventID, userID)
 	admissionChannels.mu.Lock()
 	defer admissionChannels.mu.Unlock()
@@ -90,7 +90,7 @@ func Register(eventID int64, userID string) chan string {
 // Unregister removes a user's admission channel. Called when the SSE
 // connection closes (client disconnects, context cancelled, timeout).
 // The channel is closed to signal to any pending handler goroutine to exit.
-func Unregister(eventID int64, userID string) {
+func Unregister(eventID string, userID string) {
 	key := queueKey(eventID, userID)
 	admissionChannels.mu.Lock()
 	defer admissionChannels.mu.Unlock()
@@ -105,7 +105,7 @@ func Unregister(eventID int64, userID string) {
 // If the user has no active SSE connection (e.g. they closed the tab),
 // the send does nothing — the channel is already closed or empty.
 // Returns true if the user was found and notified, false otherwise.
-func Deliver(eventID int64, userID string, token string) bool {
+func Deliver(eventID string, userID string, token string) bool {
 	key := queueKey(eventID, userID)
 	admissionChannels.mu.RLock()
 	ch, exists := admissionChannels.ch[key]

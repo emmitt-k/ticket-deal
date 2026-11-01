@@ -6,8 +6,8 @@
 # don't have to remember to do it manually. Override behavior with env
 # vars — anything passed to reset-state.sh / mint-jwts.sh:
 #
-#   EVENT_ID=2 ./loadtest/run-burst.sh       # different event
-#   VUS=500   ./loadtest/run-burst.sh       # fewer VUs (= fewer JWTs)
+#   EVENT_ID=<uuid> ./loadtest/run-burst.sh   # REQUIRED — the event to test
+#   VUS=500   ./loadtest/run-burst.sh          # fewer VUs (= fewer JWTs)
 #   JWT_FILE=/tmp/jwts.txt ./loadtest/run-burst.sh
 #   K6_REST_ADDR=:6565 ./loadtest/run-burst.sh   # k6 REST API (live dashboard)
 #
@@ -16,6 +16,19 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+
+# ── EVENT_ID is required ─────────────────────────────────────────────
+#
+# There is no seeded event any more, so there is no default. The
+# bootstrap scripts below will refuse to run without it, but failing
+# here with a clear message is friendlier than failing three steps in.
+if [ -z "${EVENT_ID:-}" ]; then
+    echo "ERROR: EVENT_ID is required — it is the UUID of the event to load-test." >&2
+    echo "" >&2
+    echo "  Get it with:" >&2
+    echo "    docker exec -i ticket-postgres psql -U tickets -d tickets -c \"SELECT id FROM events LIMIT 1\"" >&2
+    exit 1
+fi
 
 # ── Self-bootstrap: reset state + mint JWTs ────────────────────────
 #

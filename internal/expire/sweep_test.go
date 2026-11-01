@@ -18,7 +18,7 @@ import (
 // to EXPIRED and returned to the caller for compensating INCRBY.
 func TestFindAndExpireSweptRows_PicksUpExpired(t *testing.T) {
 	pool := newTestPool(t)
-	const eID = int64(72001)
+	const eID = "00000000-0000-4000-8000-000000011941"
 	seedEvent(t, pool, eID)
 	uid := "sweep-alice-" + uuid.NewString()[:8]
 
@@ -50,7 +50,7 @@ func TestFindAndExpireSweptRows_PicksUpExpired(t *testing.T) {
 // PENDING (expires_at in the future) must NOT be touched.
 func TestFindAndExpireSweptRows_IgnoresNotExpired(t *testing.T) {
 	pool := newTestPool(t)
-	const eID = int64(72002)
+	const eID = "00000000-0000-4000-8000-000000011942"
 	seedEvent(t, pool, eID)
 	uid := "future-" + uuid.NewString()[:8]
 
@@ -75,7 +75,7 @@ func TestFindAndExpireSweptRows_IgnoresNotExpired(t *testing.T) {
 // filters these out.
 func TestFindAndExpireSweptRows_IgnoresNonPending(t *testing.T) {
 	pool := newTestPool(t)
-	const eID = int64(72003)
+	const eID = "00000000-0000-4000-8000-000000011943"
 	seedEvent(t, pool, eID)
 	uid := "confirmed-" + uuid.NewString()[:8]
 
@@ -104,7 +104,7 @@ func TestFindAndExpireSweptRows_IgnoresNonPending(t *testing.T) {
 // EXPIRED.
 func TestFindAndExpireSweptRows_Idempotent(t *testing.T) {
 	pool := newTestPool(t)
-	const eID = int64(72004)
+	const eID = "00000000-0000-4000-8000-000000011944"
 	seedEvent(t, pool, eID)
 	uid := "idemp-" + uuid.NewString()[:8]
 
@@ -133,7 +133,7 @@ func TestFindAndExpireSweptRows_Idempotent(t *testing.T) {
 // to the caller (so the INCRBY is sized right).
 func TestFindAndExpireSweptRows_MultiSeat(t *testing.T) {
 	pool := newTestPool(t)
-	const eID = int64(72005)
+	const eID = "00000000-0000-4000-8000-000000011945"
 	seedEvent(t, pool, eID)
 	uid := "group-" + uuid.NewString()[:8]
 
@@ -176,7 +176,7 @@ func TestRunSweep_ContextCancel(t *testing.T) {
 func TestRunSweep_Integration(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(72006)
+	const eID = "00000000-0000-4000-8000-000000011946"
 	seedEvent(t, pool, eID)
 	uid := "integ-" + uuid.NewString()[:8]
 

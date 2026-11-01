@@ -108,7 +108,7 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, idempoten
 			return
 		}
 		span.SetAttributes(
-			attribute.Int64("reservation.event_id", int64(claims.EventID)),
+			attribute.String("reservation.event_id", claims.EventID),
 			attribute.String("reservation.user_id", claims.Subject),
 		)
 
@@ -229,7 +229,7 @@ func ReserveHandler(rdb *redis.Client, publisher ReservationPublisher, idempoten
 		// ── 5. Atomic seat lock (Lua reserve script) ─────────────
 		_, holdSpan := tracer.Start(r.Context(), "redis.acquire-hold",
 			trace.WithAttributes(
-				attribute.Int64("hold.event_id", int64(claims.EventID)),
+				attribute.String("hold.event_id", claims.EventID),
 				attribute.Int64("hold.user_id_hash", hashUserID(claims.Subject)),
 				attribute.Int("hold.ttl_seconds", int(holdTTL.Seconds())),
 			),

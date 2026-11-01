@@ -96,7 +96,7 @@ func cleanupReservation(t *testing.T, pool *Pool, reservationID string) {
 //
 // The cleanup deletes the event row (after the reservations
 // cleanup has run, so we don't hit a FK violation in reverse).
-func seedEvent(t *testing.T, pool *Pool, eventID int64) {
+func seedEvent(t *testing.T, pool *Pool, eventID string) {
 	t.Helper()
 	name := "test-event-" + uuid.NewString()
 	_, err := pool.Exec(context.Background(),
@@ -121,7 +121,7 @@ func nowRFC3339(t *testing.T) (created, expires string) {
 }
 
 // validReservation returns a reservation that's about to be inserted.
-func validReservation(t *testing.T, eventID int64) queue.Reservation {
+func validReservation(t *testing.T, eventID string) queue.Reservation {
 	t.Helper()
 	created, expires := nowRFC3339(t)
 	return queue.Reservation{
@@ -137,7 +137,7 @@ func validReservation(t *testing.T, eventID int64) queue.Reservation {
 // TestInsertIfAbsent_HappyPath — first call inserts the row.
 func TestInsertIfAbsent_HappyPath(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(61001)
+	const eventID = "00000000-0000-4000-8000-00000000ee49"
 
 	// Register event cleanup FIRST (LIFO order) so reservations
 	// cleanup runs first.
@@ -163,7 +163,7 @@ func TestInsertIfAbsent_HappyPath(t *testing.T) {
 // publishes produce zero extra Postgres rows.
 func TestInsertIfAbsent_Idempotency(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(61002)
+	const eventID = "00000000-0000-4000-8000-00000000ee4a"
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -188,7 +188,7 @@ func TestInsertIfAbsent_Idempotency(t *testing.T) {
 // produce different rows; idempotency only collapses same-ID writes.
 func TestInsertIfAbsent_MultipleDifferentReservations(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(61003)
+	const eventID = "00000000-0000-4000-8000-00000000ee4b"
 
 	seedEvent(t, pool, eventID)
 	r1 := validReservation(t, eventID)
@@ -211,7 +211,7 @@ func TestInsertIfAbsent_MultipleDifferentReservations(t *testing.T) {
 // can log + delete the malformed message instead of retrying forever.
 func TestInsertIfAbsent_BadTimestamp(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(61004)
+	const eventID = "00000000-0000-4000-8000-00000000ee4c"
 
 	r := validReservation(t, eventID)
 	r.CreatedAt = "not-a-timestamp"
@@ -226,7 +226,7 @@ func TestInsertIfAbsent_BadTimestamp(t *testing.T) {
 func TestInsertIfAbsent_FKConstraint(t *testing.T) {
 	pool := newTestPool(t)
 
-	r := validReservation(t, 99999999) // not in events table
+	r := validReservation(t, "00000000-0000-4000-8000-000005f5e0ff") // not in events table
 	cleanupReservation(t, pool, r.ReservationID)
 
 	err := InsertIfAbsent(context.Background(), pool, r)
@@ -240,7 +240,7 @@ func TestInsertIfAbsent_FKConstraint(t *testing.T) {
 // DO NOTHING semantics are preserved.
 func TestInsertIfAbsent_ConcurrentSameID(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(61005)
+	const eventID = "00000000-0000-4000-8000-00000000ee4d"
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)

@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,14 +25,6 @@ import (
 // correctness is about what it does to the seat count and the audit
 // trail, and neither is provable against a fake. Per the repo
 // convention, a missing dependency means SKIP, not fail.
-
-// eventIDBase keeps the test event ids out of the ranges the other
-// packages use. Every package in this repo owns a range, and an
-// overlapping id is a duplicate-key error at best.
-const eventIDBase = 95000
-
-// eventCounter hands out the per-test event ids.
-var eventCounter atomic.Int64
 
 // runSuffix makes the test user ids unique per run.
 //
@@ -79,7 +70,7 @@ func newTestRedis(t *testing.T) *redis.Client {
 type fixture struct {
 	pool    *db.Pool
 	rdb     *redis.Client
-	eventID int64
+	eventID string
 	verif   *Verifier
 	router  chi.Router
 }
@@ -102,14 +93,18 @@ func newFixture(t *testing.T) *fixture {
 // newEvent creates an event with its own inventory.
 //
 // EVENT IDS MUST BE GLOBALLY UNIQUE ACROSS PACKAGES. Every test
-// package in this repo talks to the SAME Postgres database and `go
-// test ./...` runs them in parallel — so two packages using the same
-// event id collide on the primary key, and the failure shows up in
-// whichever package lost the race. This package owns the 95000 range.
-func (f *fixture) newEvent(t *testing.T) int64 {
+// The event id is a UUID, so it is globally unique by construction —
+// there is no per-package range to keep apart any more. Every package
+// in this repo talks to the SAME Postgres database and `go test ./...`
+// runs them in parallel, but a uuid collision is not a thing that can
+// happen, so the old "each package owns a range" convention is gone.
+//
+// The name still carries a uuid so a failed test leaves a row that is
+// traceable back to the run that created it.
+func (f *fixture) newEvent(t *testing.T) string {
 	t.Helper()
 
-	eventID := eventIDBase + eventCounter.Add(1)
+	eventID := uuid.NewString()
 	_, err := f.pool.Exec(context.Background(),
 		`INSERT INTO events (id, name, initial_inventory, price_cents, currency)
 		 VALUES ($1, $2, 100, 2500, 'usd')`,
@@ -138,7 +133,7 @@ func (f *fixture) newEvent(t *testing.T) int64 {
 // Getting this wrong is not cosmetic: a leaked reservation row makes
 // the NEXT test run's lookup return extra rows, and a leaked event row
 // makes its seed INSERT hit a duplicate key.
-func (f *fixture) purgeEvent(eventID int64) {
+func (f *fixture) purgeEvent(eventID string) {
 	ctx := context.Background()
 
 	tx, err := f.pool.Begin(ctx)
@@ -177,7 +172,7 @@ func (f *fixture) user(name string) string {
 // hold creates a reservation the way the system does: a real Redis
 // hold (which decrements the inventory) plus the Postgres row the
 // worker writes.
-func (f *fixture) hold(t *testing.T, eventID int64, userID string, seats int) (string, db.ReservationRow) {
+func (f *fixture) hold(t *testing.T, eventID string, userID string, seats int) (string, db.ReservationRow) {
 	t.Helper()
 	ctx := context.Background()
 

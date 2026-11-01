@@ -45,15 +45,15 @@ func StartDrainer(ctx context.Context, cfg DrainerConfig) func() {
 	// active tracks the set of eventIDs that currently have a drain loop running.
 	// Access is protected by the mutex.
 	var (
-		active    map[int64]struct{} = make(map[int64]struct{})
+		active    map[string]struct{} = make(map[string]struct{})
 		mu        sync.Mutex
-		cancelFns = make(map[int64]context.CancelFunc)
+		cancelFns = make(map[string]context.CancelFunc)
 		wg        sync.WaitGroup
 	)
 
 	// onEvent is called by handlers when a user is queued. It starts
 	// a drain loop for that event if one isn't already running.
-	onEvent := func(eventID int64) {
+	onEvent := func(eventID string) {
 		mu.Lock()
 		_, running := active[eventID]
 		if !running {
@@ -88,8 +88,8 @@ func StartDrainer(ctx context.Context, cfg DrainerConfig) func() {
 // drainLoop runs the drain cycle for a single event until ctx is cancelled
 // or the queue is empty for 5 minutes.
 func drainLoop(ctx context.Context, wg *sync.WaitGroup,
-	eventID int64, cfg DrainerConfig,
-	activeMu *sync.Mutex, active map[int64]struct{}, cancelFns map[int64]context.CancelFunc,
+	eventID string, cfg DrainerConfig,
+	activeMu *sync.Mutex, active map[string]struct{}, cancelFns map[string]context.CancelFunc,
 ) {
 	defer wg.Done()
 	defer func() {
@@ -180,8 +180,8 @@ func drainLoop(ctx context.Context, wg *sync.WaitGroup,
 }
 
 // cleanupDrainer removes the drainer from the active set and calls its cancel func.
-func cleanupDrainer(eventID int64,
-	activeMu *sync.Mutex, active map[int64]struct{}, cancelFns map[int64]context.CancelFunc,
+func cleanupDrainer(eventID string,
+	activeMu *sync.Mutex, active map[string]struct{}, cancelFns map[string]context.CancelFunc,
 ) {
 	activeMu.Lock()
 	delete(active, eventID)

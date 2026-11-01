@@ -252,7 +252,7 @@ func handleMessage(ctx context.Context, pool *db.Pool, raw []byte) error {
 	}
 	span.SetAttributes(
 		attribute.String("reservation.id", r.ReservationID),
-		attribute.Int64("reservation.event_id", int64(r.EventID)),
+		attribute.String("reservation.event_id", r.EventID),
 		attribute.Int("reservation.seats", r.Seats),
 	)
 

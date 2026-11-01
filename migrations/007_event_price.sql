@@ -52,23 +52,28 @@ ALTER TABLE reservations
     ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'usd'
         CHECK (currency ~ '^[a-z]{3}$');
 
--- The dev seed event needs a price.
+-- ── The default price for a NEW event ─────────────────────────────────
 --
--- migrations/002_seed.sql runs BEFORE this file (the Makefile applies
--- migrations/0*.sql in filename order), and 002 predates the price
--- column — so on a fresh database the seed event is inserted without
--- one and lands on the DEFAULT 0. On an existing database the seed is
--- a no-op (ON CONFLICT DO NOTHING), so it is still at 0.
+-- There used to be a dev seed event here (migrations/002_seed.sql), and
+-- this file gave it a demo price so the Stripe path had something
+-- non-zero to work with. The seed is gone — events are created through
+-- the admin API (Layer 2, item 9b) — so there is no longer a row to
+-- UPDATE here.
 --
--- A $0.00 event is a dead end for Stripe (amounts below $0.50 are
--- rejected), so give the demo event a demo price. Only rows still at
--- the default are touched — an event that was deliberately priced
--- keeps its price.
+-- Instead the DEFAULT on the column becomes a real, usable price: a
+-- $0.00 event is a dead end for Stripe (amounts below $0.50 are
+-- rejected), so an event that is created without an explicit price
+-- gets a $25.00 one and can be sold immediately. An organizer who
+-- wants a different price sets it explicitly at creation time.
 --
--- This mirrors what 002_seed.sql itself does: dev fixture data, with
--- the dev fixture's own id.
-UPDATE events
-   SET price_cents = 2500,
-       currency     = 'usd'
- WHERE id = 1
-   AND price_cents = 0;
+-- The default lives on the COLUMN, not in a data-fixing UPDATE, so it
+-- applies to every event created from now on — including the ones a
+-- future CRUD API creates — without this migration having to know
+-- about them.
+--
+-- The column DEFAULT is changed here rather than in 010 because this
+-- is the migration that introduced the concept of a price; 010 only
+-- changes the shape of the id.
+ALTER TABLE events
+    ALTER COLUMN price_cents SET DEFAULT 2500;
+

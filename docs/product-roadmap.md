@@ -419,6 +419,168 @@ rejecting timestamps outside the window.
 Every admin call writes to the audit log (`actor_type='admin'`, `actor_id=<key
 fingerprint>`). This is why item 6 (audit log) was sequenced first.
 
+### 9a. Event id → UUID ✅ Done
+
+**Effort:** ~1 day. **Why:** `events.id` is a `BIGINT` running counter from the very first
+migration (`migrations/001_init.sql`), which means the id is **guessable** — a customer can
+walk `id=1, 2, 3…` and enumerate the catalogue. It also means every event id is allocated
+by hand (`002_seed.sql` hardcodes `id=1`), so an admin cannot create an event without
+inventing an id.
+
+**The id becomes a UUID, minted by the application**, exactly like `reservation_id` already
+is (`reservations.reservation_id UUID PRIMARY KEY`, minted with `uuid.NewString()` in
+`internal/api/reserve_handler.go`). The two decisions:
+
+- **The UUID is created by the APP, not the database.** The column has no default — the
+  application always supplies it. This matches the existing codebase rather than introducing
+  a second convention.
+- **In Go the id is a plain `string`**, like `reservation_id` already is. Not a `uuid.UUID`
+  type — one representation, consistent with the rest of the project.
+
+**Why app-side and not `gen_random_uuid()`:** the codebase already has a rule for this
+(`reservations.reservation_id` is app-minted). Two conventions for the same idea is worse
+than one. And the app knows the id *before* it needs to put it in a Redis key — the Redis
+key is written in the same request, so there is no reason to ask the database for it first.
+
+**Why UUID and not a surrogate + public_id pair:** two identifiers means two things to keep
+in sync and two things to expose. One UUID, used everywhere, is simpler.
+
+### Where the id lives today — the 8 layers that change
+
+This is not one migration. The id is baked into:
+
+| Layer | Today | Becomes |
+|---|---|---|
+| **DB** | `events.id BIGINT`, `reservations.event_id BIGINT` | `UUID` |
+| **Go types** | `EventID int64` in 9 places (`db.ReservationRow`, `queue.Reservation`, `auth.Claims`, `expire.SweptRow`, …) | `EventID string` |
+| **Redis keys** | `inventory:event:42`, `hold:event:42:user:x`, `bucket:event:42`, `queue:event:42` | `%d` → `%s` |
+| **Hold key parser** | `internal/expire/watcher.go` `ParseHoldKey` — `strconv.ParseInt` on the key | parse a UUID instead |
+| **JWT claim** | `auth.Claims.EventID int64` | `string` |
+| **SQS payload** | `queue.Reservation.EventID` — JSON number | JSON string |
+| **Metrics** | `attribute.Int64("reservation.event_id", …)` | `attribute.String` |
+| **CLI + loadtest** | `cmd/mintjwt` `EVENT_ID=42` parsed with `strconv.ParseInt`; `loadtest/*.sh` | `EVENT_ID=<uuid>` |
+
+**The migration itself is the easy part.** New columns alongside the old, map old→new,
+backfill, swap, re-add the FK. Verified against the live database: 0 orphan reservations,
+FK re-created cleanly, `events.id` ends up `uuid NOT NULL DEFAULT gen_random_uuid()`.
+
+**The hold key parser is the sharp edge.** `ParseHoldKey` exists because the Redis
+keyspace-notification channel fires for EVERY expired key, so the watcher has to recognise
+its own hold keys and extract the event id back out of the key string. A UUID in the key
+means that extraction changes from `strconv.ParseInt` to a UUID parse — small, but it is the
+kind of change that fails silently if the key format and the parser disagree.
+
+**41 files** are touched (23 Go source files, 21 test files, the load-test scripts, and the
+docs that show `event_id=42` as a number).
+
+**This is sequenced as its OWN branch and PR, before the event CRUD work.** The id changing
+underneath the entire system is exactly the kind of change that should be one reviewable,
+revertible unit — and building event CRUD on top of a `BIGINT` id only to rewrite it
+afterwards is wasted work.
+
+#### What actually landed (and where the plan above changed)
+
+The plan above is right about the shape and wrong in three places. What shipped:
+
+- **No seed at all.** `migrations/002_seed.sql` is **deleted**. The plan assumed a fixed
+  UUID for the dev event; instead there is no dev event. Events are created through the
+  admin API (item 9b), so a fresh database has **zero events** until an admin creates one.
+  The consequence is that the load-test targets now **require** `EVENT_ID` to be passed in
+  rather than defaulting to a number that no longer exists — a default would have silently
+  tested an event that does not exist, and the burst would report zero reservations while
+  still looking like a pass.
+- **The price moved to a column DEFAULT.** With no seeded event to price, the plan's
+  "`UPDATE events SET price_cents = 2500 WHERE id = 1`" had nothing to update. The default
+  on `events.price_cents` is now `2500` ($25.00) instead of `0`, so an event created without
+  an explicit price is sellable out of the box — a $0.00 event is a dead end for Stripe,
+  which rejects amounts below $0.50.
+- **`events.id` has NO database default.** The plan's closing line said "`events.id` ends up
+  `uuid NOT NULL DEFAULT gen_random_uuid()`", which contradicts the plan's own decision
+  that "the UUID is created by the APP, not the database". The stated **design** won: the
+  column has no DEFAULT, the app always supplies the id, and there is exactly one convention
+  for an app-minted identifier.
+
+Two things the plan did not anticipate, both found by writing the code:
+
+- **The migration has to work on BOTH database shapes.** `001_init.sql` now declares
+  `events.id` as `UUID` so a fresh database gets the final shape directly — but `010` still
+  runs on a fresh database and must not fail there. Worse, Postgres resolves a cast at
+  PARSE time, so a `CASE` containing `id::uuid` is rejected outright on a bigint column
+  even in the branch that would never be taken. The fix is a `DO` block (statements are
+  parsed when they execute) branching on `pg_typeof`.
+- **The mapping has to be deterministic.** `gen_random_uuid()` would mean a re-run of a
+  half-finished migration produces a *different* mapping — silently re-pointing every
+  reservation at a different event. The mapping is `md5(old_id::text ||
+  ':ticket-deal:event')::uuid`, which is reproducible by hand from the old id without
+  reading a table.
+
+### 9b. Event CRUD for admins ⬜ Not started
+
+**Effort:** ~1 day. **Why:** the system can only ever sell ONE event — there is no catalogue,
+no way for a customer to browse, and no way for an organizer to put a new drop on sale
+without a migration. (The seed that used to hardcode `id=1` and a name of "Dev Test Event"
+is GONE as of item 9a: no event is seeded any more, so a fresh database has zero events
+until an admin creates one. That makes this item the thing that makes the system usable
+at all — until it lands, there is nothing to sell.)
+
+This extends the admin/ops API (item 9) with a second resource, and adds the two PUBLIC
+read endpoints that make the catalogue visible to customers.
+
+```
+POST   /admin/events          create an event (+ seed its inventory)
+GET    /admin/events          ops list
+GET    /admin/events/{id}     ops read one
+PATCH  /admin/events/{id}     update name / price / add seats
+POST   /admin/events/{id}/cancel   cancel an event (see the guard below)
+GET    /api/events            PUBLIC list of live events
+GET    /api/events/{id}       PUBLIC read one
+```
+
+**The events table gains a status column.** `active` | `cancelled`. The row is NEVER deleted —
+a cancelled event stays as a tombstone so an ops question ("we had a 'Midnight Echo' drop,
+what happened to it?") still has an answer. Public listings filter out cancelled events;
+admin listings show everything.
+
+**The cancel guard: an event may only be cancelled while it has ZERO reservations.**
+
+```sql
+SELECT count(*) FROM reservations WHERE event_id = $1
+```
+
+- **0 reservations** → cancel allowed.
+- **≥1 reservation** → `409 event_has_reservations`, with the count in the response.
+
+This is not an arbitrary line — it is where the schema already draws it.
+`reservations.event_id REFERENCES events(id)` has **no `ON DELETE CASCADE`**, so a hard delete
+against an event with any reservation fails at the database level. The explicit check turns
+an ugly `23503 foreign_key_violation` into a clear `409`.
+
+The line is drawn at "any reservation ever existed", not "any paid reservation", because a
+reservation that was created and then expired still proves a customer interacted with the
+event — and because deleting an event out from under someone who *tried* to buy is worse
+than refusing.
+
+**The cancel order is Redis first, then Postgres.** This is the opposite of the obvious
+order, and the reason is the phantom seat:
+
+- **Redis first** (`DEL inventory:event:<id>`) then Postgres (`status='cancelled'`): if the
+  Postgres write fails, the event is still live in Postgres but has no inventory counter, so
+  `reserve.lua` returns `event_not_found`. The drop is unavailable, but **no seat is sold and
+  no reservation is lost**. A retry fixes it.
+- **Postgres first** then Redis: if the Redis `DEL` fails, **Redis still reports seats
+  available against a cancelled event**. Reservations keep succeeding, the Lua script
+  decrements the counter, and the worker then fails the foreign key — the seat is gone but
+  no reservation row exists. That is a phantom seat.
+
+Same shape as the partial-Redis-failure convention, inverted: the write that can leave a
+phantom must not be the one that goes first.
+
+**OUT OF SCOPE — cancelling a LIVE event.** The real-world scenario (a singer cancels
+mid-sale: stop new reservations, fail unpaid payments and notify the customer, refund the
+paid ones) is a much bigger operation — it needs a drain state on the reservation state
+machine, a Stripe refund sweep, and a notification path. It is deliberately NOT built
+here. This item only covers the "not live yet, nothing sold" case.
+
 ### 10. Anti-bot hardening ⬜ Not started
 
 **Effort:** ~1-2 days. **Why:** ticket scalpers are a real threat to any
@@ -508,18 +670,23 @@ service for our scale and removes a future "I forgot to clean up" problem.
 
 ## What I'd build first — and why
 
-**Done:** Layer 1 (1 → 2 → 3 → 4 → 5) and Layer 2 items 6 and 7. The system
-now has the whole user-facing spine, an audit trail behind it, and it takes
-money. Stripe was the only item that turned *"a reservation kernel"* into
+**Done:** Layer 1 (1 → 2 → 3 → 4 → 5) and Layer 2 items 6, 7 and 9. The system
+now has the whole user-facing spine, an audit trail behind it, it takes
+money, and it has a support override. Stripe was the only item that turned
+*"a reservation kernel"* into
 *"a product that takes money"*, and it exercised every pattern a payments
 engineer actually solves: signature verification, webhook idempotency,
 out-of-order delivery, and the race between the payment webhook and the expiry
 watcher.
 
-**Next: item 9 (the admin/ops API)** — it became interesting the moment there
-was money to refund. The audit log already has `actor_type = 'admin'` waiting
-for it, so this is the item that makes the audit trail earn its keep rather
-than just exist. **Then item 10 (anti-bot)**, the cheapest proof that you think
+**Just done: item 9a (the event id becomes a UUID).** Two things changed
+underneath the whole system: the id is no longer a guessable counter, and
+**no event is seeded any more** — events are created through the admin API.
+That makes **item 9b (event CRUD) the next one, and it is now load-bearing
+rather than merely nice**: until it lands, a fresh database has zero events
+and there is nothing to sell.
+
+**Then item 10 (anti-bot)**, the cheapest proof that you think
 like an attacker. Item 8 (notifications) is the best demonstration that the
 queue design scales to a second consumer, but it is the least differentiating —
 so it goes third, unless the demo needs the MailHog inbox to look busy.
@@ -572,17 +739,18 @@ The biggest impact-portfolio item, ranked:
 | 1 | **Stripe test mode** (#7) | Forces you to solve every pattern real engineers solve: signature verification, webhook idempotency, payment state, race-vs-expiry. Recruiters recognize it. | ✅ Shipped |
 | 2 | **State machine + cancel** (#1, #3) | The connective tissue. Makes Layer 2 possible. | ✅ Shipped |
 | 3 | **Audit log** (#6) | "Who did this when?" is the SOC2 question. | ✅ Shipped |
-| 4 | **Anti-bot** (#10) | Proves you think like an attacker. | ⬜ Not started — **← next** |
-| 5 | **Notifications** (#8) | Tests the design's flexibility claim. | ⬜ Not started |
-| 6 | **Admin API** (#9) | Every real product has this; usually glossed over. | ⬜ Not started |
+| 4 | **Admin API** (#9) | Every real product has this; usually glossed over. | ✅ Shipped |
+| 5 | **Event CRUD** (#9b) | Without it there is no catalogue and nothing to sell — the admin override exists but has nothing to override *on*. | ⬜ Not started — **← next** |
+| 6 | **Anti-bot** (#10) | Proves you think like an attacker. | ⬜ Not started |
+| 7 | **Notifications** (#8) | Tests the design's flexibility claim. | ⬜ Not started |
 
-The three headline items are shipped, and they were the hard ones — the
-prerequisites (the state machine, the audit log) and the money (Stripe). What
-is left is the layer of polish and support tooling that makes a project look
-like it was *operated*, not just written: the admin override, the bot defence,
-the notifications. That is where the remaining differentiator is, and it is a
-different kind of differentiator — less "impressive endpoint" and more "someone
-ran this in production and thought about what goes wrong".
+The four headline items are shipped, and they were the hard ones — the
+prerequisites (the state machine, the audit log), the money (Stripe) and the
+support override. What is left is the layer of polish and support tooling that
+makes a project look like it was *operated*, not just written: the catalogue,
+the bot defence, the notifications. That is where the remaining differentiator
+is, and it is a different kind of differentiator — less "impressive endpoint"
+and more "someone ran this in production and thought about what goes wrong".
 
 ---
 

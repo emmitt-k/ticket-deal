@@ -38,7 +38,7 @@ type AdmissionResult struct {
 //
 //	Prevents unbounded growth from disconnected users.
 type WaitRoomConfig struct {
-	EventID         int64
+	EventID         string
 	Capacity        int
 	RefillRate      float64
 	QueueTTLSeconds int
@@ -47,15 +47,15 @@ type WaitRoomConfig struct {
 // bucketKey returns the bucket state key for an event.
 //
 //	"bucket:event:42"
-func bucketKey(eventID int64) string {
-	return fmt.Sprintf("bucket:event:%d", eventID)
+func bucketKey(eventID string) string {
+	return fmt.Sprintf("bucket:event:%s", eventID)
 }
 
 // queueKey returns the queue key for an event.
 //
 //	"queue:event:42"
-func queueKey(eventID int64) string {
-	return fmt.Sprintf("queue:event:%d", eventID)
+func queueKey(eventID string) string {
+	return fmt.Sprintf("queue:event:%s", eventID)
 }
 
 // TryAdmit runs the token bucket atomically: refills tokens if time has
@@ -116,7 +116,7 @@ func TryAdmit(ctx context.Context, c *redisclient.Client,
 // GetPosition returns a user's 1-based queue position.
 // Returns 0 if the user is not in the queue.
 func GetPosition(ctx context.Context, c *redisclient.Client,
-	eventID int64, userID string,
+	eventID string, userID string,
 ) (int, error) {
 	rank, err := c.ZRank(ctx, queueKey(eventID), userID).Result()
 	if err == redisclient.Nil {
@@ -131,7 +131,7 @@ func GetPosition(ctx context.Context, c *redisclient.Client,
 // Promote removes a user from the queue. The drainer goroutine (Phase 4)
 // calls this when a token becomes available for a queued user.
 func Promote(ctx context.Context, c *redisclient.Client,
-	eventID int64, userID string,
+	eventID string, userID string,
 ) error {
 	if err := c.ZRem(ctx, queueKey(eventID), userID).Err(); err != nil {
 		return fmt.Errorf("redis: ZREM failed: %w", err)
@@ -145,7 +145,7 @@ func Promote(ctx context.Context, c *redisclient.Client,
 //
 // Returns the user's 1-based queue position.
 func Enqueue(ctx context.Context, c *redisclient.Client,
-	eventID int64, userID string, nowMS int64, ttlSec int,
+	eventID string, userID string, nowMS int64, ttlSec int,
 ) (int, error) {
 	cutoff := nowMS - int64(ttlSec)*1000
 	pipe := c.Pipeline()
@@ -170,7 +170,7 @@ func Enqueue(ctx context.Context, c *redisclient.Client,
 // the head of the queue when a token refills.
 //
 // Returns ErrQueueEmpty if the queue is empty.
-func ZPopMin(ctx context.Context, c *redisclient.Client, eventID int64) (string, error) {
+func ZPopMin(ctx context.Context, c *redisclient.Client, eventID string) (string, error) {
 	result, err := c.ZPopMin(ctx, queueKey(eventID), 1).Result()
 	if err == redisclient.Nil {
 		return "", ErrQueueEmpty
@@ -185,7 +185,7 @@ func ZPopMin(ctx context.Context, c *redisclient.Client, eventID int64) (string,
 }
 
 // QueueSize returns the number of users currently waiting in the event's queue.
-func QueueSize(ctx context.Context, c *redisclient.Client, eventID int64) (int, error) {
+func QueueSize(ctx context.Context, c *redisclient.Client, eventID string) (int, error) {
 	n, err := c.ZCard(ctx, queueKey(eventID)).Result()
 	if err != nil {
 		return 0, fmt.Errorf("redis: ZCard failed: %w", err)

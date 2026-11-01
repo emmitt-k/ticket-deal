@@ -50,7 +50,7 @@ func newTestRedis(t *testing.T) *redisclient.Client {
 	return c
 }
 
-func seedEvent(t *testing.T, pool *db.Pool, eventID int64) {
+func seedEvent(t *testing.T, pool *db.Pool, eventID string) {
 	t.Helper()
 	name := "expire-test-" + uuid.NewString()
 	_, err := pool.Exec(context.Background(),
@@ -65,7 +65,7 @@ func seedEvent(t *testing.T, pool *db.Pool, eventID int64) {
 
 // insertPendingReservation writes a PENDING_PAYMENT row directly via
 // the same SQL the worker uses, so we don't depend on Phase 6 wiring.
-func insertPendingReservation(t *testing.T, pool *db.Pool, eventID int64, userID string, seats int, expiresAt time.Time) string {
+func insertPendingReservation(t *testing.T, pool *db.Pool, eventID string, userID string, seats int, expiresAt time.Time) string {
 	t.Helper()
 	id := uuid.NewString()
 	err := db.InsertIfAbsent(context.Background(), pool, queue.Reservation{
@@ -101,7 +101,7 @@ func insertPendingReservation(t *testing.T, pool *db.Pool, eventID int64, userID
 func TestCompensate_RowFound(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(71001)
+	const eID = "00000000-0000-4000-8000-000000011559"
 	seedEvent(t, pool, eID)
 	uid := "exp-alice-" + uuid.NewString()[:8]
 
@@ -129,7 +129,7 @@ func TestCompensate_RowFound(t *testing.T) {
 func TestCompensate_MultiSeat(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(71002)
+	const eID = "00000000-0000-4000-8000-00000001155a"
 	seedEvent(t, pool, eID)
 	uid := "exp-group-" + uuid.NewString()[:8]
 
@@ -151,7 +151,7 @@ func TestCompensate_MultiSeat(t *testing.T) {
 func TestCompensate_NoRow(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(71003)
+	const eID = "00000000-0000-4000-8000-00000001155b"
 	seedEvent(t, pool, eID)
 	uid := "orphan-" + uuid.NewString()[:8]
 
@@ -172,7 +172,7 @@ func TestCompensate_NoRow(t *testing.T) {
 func TestCompensate_AlreadyNonPending(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(71004)
+	const eID = "00000000-0000-4000-8000-00000001155c"
 	seedEvent(t, pool, eID)
 	uid := "already-" + uuid.NewString()[:8]
 
@@ -206,7 +206,7 @@ func TestCompensate_AlreadyNonPending(t *testing.T) {
 func TestCompensate_Idempotent(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(71005)
+	const eID = "00000000-0000-4000-8000-00000001155d"
 	seedEvent(t, pool, eID)
 	uid := "idemp-" + uuid.NewString()[:8]
 
@@ -237,7 +237,7 @@ func TestCompensate_Idempotent(t *testing.T) {
 func TestCompensate_Concurrent(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(71006)
+	const eID = "00000000-0000-4000-8000-00000001155e"
 	seedEvent(t, pool, eID)
 
 	require.NoError(t, rdb.Set(context.Background(),

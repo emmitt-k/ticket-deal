@@ -94,7 +94,7 @@ func doPay(t *testing.T, pool *db.Pool, payments PaymentIntentCreator, userID, r
 		r.Post("/reservations/{id}/pay", PayHandler(pool, payments))
 	})
 
-	token, err := auth.Issue(userID, 1, getReservationTestSecret, 2*time.Minute)
+	token, err := auth.Issue(userID, "9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b", getReservationTestSecret, 2*time.Minute)
 	require.NoError(t, err, "issue test JWT")
 	req := httptest.NewRequest(http.MethodPost, "/api/reservations/"+reservationID+"/pay", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -141,7 +141,7 @@ func signedStripePayload(t *testing.T, payload []byte, secret string) string {
 // apiPriceEvent sets a price on a seeded event. The seed helper
 // inserts without the money columns (the defaults apply), so a test
 // that needs a priced event sets it explicitly.
-func apiPriceEvent(t *testing.T, pool *db.Pool, eventID int64, priceCents int64) {
+func apiPriceEvent(t *testing.T, pool *db.Pool, eventID string, priceCents int64) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
 		"UPDATE events SET price_cents = $2, currency = 'usd' WHERE id = $1",
@@ -157,7 +157,7 @@ func apiPriceEvent(t *testing.T, pool *db.Pool, eventID int64, priceCents int64)
 func TestPay_HappyPath(t *testing.T) {
 	const owner = "u-pay-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64008)
+	const eventID = "00000000-0000-4000-8000-00000000fa08"
 	apiSeedEvent(t, pool, eventID)
 	apiPriceEvent(t, pool, eventID, 2500)
 
@@ -193,7 +193,7 @@ func TestPay_HappyPath(t *testing.T) {
 func TestPay_NotYourReservation(t *testing.T) {
 	const owner = "u-pay-2"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64009)
+	const eventID = "00000000-0000-4000-8000-00000000fa09"
 	apiSeedEvent(t, pool, eventID)
 
 	r := apiValidReservationFor(t, eventID, owner)
@@ -211,7 +211,7 @@ func TestPay_NotYourReservation(t *testing.T) {
 func TestPay_AlreadyConfirmed(t *testing.T) {
 	const owner = "u-pay-3"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64010)
+	const eventID = "00000000-0000-4000-8000-00000000fa0a"
 	apiSeedEvent(t, pool, eventID)
 
 	r := apiValidReservationFor(t, eventID, owner)
@@ -235,7 +235,7 @@ func TestPay_AlreadyConfirmed(t *testing.T) {
 func TestPay_AlreadyExpired(t *testing.T) {
 	const owner = "u-pay-4"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64011)
+	const eventID = "00000000-0000-4000-8000-00000000fa0b"
 	apiSeedEvent(t, pool, eventID)
 
 	r := apiValidReservationFor(t, eventID, owner)
@@ -254,13 +254,20 @@ func TestPay_AlreadyExpired(t *testing.T) {
 	require.Equal(t, "already_expired", body["error"])
 }
 
-// TestPay_UnpricedEvent — an event with no price cannot be charged.
+// TestPay_UnpricedEvent — an event priced at zero cannot be charged.
 // (Stripe rejects amounts below $0.50 anyway.)
+//
+// The event is created and then EXPLICITLY priced to 0, because the
+// column default is no longer 0 — a newly created event is priced at
+// $25.00 so it is sellable out of the box. The zero-price path is
+// still reachable (an organizer can set a price of 0), so the guard
+// is still worth testing.
 func TestPay_UnpricedEvent(t *testing.T) {
 	const owner = "u-pay-5"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64012)
-	apiSeedEvent(t, pool, eventID) // no price → 0
+	const eventID = "00000000-0000-4000-8000-00000000fa0c"
+	apiSeedEvent(t, pool, eventID)
+	apiPriceEvent(t, pool, eventID, 0) // explicitly free
 
 	r := apiValidReservationFor(t, eventID, owner)
 	apiCleanupReservation(t, pool, r.ReservationID)
@@ -279,7 +286,7 @@ func TestPay_UnpricedEvent(t *testing.T) {
 func TestPay_ReplayDoesNotCreateASecondPayment(t *testing.T) {
 	const owner = "u-pay-6"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64013)
+	const eventID = "00000000-0000-4000-8000-00000000fa0d"
 	apiSeedEvent(t, pool, eventID)
 	apiPriceEvent(t, pool, eventID, 2500)
 
@@ -310,7 +317,7 @@ func TestPay_ReplayDoesNotCreateASecondPayment(t *testing.T) {
 func TestPay_StripeErrorIs502(t *testing.T) {
 	const owner = "u-pay-7"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64014)
+	const eventID = "00000000-0000-4000-8000-00000000fa0e"
 	apiSeedEvent(t, pool, eventID)
 	apiPriceEvent(t, pool, eventID, 2500)
 

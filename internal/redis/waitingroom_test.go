@@ -13,7 +13,7 @@ import (
 func TestWaitRoom_AdmitsThenQueues(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(50000)
+	const eventID = "00000000-0000-4000-8000-00000000c350"
 	cfg := WaitRoomConfig{
 		EventID:         eventID,
 		Capacity:        3,
@@ -44,7 +44,7 @@ func TestWaitRoom_AdmitsThenQueues(t *testing.T) {
 func TestWaitRoom_Refill(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(50001)
+	const eventID = "00000000-0000-4000-8000-00000000c351"
 	cfg := WaitRoomConfig{
 		EventID:         eventID,
 		Capacity:        2,
@@ -99,7 +99,7 @@ func TestWaitRoom_Refill(t *testing.T) {
 func TestWaitRoom_GetPosition(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(50002)
+	const eventID = "00000000-0000-4000-8000-00000000c352"
 	cfg := WaitRoomConfig{
 		EventID:         eventID,
 		Capacity:        1,
@@ -143,7 +143,7 @@ func TestWaitRoom_GetPosition(t *testing.T) {
 func TestWaitRoom_Enqueue(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(50003)
+	const eventID = "00000000-0000-4000-8000-00000000c353"
 	withCleanKeys(t, rdb, bucketKey(eventID), queueKey(eventID))
 
 	// Enqueue user-1 and user-2 directly

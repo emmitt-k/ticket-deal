@@ -52,7 +52,7 @@ func newTestRedis(t *testing.T) *redisclient.Client {
 }
 
 // seedEvent creates an event with a price and removes it afterwards.
-func seedEvent(t *testing.T, pool *db.Pool, eventID int64, priceCents int64) {
+func seedEvent(t *testing.T, pool *db.Pool, eventID string, priceCents int64) {
 	t.Helper()
 	name := "payment-test-" + uuid.NewString()
 	_, err := pool.Exec(context.Background(),
@@ -68,7 +68,7 @@ func seedEvent(t *testing.T, pool *db.Pool, eventID int64, priceCents int64) {
 
 // insertPendingReservation writes a PENDING_PAYMENT row via the same
 // path the worker uses, and returns its id.
-func insertPendingReservation(t *testing.T, pool *db.Pool, eventID int64, userID string, seats int) string {
+func insertPendingReservation(t *testing.T, pool *db.Pool, eventID string, userID string, seats int) string {
 	t.Helper()
 	id := uuid.NewString()
 	err := db.InsertIfAbsent(context.Background(), pool, queue.Reservation{
@@ -137,7 +137,7 @@ func reservationStatus(t *testing.T, pool *db.Pool, reservationID string) string
 func TestHandleSucceeded_ConfirmsTheReservation(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68001)
+	const eventID = "00000000-0000-4000-8000-0000000109a1"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-" + uuid.NewString()[:8]
@@ -173,7 +173,7 @@ func TestHandleSucceeded_ConfirmsTheReservation(t *testing.T) {
 func TestHandleSucceeded_DuplicateDeliveryIsIdempotent(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68002)
+	const eventID = "00000000-0000-4000-8000-0000000109a2"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-dup-" + uuid.NewString()[:8]
@@ -201,7 +201,7 @@ func TestHandleSucceeded_DuplicateDeliveryIsIdempotent(t *testing.T) {
 func TestHandleSucceeded_AfterTheHoldExpired(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68003)
+	const eventID = "00000000-0000-4000-8000-0000000109a3"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-race-" + uuid.NewString()[:8]
@@ -251,7 +251,7 @@ func TestHandleSucceeded_UnknownPayment(t *testing.T) {
 func TestHandleFailed_LeavesTheReservationPending(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68004)
+	const eventID = "00000000-0000-4000-8000-0000000109a4"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-fail-" + uuid.NewString()[:8]
@@ -279,7 +279,7 @@ func TestHandleFailed_LeavesTheReservationPending(t *testing.T) {
 func TestHandleRefunded_FullRefundReleasesTheSeat(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68005)
+	const eventID = "00000000-0000-4000-8000-0000000109a5"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-refund-" + uuid.NewString()[:8]
@@ -324,7 +324,7 @@ func TestHandleRefunded_FullRefundReleasesTheSeat(t *testing.T) {
 func TestHandleRefunded_PartialRefundLeavesTheReservationConfirmed(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68006)
+	const eventID = "00000000-0000-4000-8000-0000000109a6"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-partial-" + uuid.NewString()[:8]
@@ -365,7 +365,7 @@ func TestHandleRefunded_PartialRefundLeavesTheReservationConfirmed(t *testing.T)
 func TestHandleRefunded_DuplicateDeliveryIsIdempotent(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68007)
+	const eventID = "00000000-0000-4000-8000-0000000109a7"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-refund-dup-" + uuid.NewString()[:8]
@@ -405,7 +405,7 @@ func TestHandleMessage_MalformedMessageIsDropped(t *testing.T) {
 func TestHandleMessage_ValidMessageIsApplied(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eventID = int64(68008)
+	const eventID = "00000000-0000-4000-8000-0000000109a8"
 	seedEvent(t, pool, eventID, 2500)
 
 	uid := "pay-msg-" + uuid.NewString()[:8]

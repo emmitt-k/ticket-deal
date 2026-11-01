@@ -9,10 +9,19 @@
 -- Zero overselling is enforced at the worker write path, not here.
 
 -- ───── events ────────────────────────────────────────────────────────────
--- One row per concert/show/screening. id is BIGINT (manual, not serial),
--- because event creation is a separate workflow from reservation workflow.
+-- One row per concert/show/screening. id is a UUID with NO DEFAULT —
+-- the application mints it (uuid.NewString()), exactly like
+-- reservations.reservation_id. The reason is in migrations/
+-- 010_event_id_uuid.sql: a BIGINT id is guessable, so a customer could
+-- enumerate the whole catalogue by walking id=1, 2, 3…
+--
+-- Note on history: this file originally created the id as BIGINT, and
+-- 010_event_id_uuid.sql converts it. The line below reads as UUID so a
+-- FRESH database gets the final shape directly — but 010 still runs
+-- and still has to work, so it is written to be a no-op-safe swap on
+-- an already-UUID column. See 010's header for the reasoning.
 CREATE TABLE events (
-    id                BIGINT PRIMARY KEY,
+    id                UUID PRIMARY KEY,                        -- app-minted, no default
     name              TEXT NOT NULL,
     initial_inventory INTEGER NOT NULL CHECK (initial_inventory >= 0),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -25,7 +34,7 @@ CREATE TABLE events (
 CREATE TABLE reservations (
     reservation_id    UUID PRIMARY KEY,                       -- idempotency key
     user_id           TEXT NOT NULL,
-    event_id          BIGINT NOT NULL REFERENCES events(id),
+    event_id          UUID NOT NULL REFERENCES events(id),
     status            TEXT NOT NULL
                       CHECK (status IN ('PENDING_PAYMENT', 'CONFIRMED', 'EXPIRED', 'CANCELLED')),
     expires_at        TIMESTAMPTZ NOT NULL,

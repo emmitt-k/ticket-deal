@@ -1,4 +1,4 @@
-// Burst test: 1000 VUs each try to reserve 1 seat for event_id=1 (inv=100).
+// Burst test: 1000 VUs each try to reserve 1 seat for one event (inv=100).
 // Expected outcome with the Redis Lua reserve path: exactly 100 × 200, 900 × 409.
 // Zero oversell (impossible — Lua is atomic), zero data loss (every loser gets 409).
 //

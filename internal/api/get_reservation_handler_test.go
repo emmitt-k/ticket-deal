@@ -40,7 +40,7 @@ func doGetReservation(t *testing.T, pool *db.Pool, userID, reservationID string)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/reservations/"+reservationID, nil)
 	if userID != "" {
-		token, err := auth.Issue(userID, 1, getReservationTestSecret, 2*time.Minute)
+		token, err := auth.Issue(userID, "9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b", getReservationTestSecret, 2*time.Minute)
 		require.NoError(t, err, "Issue test JWT")
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -70,7 +70,7 @@ func doListMyReservations(t *testing.T, pool *db.Pool, userID, query string) (*h
 	}
 	req := httptest.NewRequest(http.MethodGet, url, nil)
 	if userID != "" {
-		token, err := auth.Issue(userID, 1, getReservationTestSecret, 2*time.Minute)
+		token, err := auth.Issue(userID, "9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b", getReservationTestSecret, 2*time.Minute)
 		require.NoError(t, err, "Issue test JWT")
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -106,7 +106,7 @@ func apiNewTestPool(t *testing.T) *db.Pool {
 	return p
 }
 
-func apiSeedEvent(t *testing.T, pool *db.Pool, eventID int64) {
+func apiSeedEvent(t *testing.T, pool *db.Pool, eventID string) {
 	t.Helper()
 	name := "test-event-" + uuid.NewString()
 	_, err := pool.Exec(context.Background(),
@@ -151,7 +151,7 @@ func apiCleanupReservation(t *testing.T, pool *db.Pool, reservationID string) {
 
 // apiValidReservationFor builds a queue.Reservation with a chosen user_id.
 // Mirrors the same-named helper in internal/db/list_reservations_test.go.
-func apiValidReservationFor(t *testing.T, eventID int64, userID string) queue.Reservation {
+func apiValidReservationFor(t *testing.T, eventID string, userID string) queue.Reservation {
 	t.Helper()
 	now := time.Now().UTC()
 	return queue.Reservation{
@@ -167,10 +167,10 @@ func apiValidReservationFor(t *testing.T, eventID int64, userID string) queue.Re
 // newGetReservationPool wraps apiNewTestPool + apiSeedEvent +
 // apiCleanupReservation + a single InsertIfAbsent for `owner`. Returns
 // the pool, event id, and inserted reservation id.
-func newGetReservationPool(t *testing.T, owner string) (pool *db.Pool, eventID int64, reservationID string) {
+func newGetReservationPool(t *testing.T, owner string) (pool *db.Pool, eventID string, reservationID string) {
 	t.Helper()
 	pool = apiNewTestPool(t)
-	const id = int64(64001)
+	const id = "00000000-0000-4000-8000-00000000fa01"
 	apiSeedEvent(t, pool, id)
 	r := apiValidReservationFor(t, id, owner)
 	apiCleanupReservation(t, pool, r.ReservationID)
@@ -191,7 +191,7 @@ func TestGetReservation_HappyPath(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, owner, body["user_id"])
 	require.Equal(t, rid, body["reservation_id"])
-	require.Equal(t, float64(eventID), body["event_id"], "encoding/json parses int64 as float64")
+	require.Equal(t, eventID, body["event_id"], "the event id is a UUID string in JSON")
 	require.Equal(t, db.StatusPendingPayment, body["status"])
 	require.NotEmpty(t, body["event_name"], "LEFT JOIN events should populate event_name")
 }
@@ -251,7 +251,7 @@ func TestListMyReservations_Empty(t *testing.T) {
 func TestListMyReservations_HappyPath(t *testing.T) {
 	const owner = "u-list-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64002)
+	const eventID = "00000000-0000-4000-8000-00000000fa02"
 	apiSeedEvent(t, pool, eventID)
 
 	ids := make([]string, 3)
@@ -287,7 +287,7 @@ func TestListMyReservations_HappyPath(t *testing.T) {
 func TestListMyReservations_StatusFilter(t *testing.T) {
 	const owner = "u-filter-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64003)
+	const eventID = "00000000-0000-4000-8000-00000000fa03"
 	apiSeedEvent(t, pool, eventID)
 
 	r1 := apiValidReservationFor(t, eventID, owner)
@@ -327,7 +327,7 @@ func TestListMyReservations_StatusFilter(t *testing.T) {
 func TestListMyReservations_Pagination(t *testing.T) {
 	const owner = "u-page-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64004)
+	const eventID = "00000000-0000-4000-8000-00000000fa04"
 	apiSeedEvent(t, pool, eventID)
 
 	allIDs := make(map[string]bool)
@@ -382,7 +382,7 @@ func TestListMyReservations_DoesNotLeak(t *testing.T) {
 	const owner = "u-leak-1"
 	const other = "u-leak-other-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64005)
+	const eventID = "00000000-0000-4000-8000-00000000fa05"
 	apiSeedEvent(t, pool, eventID)
 
 	// 3 rows for owner, 1 for other.
@@ -416,7 +416,7 @@ func TestListMyReservations_DoesNotLeak(t *testing.T) {
 func TestListMyReservations_RefundedIsItsOwnStatus(t *testing.T) {
 	const owner = "u-refunded-filter-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64004)
+	const eventID = "00000000-0000-4000-8000-00000000fa04"
 	apiSeedEvent(t, pool, eventID)
 
 	// One cancelled (never paid), one refunded (paid, then reversed).
@@ -473,7 +473,7 @@ func TestListMyReservations_RefundedIsItsOwnStatus(t *testing.T) {
 func TestGetReservation_IncludesThePrice(t *testing.T) {
 	const owner = "u-price-1"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64005)
+	const eventID = "00000000-0000-4000-8000-00000000fa05"
 	apiSeedEvent(t, pool, eventID)
 
 	_, err := pool.Exec(context.Background(),
@@ -498,7 +498,7 @@ func TestGetReservation_IncludesThePrice(t *testing.T) {
 func TestListMyReservations_IncludesThePrice(t *testing.T) {
 	const owner = "u-price-2"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64006)
+	const eventID = "00000000-0000-4000-8000-00000000fa06"
 	apiSeedEvent(t, pool, eventID)
 
 	_, err := pool.Exec(context.Background(),
@@ -528,7 +528,7 @@ func TestListMyReservations_IncludesThePrice(t *testing.T) {
 func TestGetReservation_PriceIsServerSide(t *testing.T) {
 	const owner = "u-price-3"
 	pool := apiNewTestPool(t)
-	const eventID = int64(64007)
+	const eventID = "00000000-0000-4000-8000-00000000fa07"
 	apiSeedEvent(t, pool, eventID)
 
 	_, err := pool.Exec(context.Background(),

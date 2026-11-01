@@ -49,7 +49,7 @@ func TestMiddleware_EmptyToken(t *testing.T) {
 
 // TestMiddleware_Tampered: payload or signature flipped ⇒ 401.
 func TestMiddleware_Tampered(t *testing.T) {
-	tok, _ := auth.Issue("alice", 42, testSecret, time.Minute)
+	tok, _ := auth.Issue("alice", testEventID, testSecret, time.Minute)
 	tampered := tok[:len(tok)-2] + "AA"
 	rec := doAuthReq(t, "Bearer "+tampered)
 	if rec.Code != http.StatusUnauthorized {
@@ -76,10 +76,10 @@ func TestMiddleware_Expired(t *testing.T) {
 // integration test: middleware must hand verified claims to the
 // downstream handler.
 func TestMiddleware_ValidPassesAndClaimsInjected(t *testing.T) {
-	tok, _ := auth.Issue("alice", 42, testSecret, time.Minute)
+	tok, _ := auth.Issue("alice", testEventID, testSecret, time.Minute)
 
 	var seenSub string
-	var seenEvent int64
+	var seenEvent string
 	handler := auth.Middleware(testSecret)(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
 			c := auth.ClaimsFromContext(r.Context())
@@ -105,8 +105,8 @@ func TestMiddleware_ValidPassesAndClaimsInjected(t *testing.T) {
 	if seenSub != "alice" {
 		t.Errorf("sub = %q, want alice", seenSub)
 	}
-	if seenEvent != 42 {
-		t.Errorf("event_id = %d, want 42", seenEvent)
+	if seenEvent != testEventID {
+		t.Errorf("event_id = %q, want %q", seenEvent, testEventID)
 	}
 }
 

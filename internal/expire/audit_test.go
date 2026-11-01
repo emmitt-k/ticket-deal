@@ -29,7 +29,7 @@ import (
 func TestCompensate_WritesAuditRow(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(73001)
+	const eID = "00000000-0000-4000-8000-000000011d29"
 	seedEvent(t, pool, eID)
 	uid := "audit-watcher-" + uuid.NewString()[:8]
 
@@ -59,7 +59,7 @@ func TestCompensate_WritesAuditRow(t *testing.T) {
 func TestCompensate_NoAuditRowWhenNothingExpired(t *testing.T) {
 	pool := newTestPool(t)
 	rdb := newTestRedis(t)
-	const eID = int64(73002)
+	const eID = "00000000-0000-4000-8000-000000011d2a"
 	seedEvent(t, pool, eID)
 	uid := "audit-orphan-" + uuid.NewString()[:8]
 
@@ -78,7 +78,7 @@ func TestCompensate_NoAuditRowWhenNothingExpired(t *testing.T) {
 // and the service label in the metadata.
 func TestFindAndExpireSweptRows_WritesAuditRow(t *testing.T) {
 	pool := newTestPool(t)
-	const eID = int64(73003)
+	const eID = "00000000-0000-4000-8000-000000011d2b"
 	seedEvent(t, pool, eID)
 	uid := "audit-sweep-" + uuid.NewString()[:8]
 
@@ -113,7 +113,7 @@ func TestFindAndExpireSweptRows_WritesAuditRow(t *testing.T) {
 // second EXPIRED audit row.
 func TestFindAndExpireSweptRows_NoAuditRowOnSecondRun(t *testing.T) {
 	pool := newTestPool(t)
-	const eID = int64(73004)
+	const eID = "00000000-0000-4000-8000-000000011d2c"
 	seedEvent(t, pool, eID)
 	uid := "audit-sweep-idem-" + uuid.NewString()[:8]
 

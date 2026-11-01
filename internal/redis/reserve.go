@@ -46,16 +46,21 @@ type Result struct {
 
 // InventoryKey is the canonical Redis key for an event's available-seat counter.
 //
-//	"inventory:event:42"
-func InventoryKey(eventID int64) string {
-	return fmt.Sprintf("inventory:event:%d", eventID)
+//	"inventory:event:9f8c1e2a-...-4b3a"
+//
+// The event id is a UUID (see internal/eventid), so the key carries it
+// verbatim. Every layer that builds this key MUST use this function —
+// a hand-built key is how the hold-key parser ends up disagreeing with
+// the writer (Convention #10).
+func InventoryKey(eventID string) string {
+	return fmt.Sprintf("inventory:event:%s", eventID)
 }
 
 // AvailableSeats returns the current available-seat count for an event
 // by reading the inventory key. Returns 0 if the key is missing (no
 // inventory seeded yet). Used by the metrics state updater — the hot
 // path uses the Lua reserve script which is atomic.
-func AvailableSeats(ctx context.Context, c *redisclient.Client, eventID int64) (int, error) {
+func AvailableSeats(ctx context.Context, c *redisclient.Client, eventID string) (int, error) {
 	v, err := c.Get(ctx, InventoryKey(eventID)).Int()
 	if err == redisclient.Nil {
 		return 0, nil
@@ -68,12 +73,16 @@ func AvailableSeats(ctx context.Context, c *redisclient.Client, eventID int64) (
 
 // HoldKey is the canonical Redis key for a per-user hold lock.
 //
-//	"hold:event:42:user:u1"
+//	"hold:event:9f8c1e2a-...-4b3a:user:u1"
 //
 // Acts as: (1) anti-double-book, (2) auto-release on abandonment, (3) cleanup-free TTL.
 // See docs/architecture.md §4 "The hold key".
-func HoldKey(eventID int64, userID string) string {
-	return fmt.Sprintf("hold:event:%d:user:%s", eventID, userID)
+//
+// The event id is a UUID, so the key format is unambiguous to parse
+// back: a UUID contains no colons, so the FIRST ":user:" in the key
+// is the separator. See expire.ParseHoldKey.
+func HoldKey(eventID string, userID string) string {
+	return fmt.Sprintf("hold:event:%s:user:%s", eventID, userID)
 }
 
 // ReserveSeat runs the atomic Lua reserve script.
@@ -93,7 +102,7 @@ func HoldKey(eventID int64, userID string) string {
 //   - {Status: StatusRejected, Reason: ReasonAlreadyHolding}       if user holds one
 //   - non-nil error                                               on connection / script issues
 func ReserveSeat(ctx context.Context, c *redisclient.Client,
-	eventID int64, userID string, holdTTLSec, seatsRequested int,
+	eventID string, userID string, holdTTLSec, seatsRequested int,
 ) (Result, error) {
 	keys := []string{InventoryKey(eventID), HoldKey(eventID, userID)}
 	args := []any{holdTTLSec, seatsRequested}

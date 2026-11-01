@@ -14,7 +14,7 @@ func TestReservation_RoundTrip(t *testing.T) {
 	original := Reservation{
 		ReservationID: "abc-123-def",
 		UserID:        "alice",
-		EventID:       42,
+		EventID:       "9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
 		Seats:         3,
 		CreatedAt:     "2026-10-06T10:00:00Z",
 		ExpiresAt:     "2026-10-06T10:10:00Z",
@@ -36,7 +36,7 @@ func TestReservation_JSONShape(t *testing.T) {
 	r := Reservation{
 		ReservationID: "x",
 		UserID:        "x",
-		EventID:       42,
+		EventID:       "9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
 		Seats:         1,
 		CreatedAt:     "x",
 		ExpiresAt:     "x",

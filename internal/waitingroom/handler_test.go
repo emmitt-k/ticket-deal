@@ -15,8 +15,8 @@ import (
 
 // bucketKeyForTest and queueKeyForTest mirror the private functions in
 // internal/redis/waitingroom.go so tests can clean up.
-func bucketKeyForTest(eventID int64) string { return fmt.Sprintf("bucket:event:%d", eventID) }
-func queueKeyForTest(eventID int64) string  { return fmt.Sprintf("queue:event:%d", eventID) }
+func bucketKeyForTest(eventID string) string { return fmt.Sprintf("bucket:event:%s", eventID) }
+func queueKeyForTest(eventID string) string  { return fmt.Sprintf("queue:event:%s", eventID) }
 
 func TestEnterHandler_IPReject(t *testing.T) {
 	rdb := testClient(t)
@@ -34,7 +34,7 @@ func TestEnterHandler_IPReject(t *testing.T) {
 
 	h := EnterHandler(cfg, rdb)
 
-	body := strings.NewReader(`{"user_id":"u1","event_id":42}`)
+	body := strings.NewReader(`{"user_id":"u1","event_id":"9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/tickets/enter", body)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -49,7 +49,7 @@ func TestEnterHandler_IPReject(t *testing.T) {
 
 func TestEnterHandler_AdmitAndQueue(t *testing.T) {
 	rdb := testClient(t)
-	const eventID = int64(51000)
+	const eventID = "00000000-0000-4000-8000-00000000c738"
 
 	cleanupKeys := []string{
 		bucketKeyForTest(eventID),
@@ -79,7 +79,7 @@ func TestEnterHandler_AdmitAndQueue(t *testing.T) {
 
 	makeReq := func(userID string) (int, map[string]any) {
 		body := strings.NewReader(fmt.Sprintf(
-			`{"user_id":"%s","event_id":%d}`, userID, eventID))
+			`{"user_id":"%s","event_id":"%s"}`, userID, eventID))
 		req := httptest.NewRequest(http.MethodPost, "/api/tickets/enter", body)
 		req.Header.Set("Content-Type", "application/json")
 		req.RemoteAddr = "1.2.3.4:12345"
@@ -115,7 +115,7 @@ func TestQueueSSEHandler_NotInQueue(t *testing.T) {
 	h := QueueSSEHandler(rdb)
 
 	req := httptest.NewRequest(http.MethodGet,
-		"/api/tickets/queue?event_id=99999&user_id=nonexistent", nil)
+		"/api/tickets/queue?event_id=9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b&user_id=nonexistent", nil)
 	rec := httptest.NewRecorder()
 
 	h.ServeHTTP(rec, req)
@@ -149,14 +149,14 @@ func TestQueueSSEHandler_BadParams(t *testing.T) {
 
 func TestEnterHandler_QueueURLFormat(t *testing.T) {
 	rdb := testClient(t)
-	const eventID = int64(51001)
+	const eventID = "00000000-0000-4000-8000-00000000c739"
 
 	// Pre-seed inventory so TryAdmit sees the event
-	rdb.Set(context.Background(), fmt.Sprintf("inventory:event:%d", eventID), 1, 0)
+	rdb.Set(context.Background(), fmt.Sprintf("inventory:event:%s", eventID), 1, 0)
 
 	t.Cleanup(func() {
 		rdb.Del(context.Background(),
-			fmt.Sprintf("inventory:event:%d", eventID),
+			fmt.Sprintf("inventory:event:%s", eventID),
 			bucketKeyForTest(eventID),
 			queueKeyForTest(eventID),
 			"ip:5.6.7.8",
@@ -174,7 +174,7 @@ func TestEnterHandler_QueueURLFormat(t *testing.T) {
 	}
 
 	h := EnterHandler(cfg, rdb)
-	body := strings.NewReader(fmt.Sprintf(`{"user_id":"u1","event_id":%d}`, eventID))
+	body := strings.NewReader(fmt.Sprintf(`{"user_id":"u1","event_id":"%s"}`, eventID))
 	req := httptest.NewRequest(http.MethodPost, "/api/tickets/enter", body)
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = "5.6.7.8:12345"
@@ -185,7 +185,7 @@ func TestEnterHandler_QueueURLFormat(t *testing.T) {
 	var resp map[string]any
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
 	require.Contains(t, resp["queue_url"], "/api/tickets/queue")
-	require.Contains(t, resp["queue_url"], "event_id=51001")
+	require.Contains(t, resp["queue_url"], "event_id="+eventID)
 	require.Contains(t, resp["queue_url"], "user_id=u1")
 }
 

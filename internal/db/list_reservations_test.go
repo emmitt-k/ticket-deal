@@ -27,7 +27,7 @@ func TestListReservationsByUser_NoRows(t *testing.T) {
 // don't leak into user B's list.
 func TestListReservationsByUser_FiltersByUser(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(63001)
+	const eventID = "00000000-0000-4000-8000-00000000f619"
 
 	seedEvent(t, pool, eventID)
 	uA := "user-a-" + uuid.NewString()[:8]
@@ -65,7 +65,7 @@ func TestListReservationsByUser_FiltersByUser(t *testing.T) {
 // passed, only EXPIRED rows come back.
 func TestListReservationsByUser_StatusFilter(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(63002)
+	const eventID = "00000000-0000-4000-8000-00000000f61a"
 
 	seedEvent(t, pool, eventID)
 	u := "user-status-" + uuid.NewString()[:8]
@@ -111,7 +111,7 @@ func TestListReservationsByUser_StatusFilter(t *testing.T) {
 // page through results; default + max bounds enforced.
 func TestListReservationsByUser_Pagination(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(63003)
+	const eventID = "00000000-0000-4000-8000-00000000f61b"
 
 	seedEvent(t, pool, eventID)
 	u := "user-page-" + uuid.NewString()[:8]
@@ -172,7 +172,7 @@ func TestListReservationsByUser_RequiresUserID(t *testing.T) {
 // validReservationFor is a copy of validReservation() that takes an
 // explicit userID instead of generating one. Lets a single test use
 // multiple distinct users without colliding on the unique constraint.
-func validReservationFor(t *testing.T, eventID int64, userID string) queue.Reservation {
+func validReservationFor(t *testing.T, eventID string, userID string) queue.Reservation {
 	t.Helper()
 	r := validReservation(t, eventID) // reuses reservations_test.go's helper
 	r.UserID = userID

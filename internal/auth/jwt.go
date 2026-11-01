@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/emmitt-k/ticket-deal/internal/eventid"
 )
 
 // Claims is the payload we sign.
@@ -21,8 +23,15 @@ import (
 // event A cannot be used to reserve on event B. This catches the most
 // common token-replay attempt (waiting for one drop, then racing
 // against a hotter one) at the middleware layer with zero state.
+//
+// The event id is a UUID, carried as a string (see internal/eventid).
+// It was an int64 before the id became a UUID — a JWT minted by the
+// old code carries `"event_id": 42`, which does not unmarshal into a
+// string field. Such a token is rejected at verification, which is
+// the correct outcome: it names an event id that cannot exist in a
+// UUID-keyed system.
 type Claims struct {
-	EventID int64 `json:"event_id"`
+	EventID string `json:"event_id"`
 	jwt.RegisteredClaims
 }
 
@@ -43,15 +52,15 @@ var (
 // The caller is responsible for ensuring secret is at least 32 bytes;
 // config.Load already enforces this at startup, so app code can rely
 // on the check at the edge. We re-check here because Issue is exported.
-func Issue(userID string, eventID int64, secret []byte, ttl time.Duration) (string, error) {
+func Issue(userID string, eventID string, secret []byte, ttl time.Duration) (string, error) {
 	if len(secret) < 32 {
 		return "", errors.New("auth: secret must be at least 32 bytes")
 	}
 	if userID == "" {
 		return "", errors.New("auth: userID is required")
 	}
-	if eventID <= 0 {
-		return "", errors.New("auth: eventID must be positive")
+	if _, err := eventid.Parse(eventID); err != nil {
+		return "", fmt.Errorf("auth: event_id: %w", err)
 	}
 	if ttl <= 0 {
 		return "", errors.New("auth: ttl must be positive")
@@ -111,7 +120,11 @@ func Verify(tokenString string, secret []byte) (*Claims, error) {
 	if claims.Subject == "" {
 		return nil, fmt.Errorf("%w: sub", ErrClaimsMissing)
 	}
-	if claims.EventID <= 0 {
+	// The event id must be a well-formed UUID. This is the LAST gate
+	// before the id reaches a Redis key, a SQL parameter and a JSON
+	// payload — three places that would each fail differently, and
+	// none of them loudly. Validating here means one clear error.
+	if _, err := eventid.Parse(claims.EventID); err != nil {
 		return nil, fmt.Errorf("%w: event_id", ErrClaimsMissing)
 	}
 

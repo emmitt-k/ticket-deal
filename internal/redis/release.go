@@ -51,7 +51,7 @@ var ErrUnknownReleaseOutcome = errors.New("redis: unknown release-seat reason")
 //
 // userID is the owner of the hold; the hold key is
 // hold:event:<eventID>:user:<userID>.
-func ReleaseSeat(ctx context.Context, c *redisclient.Client, eventID int64, userID string, seats int) (ReleaseOutcome, error) {
+func ReleaseSeat(ctx context.Context, c *redisclient.Client, eventID string, userID string, seats int) (ReleaseOutcome, error) {
 	if seats <= 0 {
 		return ReleaseSeatDone, nil // nothing to release
 	}
