@@ -1,0 +1,52 @@
+-- 011_event_status.sql — the events table gains a status column.
+--
+-- An event used to be a row with no lifecycle: it existed or it did
+-- not, and the only way to remove one was to DELETE it. That is the
+-- wrong shape for a product. Once a drop has been on sale, "is it
+-- still live?" is a real question, and "we had a 'Midnight Echo' drop,
+-- what happened to it?" is a real support question — both need the
+-- row to still be there to answer.
+--
+-- So an event gains a status:
+--
+--   active     the drop is live; its inventory is on sale
+--   cancelled  the drop was pulled before it sold anything
+--
+-- ── Why the row is NEVER deleted ───────────────────────────────────────
+--
+-- The events table is the top of the reservation tree: every
+-- reservation points at one. Deleting an event that has reservations
+-- would fail the foreign key anyway (there is no ON DELETE CASCADE),
+-- and deleting one that has none would erase the only record that the
+-- drop ever existed. A cancelled event stays as a TOMBSTONE.
+--
+-- ── Why 'cancelled' and not 'deleted' ──────────────────────────────────
+--
+-- The name says what happened. "deleted" would claim the row is gone,
+-- which it is not — and it would be a lie in the audit trail, which
+-- records that the event was CANCELLED on a date, by an actor.
+--
+-- ── The CHECK constraint ───────────────────────────────────────────────
+--
+-- The database enforces the list, so a typo in Go cannot invent a
+-- third state. This is the same pattern as the reservation status
+-- CHECK: the allowed set is data, not a convention.
+
+ALTER TABLE events
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'cancelled'));
+
+-- The DEFAULT exists so every EXISTING event is 'active' without a
+-- backfill UPDATE — an event that was sellable before this migration
+-- is still sellable after it. The default stays on the column because
+-- a newly created event (through the admin API) is active by
+-- definition; an admin cancels one explicitly.
+--
+-- There is deliberately NO index on status yet. The public catalogue
+-- lists live events and there will be a handful of them, so the
+-- planner will use a sequential scan and it will not matter. When the
+-- catalogue grows to thousands, this is the line to revisit — and the
+-- index would be a partial one:
+--
+--   CREATE INDEX idx_events_active ON events(created_at DESC)
+--     WHERE status = 'active';

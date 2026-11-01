@@ -71,6 +71,50 @@ func AvailableSeats(ctx context.Context, c *redisclient.Client, eventID string) 
 	return v, nil
 }
 
+// AddSeats puts more seats on sale for an event and returns the NEW
+// total.
+//
+// It is the admin's "we opened the back of the house" operation: an
+// organizer adds capacity to a live drop.
+//
+// It uses INCRBY, so it ADDS to the current count rather than
+// replacing it — adding seats to an event that has already sold some
+// must not resurrect the sold ones.
+//
+// A negative amount is refused: seats can be added, not removed. The
+// removal path is the expiry/release path, which is guarded by the
+// hold key (see release_seat.lua) — an admin INCRBY of a negative
+// number would have no such guard and could drive the counter
+// negative, which is a phantom seat waiting to happen.
+//
+// A missing inventory key is an error, not a zero: the event has never
+// been seeded, and adding seats to a counter that does not exist would
+// create one with the wrong number (the added seats, not the event's
+// inventory).
+func AddSeats(ctx context.Context, c *redisclient.Client, eventID string, seats int) (int, error) {
+	if seats <= 0 {
+		return 0, fmt.Errorf("redis: seats must be positive, got %d", seats)
+	}
+
+	key := InventoryKey(eventID)
+
+	// The key must already exist. INCRBY would happily create it,
+	// and a counter holding only the added seats would be wrong.
+	exists, err := c.Exists(ctx, key).Result()
+	if err != nil {
+		return 0, fmt.Errorf("redis: check inventory existence failed: %w", err)
+	}
+	if exists == 0 {
+		return 0, fmt.Errorf("redis: event %s has no inventory counter", eventID)
+	}
+
+	total, err := c.IncrBy(ctx, key, int64(seats)).Result()
+	if err != nil {
+		return 0, fmt.Errorf("redis: add seats failed: %w", err)
+	}
+	return int(total), nil
+}
+
 // HoldKey is the canonical Redis key for a per-user hold lock.
 //
 //	"hold:event:9f8c1e2a-...-4b3a:user:u1"

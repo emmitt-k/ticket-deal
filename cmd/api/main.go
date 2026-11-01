@@ -263,6 +263,12 @@ func run() error {
 	// client used by /reserve — cancel reads/seats to release seats
 	// back and clear the hold key.
 	r.Route("/api", func(r chi.Router) {
+		// GET /api/events  — the PUBLIC catalogue (Layer 2, item 9b).
+		// No auth: it is a shop window. Only ACTIVE events, and the
+		// live seat count comes from Redis.
+		r.Get("/events", api.ListEventsHandler(pool, rdb))
+		r.Get("/events/{id}", api.GetEventHandler(pool, rdb))
+
 		// GET /api/reservations/{id}  — single reservation by UUID
 		r.With(auth.Middleware(cfg.JWTSecret)).Get("/reservations/{id}",
 			api.GetReservationHandler(pool))
