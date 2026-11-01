@@ -42,11 +42,29 @@ unblock the later ones (state machine → cancel → refund → audit → Stripe
 | `/api/reservations/{id}/cancel` | POST | JWT | Cancel a `PENDING_PAYMENT` reservation; releases the seat |
 | `/api/reservations/{id}/pay` | POST | JWT | Create the Stripe PaymentIntent; returns the `client_secret` |
 | `/webhooks/stripe` | POST | Stripe signature | Stripe's callback. Verifies, snapshots, queues — no state change here |
+| `/api/events` | GET | none | **The public catalogue** — the live drops, with the live seat count |
+| `/api/events/{id}` | GET | none | One live drop. A cancelled drop is a `404` here |
 
-That's the **complete public surface**. Eleven endpoints — five from the original
-kernel, four added by Layer 1, two added by Layer 2 item 7. Behind the scenes there
-are 13 docker services, 15 internal packages, 8 migrations, and a 4-pillar
-observability stack.
+That's the **complete PUBLIC surface** — thirteen endpoints: five from the original
+kernel, four added by Layer 1, two by Layer 2 item 7, and two by item 9b.
+
+Behind the **`/admin` tree** (HMAC-signed, and **not mounted at all** when no admin key
+is configured — off, not open):
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/admin/reservations/lookup?user_id=` | GET | Support lookup — a user's reservations |
+| `/admin/reservations/{id}` | GET | Support lookup — one reservation |
+| `/admin/reservations/{id}/cancel` | POST | Cancel a held reservation; releases the seat |
+| `/admin/reservations/{id}/release-seat` | POST | Put a seat back on sale |
+| `/admin/events` | POST | **Create a drop** (+ seed its inventory into Redis) |
+| `/admin/events` | GET | Ops list — includes the cancelled tombstones |
+| `/admin/events/{id}` | GET | Ops read one |
+| `/admin/events/{id}` | PATCH | Update the name / price / currency, add seats |
+| `/admin/events/{id}/cancel` | POST | Cancel a drop — only while it has ZERO reservations |
+
+Behind the scenes there are 13 docker services, 17 internal packages, 10 migrations,
+and a 4-pillar observability stack.
 
 The read endpoints are what make the seat price reachable by a client:
 `GET /api/reservations/{id}` and `GET /api/me/reservations` return
@@ -87,14 +105,16 @@ gave them a way to be reached.
 
 ### What's not there at all (not even a stub)
 
-- ~~No payment integration — `CONFIRMED` is unreachable~~ *(Layer 2 item 7 — done; see branch `feature/stripe-integration`)*
-- ~~No webhook receiver — systems can't be told things changed~~ *(Layer 2 item 7 — done)*
+- ~~No payment integration — `CONFIRMED` is unreachable~~ *(Layer 2 item 7 — done; PR #23)*
+- ~~No webhook receiver — systems can't be told things changed~~ *(Layer 2 item 7 — done; PR #23)*
 - No notifications service — second consumer on the queue pattern
-- No admin/ops API — no way for support to look up / cancel / refund
-- ~~No `/readyz` — only bare `/healthz`, no deep dep checks~~ *(Layer 1 item 4 — done; see branch `feature/readyz`)*
+- ~~No admin/ops API — no way for support to look up / cancel / refund~~ *(Layer 2 item 9 — done; PR #26)*
+- ~~No catalogue — no way for a customer to browse, and no way to put a drop on sale~~ *(Layer 2 item 9b — done; PR #30)*
+- ~~No `/readyz` — only bare `/healthz`, no deep dep checks~~ *(Layer 1 item 4 — done)*
 - No anti-bot/CAPTCHA — only IP rate-limit via waiting room
-- ~~No idempotency keys on POST /reserve — network retries could double-book~~ *(Layer 1 item 5 — done; see branch `feature/idempotency-key`)*
-- ~~No audit log — `who did what when` is unanswerable~~ *(Layer 2 item 6 — done; see branch `feature/audit-log`)*
+- ~~No idempotency keys on POST /reserve — network retries could double-book~~ *(Layer 1 item 5 — done)*
+- ~~No audit log — `who did what when` is unanswerable~~ *(Layer 2 item 6 — done; PR #21/#22)*
+- ~~A guessable event id — a customer could walk `id=1, 2, 3…` and enumerate the catalogue~~ *(Layer 2 item 9a — done; PR #29)*
 
 ---
 
@@ -218,8 +238,8 @@ After this layer, the system has:
 - ✅ A real state machine users can drive  *(Layer 1 item 1 — done)*
 - ✅ Look-up their own tickets  *(Layer 1 item 2 — done)*
 - ✅ Cancel them  *(Layer 1 item 3 — done; branch `feature/cancel-reservation`)*
-- ✅ Tell ops "I'm healthy and all my deps are reachable"  *(Layer 1 item 4 — done; branch `feature/readyz`)*
-- ✅ Network-retry safely  *(Layer 1 item 5 — done; branch `feature/idempotency-key`)*
+- ✅ Tell ops "I'm healthy and all my deps are reachable"  *(Layer 1 item 4 — done)*
+- ✅ Network-retry safely  *(Layer 1 item 5 — done)*
 
 About 1 weekend of focused work. Small commits. Each item is independent.
 
@@ -292,7 +312,7 @@ The audit row has the OTel `trace_id` so an ops person can paste it into Grafana
 
 **Effort:** ~3-4 days. **Why it's #2 here:** audit log lets you safely debug webhooks.
 
-> **Shipped** on `feature/stripe-integration`. Notes on what changed vs the sketch
+> **Shipped** (PR #23). Notes on what changed vs the sketch
 > below:
 >
 > - The migration is `008_stripe_payments.sql` (005–007 were taken) and the table is
@@ -381,7 +401,7 @@ Events to send:
 
 **Effort:** ~1 day. **Why:** every real product has "support override."
 
-> **Shipped** on `feature/admin-api`. Notes on what changed vs the sketch below:
+> **Shipped** (PR #26). Notes on what changed vs the sketch below:
 >
 > - The signature is an HMAC over the **request** — the method, the FULL URI
 >   (query string included), the body and a timestamp — not a bearer token. A
@@ -458,11 +478,14 @@ This is not one migration. The id is baked into:
 | **JWT claim** | `auth.Claims.EventID int64` | `string` |
 | **SQS payload** | `queue.Reservation.EventID` — JSON number | JSON string |
 | **Metrics** | `attribute.Int64("reservation.event_id", …)` | `attribute.String` |
-| **CLI + loadtest** | `cmd/mintjwt` `EVENT_ID=42` parsed with `strconv.ParseInt`; `loadtest/*.sh` | `EVENT_ID=<uuid>` |
+| **CLI + loadtest** | `cmd/mintjwt` `EVENT_ID=42` parsed with `strconv.ParseInt`; `loadtest/*.sh` | `EVENT_ID=<uuid>` — and the load test **creates** one via the admin API when it is unset (item 9b) |
 
 **The migration itself is the easy part.** New columns alongside the old, map old→new,
 backfill, swap, re-add the FK. Verified against the live database: 0 orphan reservations,
-FK re-created cleanly, `events.id` ends up `uuid NOT NULL DEFAULT gen_random_uuid()`.
+FK re-created cleanly. ⚠️ *This line originally said `events.id` ends up `uuid NOT NULL
+DEFAULT gen_random_uuid()` — which contradicts the design two paragraphs above ("the
+UUID is created by the APP, not the database"). The **design** won: the column has NO
+default. See "What actually landed" below.*
 
 **The hold key parser is the sharp edge.** `ParseHoldKey` exists because the Redis
 keyspace-notification channel fires for EVERY expired key, so the watcher has to recognise
@@ -485,10 +508,11 @@ The plan above is right about the shape and wrong in three places. What shipped:
 - **No seed at all.** `migrations/002_seed.sql` is **deleted**. The plan assumed a fixed
   UUID for the dev event; instead there is no dev event. Events are created through the
   admin API (item 9b), so a fresh database has **zero events** until an admin creates one.
-  The consequence is that the load-test targets now **require** `EVENT_ID` to be passed in
-  rather than defaulting to a number that no longer exists — a default would have silently
-  tested an event that does not exist, and the burst would report zero reservations while
-  still looking like a pass.
+  The consequence is that the load-test targets can no longer **default** `EVENT_ID` to a
+  number that no longer exists — a default would have silently tested an event that does
+  not exist, and the burst would report zero reservations while still looking like a pass.
+  (Item 9b resolved this: with no `EVENT_ID` the load test **creates** one through the
+  admin API, so it is a zero-setup command rather than a broken one.)
 - **The price moved to a column DEFAULT.** With no seeded event to price, the plan's
   "`UPDATE events SET price_cents = 2500 WHERE id = 1`" had nothing to update. The default
   on `events.price_cents` is now `2500` ($25.00) instead of `0`, so an event created without
@@ -652,14 +676,30 @@ Use `github.com/sony/gobreaker` (or roll your own in 50 LOC). Wrap:
 
 Each circuit breaker emits metrics: `circuit_breaker_state{name}`, `circuit_breaker_trips_total{name}`.
 
-### 12. Multi-event (bulk load + listing) ⬜ Not started
+### 12. Multi-event (bulk load + listing) ◐ Partly done
 
-**Effort:** ~1 day. Schema is ready, data is hardcoded.
+**Effort:** ~half a day. **Status:** item 9b built most of this.
 
-- New migration: `004_events_seed.sql` with 10 realistic events (concert, sports,
-  theater, conference)
-- New endpoint: `GET /api/events` (no auth, public list)
-- A `cmd/seed-events` tool that reads a YAML and bulk-inserts into Postgres + Redis
+**Already shipped** (by item 9b):
+
+- `GET /api/events` — the public list, no auth, with the live seat count
+- `GET /api/events/{id}` — the public read of one drop
+- `POST /admin/events` — create a drop, with its inventory seeded into Redis
+- The event id is a UUID, so a catalogue of any size is fine
+
+**Still to do:**
+
+- A `cmd/seed-events` tool that reads a YAML file and bulk-inserts into Postgres +
+  Redis — the admin API creates one event at a time, which is right for an organizer
+  and wrong for filling a demo catalogue with 10 realistic drops (concert, sports,
+  theatre, conference)
+- A `status` filter on the admin list (`?status=cancelled` to see only the tombstones)
+
+**The seed migration is deliberately NOT coming back.** The old plan was a
+`004_events_seed.sql` with 10 hardcoded events — but a migration that inserts demo data
+is a migration that has to be undone, and the event id is a UUID now, so there is no
+sensible id to hardcode. The admin API and the `cmd/seed-events` tool cover the same
+ground without the migration.
 
 ### 13. Redis Cluster / sharding ⬜ Not started
 

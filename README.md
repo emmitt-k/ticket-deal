@@ -160,7 +160,7 @@ reservation, and when?" has an answer that does not depend on log retention.
 | **0 oversell** | **417,563 requests → exactly 100 reserved, 417,463 sold out.** Never 101 |
 | **4,639 req/s** | sustained through a 7-stage ramp to 1,000 concurrent VUs |
 | **33 ms** | median reserve latency under that load (p99 525 ms at the 1,000-VU peak) |
-| **298 tests** | 56.4% statement coverage, with a 45% floor enforced in CI |
+| **340 tests** | 58.2% statement coverage, with a 45% floor enforced in CI |
 | **3 CI jobs** | Test (a real Postgres, Redis and SQS broker), Lint, E2E — and the E2E job boots the whole stack and drives a reservation through it |
 | **0 known CVEs** | `govulncheck` is a gate, not a report |
 | **22 routes · 10 migrations · 17 packages · 13 containers** | 5 Go binaries, 8 infrastructure services |
@@ -224,6 +224,15 @@ request, one body, five minutes. The audit trail records the *fingerprint* of th
 that acted, never the key itself. And its power is bounded by the same state machine: a
 paid reservation is **refunded**, not cancelled.
 
+**The admin API manages the catalogue too.** A drop is created, priced and taken off
+sale through `/admin/events` — and creating one is *all-or-nothing* across both stores:
+the row lands in Postgres and the inventory counter lands in Redis, or the row is rolled
+back. An event with no counter can't sell a seat and would answer `event_not_found` to
+every customer. Cancelling takes the inventory off sale **before** the row is cancelled,
+so a failure can never leave a phantom seat. And a drop can only be cancelled while it
+has sold **nothing** — once a customer has touched it, it stays as a tombstone, because
+"what happened to that drop?" is a question worth being able to answer.
+
 ---
 
 ## Testing
@@ -268,6 +277,7 @@ interesting parts.
 | **Queue** | AWS SQS Standard (ElasticMQ locally) — at-least-once delivery plus idempotent workers is reliable enough |
 | **Database** | PostgreSQL 16 — the source of truth, never on the hot path |
 | **Auth** | JWT HS256 — `sub` + `event_id` + `exp`, and Stripe confirms the money |
+| **Catalogue** | A public list of live drops — created and managed through the admin API |
 | **Payments** | Stripe test mode — PaymentIntents, signature-verified webhooks, refunds |
 | **Metrics / Traces / Logs** | Prometheus + Grafana · OpenTelemetry → Jaeger · `log/slog` → Loki |
 | **Load testing** | k6 — 1,000 VUs, threshold assertions |
@@ -280,17 +290,18 @@ interesting parts.
 ```
 cmd/                api · worker · stripe-worker · expiration-watcher · dashboard-server · mintjwt · seed-inventory
 internal/
-  api/              the HTTP handlers
-  admin/            the HMAC-signed support API
+  api/              the HTTP handlers, and the public catalogue
+  admin/            the HMAC-signed support API, and the event CRUD
   payment/          the Stripe state machine (the consumer side)
   stripe/           the Stripe client — create, verify, snapshot
   queue/            SQS publisher + consumer, and the trace propagation
-  db/               pgx pool, the state machine, the audit log, payments
+  db/               pgx pool, the state machine, the audit log, payments, events
+  eventid/          the event id — a UUID, minted by the app, validated in one place
   redis/            the Lua scripts — seat locking, the waiting room, idempotency
   expire/           the expiry path, shared by the watcher and the sweep
   waitingroom/      the token bucket, the queue and the SSE stream
   e2e/              the end-to-end test (build tag `e2e`)
-migrations/         9 files, applied in order
+migrations/         10 files, applied in order
 monitoring/         Prometheus, Grafana dashboards, Loki, Promtail
 loadtest/           the k6 scripts and the live dashboard
 docs/               the engineering manual and the roadmap
