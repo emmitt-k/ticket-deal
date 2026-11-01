@@ -90,7 +90,7 @@ func (p *testPublisher) Calls() int {
 // header means the wrapper is a no-op anyway); the dedicated
 // idempotency tests use doReserveFull below.
 func doReserve(t *testing.T, rdb *redis.Client, publisher ReservationPublisher,
-	holdTTL time.Duration, userID string, eventID int64, body string,
+	holdTTL time.Duration, userID string, eventID string, body string,
 ) (*httptest.ResponseRecorder, map[string]any) {
 	return doReserveFull(t, rdb, publisher, nil, holdTTL, userID, eventID, body, "")
 }
@@ -100,7 +100,7 @@ func doReserve(t *testing.T, rdb *redis.Client, publisher ReservationPublisher,
 // use this; existing happy-path tests stick with doReserve above.
 func doReserveFull(t *testing.T, rdb *redis.Client, publisher ReservationPublisher,
 	idem *redis.Idempotency, holdTTL time.Duration,
-	userID string, eventID int64, body string, idemKey string,
+	userID string, eventID string, body string, idemKey string,
 ) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 
@@ -147,7 +147,7 @@ func newTestClient(t *testing.T) *redis.Client {
 
 // cleanupReserveKeys wipes the inventory + hold keys for the given
 // event so each test starts from a clean slate.
-func cleanupReserveKeys(t *testing.T, rdb *redis.Client, eventID int64, userIDs ...string) {
+func cleanupReserveKeys(t *testing.T, rdb *redis.Client, eventID string, userIDs ...string) {
 	t.Helper()
 	keys := []string{redis.InventoryKey(eventID)}
 	for _, u := range userIDs {
@@ -168,7 +168,7 @@ func cleanupReserveKeys(t *testing.T, rdb *redis.Client, eventID int64, userIDs 
 func TestReserveHandler_Success(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51001)
+	const eventID = "00000000-0000-4000-8000-00000000c739"
 	const userID = "u-success"
 	cleanupReserveKeys(t, rdb, eventID, userID)
 
@@ -204,7 +204,7 @@ func TestReserveHandler_Success(t *testing.T) {
 	require.NoError(t, json.Unmarshal(pub.lastBody, &msg))
 	require.Equal(t, resID, msg["reservation_id"])
 	require.Equal(t, userID, msg["user_id"])
-	require.Equal(t, float64(eventID), msg["event_id"])
+	require.Equal(t, eventID, msg["event_id"])
 	require.Equal(t, float64(1), msg["seats"])
 	require.NotEmpty(t, msg["created_at"])
 	require.NotEmpty(t, msg["expires_at"])
@@ -215,7 +215,7 @@ func TestReserveHandler_Success(t *testing.T) {
 func TestReserveHandler_AlreadyHolding(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51002)
+	const eventID = "00000000-0000-4000-8000-00000000c73a"
 	const userID = "u-already"
 	cleanupReserveKeys(t, rdb, eventID, userID)
 
@@ -243,7 +243,7 @@ func TestReserveHandler_AlreadyHolding(t *testing.T) {
 func TestReserveHandler_SoldOut(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51003)
+	const eventID = "00000000-0000-4000-8000-00000000c73b"
 	const userID = "u-soldout"
 	cleanupReserveKeys(t, rdb, eventID, userID)
 
@@ -263,7 +263,7 @@ func TestReserveHandler_SoldOut(t *testing.T) {
 func TestReserveHandler_EventNotFound(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51004) // intentionally never seeded
+	const eventID = "00000000-0000-4000-8000-00000000c73c" // intentionally never seeded
 
 	rec, body := doReserve(t, rdb, pub, 600*time.Second,
 		"u1", eventID, ``)
@@ -276,7 +276,7 @@ func TestReserveHandler_EventNotFound(t *testing.T) {
 func TestReserveHandler_MultiSeat(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51005)
+	const eventID = "00000000-0000-4000-8000-00000000c73d"
 	const userID = "u-group"
 	cleanupReserveKeys(t, rdb, eventID, userID)
 
@@ -305,7 +305,7 @@ func TestReserveHandler_MultiSeat(t *testing.T) {
 func TestReserveHandler_DefaultSeatCount(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51006)
+	const eventID = "00000000-0000-4000-8000-00000000c73e"
 	// Distinct users so the second/third don't hit already_holding.
 	cleanupReserveKeys(t, rdb, eventID, "empty", "null", "zero")
 
@@ -339,7 +339,7 @@ func TestReserveHandler_DefaultSeatCount(t *testing.T) {
 func TestReserveHandler_InvalidSeatsRequested(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51006)
+	const eventID = "00000000-0000-4000-8000-00000000c73e"
 	cleanupReserveKeys(t, rdb, eventID, "neg", "toomany")
 
 	require.NoError(t, rdb.Set(context.Background(),
@@ -370,7 +370,7 @@ func TestReserveHandler_InvalidSeatsRequested(t *testing.T) {
 func TestReserveHandler_BadJSONBody(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51007)
+	const eventID = "00000000-0000-4000-8000-00000000c73f"
 	cleanupReserveKeys(t, rdb, eventID, "u1")
 
 	require.NoError(t, rdb.Set(context.Background(),
@@ -388,7 +388,7 @@ func TestReserveHandler_BadJSONBody(t *testing.T) {
 func TestReserveHandler_PublisherError(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{failNext: true, err: fmt.Errorf("sqs unavailable")}
-	const eventID = int64(51008)
+	const eventID = "00000000-0000-4000-8000-00000000c740"
 	const userID = "u-pubfail"
 	cleanupReserveKeys(t, rdb, eventID, userID)
 
@@ -428,7 +428,7 @@ func TestReserveHandler_NoClaims(t *testing.T) {
 func TestReserveHandler_DifferentUsersDifferentHolds(t *testing.T) {
 	rdb := newTestClient(t)
 	pub := &testPublisher{}
-	const eventID = int64(51009)
+	const eventID = "00000000-0000-4000-8000-00000000c741"
 	cleanupReserveKeys(t, rdb, eventID, "alice", "bob")
 
 	require.NoError(t, rdb.Set(context.Background(),

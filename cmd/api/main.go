@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -36,6 +35,7 @@ import (
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/config"
 	"github.com/emmitt-k/ticket-deal/internal/db"
+	"github.com/emmitt-k/ticket-deal/internal/eventid"
 	"github.com/emmitt-k/ticket-deal/internal/logging"
 	"github.com/emmitt-k/ticket-deal/internal/metrics"
 	"github.com/emmitt-k/ticket-deal/internal/queue"
@@ -142,14 +142,34 @@ func run() error {
 	//
 	// Event ID is configurable via METRICS_EVENT_ID so the dashboard
 	// can be pointed at a different event without rebuilding.
-	metricsEventID := parseInt64Or(os.Getenv("METRICS_EVENT_ID"), 1)
-	metrics.StartStateUpdater(
-		drainerCtx,
-		&redisSeatsAdapter{rdb: rdb},
-		&redisQueueAdapter{rdb: rdb},
-		metricsEventID,
-		5*time.Second,
-	)
+	//
+	// There is NO default. The event id is a UUID (see
+	// internal/eventid) and no event is seeded, so a hardcoded default
+	// would point the gauges at an event that does not exist — and
+	// the symptom is a dashboard that reads zero seats, forever,
+	// which looks like a real measurement rather than a
+	// misconfiguration.
+	//
+	// An unset or malformed METRICS_EVENT_ID is therefore NOT a
+	// startup error: the reservation core does not need the gauges,
+	// and refusing to boot would take down the whole API over a
+	// dashboard panel. Instead the gauges are left at their last
+	// value and the reason is logged loudly — a silent zero would be
+	// indistinguishable from a real measurement.
+	metricsEventID := os.Getenv("METRICS_EVENT_ID")
+	if _, parseErr := eventid.Parse(metricsEventID); parseErr != nil {
+		slog.Warn("METRICS_EVENT_ID is not a valid event UUID — the "+
+			"seats-available and queue-length gauges will not be updated",
+			"error", parseErr)
+	} else {
+		metrics.StartStateUpdater(
+			drainerCtx,
+			&redisSeatsAdapter{rdb: rdb},
+			&redisQueueAdapter{rdb: rdb},
+			metricsEventID,
+			5*time.Second,
+		)
+	}
 
 	// ── Stripe (Layer 2, item 7) ──────────────────────────────────
 	//
@@ -509,7 +529,7 @@ type redisSeatsAdapter struct {
 	rdb *redis.Client
 }
 
-func (a *redisSeatsAdapter) GetAvailableSeats(ctx context.Context, eventID int64) (int, error) {
+func (a *redisSeatsAdapter) GetAvailableSeats(ctx context.Context, eventID string) (int, error) {
 	return redis.AvailableSeats(ctx, a.rdb, eventID)
 }
 
@@ -517,19 +537,6 @@ type redisQueueAdapter struct {
 	rdb *redis.Client
 }
 
-func (a *redisQueueAdapter) GetQueueSize(ctx context.Context, eventID int64) (int, error) {
+func (a *redisQueueAdapter) GetQueueSize(ctx context.Context, eventID string) (int, error) {
 	return redis.QueueSize(ctx, a.rdb, eventID)
-}
-
-// parseInt64Or parses a string as int64, falling back to def on
-// missing or unparseable input. Used for env-var config.
-func parseInt64Or(s string, def int64) int64 {
-	if s == "" {
-		return def
-	}
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return def
-	}
-	return v
 }

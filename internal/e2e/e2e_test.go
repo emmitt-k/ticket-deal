@@ -49,6 +49,7 @@ import (
 
 	"github.com/emmitt-k/ticket-deal/internal/auth"
 	"github.com/emmitt-k/ticket-deal/internal/db"
+	"github.com/emmitt-k/ticket-deal/internal/eventid"
 	"github.com/emmitt-k/ticket-deal/internal/redis"
 )
 
@@ -60,7 +61,7 @@ type env struct {
 	redisAddr      string
 	jwtSecret      []byte
 	webhookSecret  string
-	eventID        int64
+	eventID        string
 	stripePaymentI string
 }
 
@@ -73,7 +74,7 @@ func loadEnv(t *testing.T) env {
 		redisAddr:      envOr("REDIS_ADDR", "localhost:6379"),
 		jwtSecret:      []byte(os.Getenv("JWT_SECRET")),
 		webhookSecret:  os.Getenv("STRIPE_WEBHOOK_SECRET"),
-		eventID:        1,
+		eventID:        eventid.New(),
 		stripePaymentI: "pi_e2e_" + strconv.FormatInt(time.Now().UnixNano(), 36),
 	}
 
@@ -115,10 +116,28 @@ func TestReserveToConfirmed(t *testing.T) {
 	require.NoError(t, redis.Ping(ctx, rdb), "the e2e needs a reachable Redis")
 	t.Cleanup(func() { _ = rdb.Close() })
 
+	// ── Create the event ────────────────────────────────────────────
+	// No event is seeded any more, so the e2e creates its own. The
+	// event id is a UUID minted by the application (see
+	// internal/eventid) — exactly the way the admin API will mint it.
+	//
+	// The price is the column DEFAULT ($25.00), so the reservation
+	// carries a non-zero amount and the payment path is exercised for
+	// real rather than against a $0.00 event Stripe would reject.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO events (id, name, initial_inventory)
+		 VALUES ($1, $2, 100)`,
+		e.eventID, "E2E Event")
+	require.NoError(t, err, "the e2e needs to create its event")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), "DELETE FROM events WHERE id = $1", e.eventID)
+	})
+
 	// ── Seed the inventory ──────────────────────────────────────────
-	// The e2e does not go through cmd/seed-inventory (that is a
+	// The E2E does not go through cmd/seed-inventory (that is a
 	// separate container); it puts the seats there directly.
 	require.NoError(t, rdb.Set(ctx, redis.InventoryKey(e.eventID), 100, 0).Err())
+	t.Cleanup(func() { _ = rdb.Del(context.Background(), redis.InventoryKey(e.eventID)).Err() })
 
 	// ── A JWT for the customer ─────────────────────────────────────
 	userID := "e2e-user-" + strconv.FormatInt(time.Now().UnixNano(), 36)

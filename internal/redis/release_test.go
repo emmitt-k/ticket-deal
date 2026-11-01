@@ -32,7 +32,7 @@ func TestReleaseSeat_ReleasesAHeldSeat(t *testing.T) {
 	c := newReleaseTestRedis(t)
 	ctx := context.Background()
 
-	const eventID = int64(96001)
+	const eventID = "00000000-0000-4000-8000-000000017701"
 	const user = "release-user-1"
 	require.NoError(t, c.Set(ctx, InventoryKey(eventID), 100, 0).Err())
 	t.Cleanup(func() { _ = c.Del(ctx, InventoryKey(eventID)).Err() })
@@ -63,7 +63,7 @@ func TestReleaseSeat_TwiceDoesNotDoubleCount(t *testing.T) {
 	c := newReleaseTestRedis(t)
 	ctx := context.Background()
 
-	const eventID = int64(96002)
+	const eventID = "00000000-0000-4000-8000-000000017702"
 	const user = "release-user-2"
 	require.NoError(t, c.Set(ctx, InventoryKey(eventID), 100, 0).Err())
 	t.Cleanup(func() {
@@ -94,7 +94,7 @@ func TestReleaseSeat_NotHeld(t *testing.T) {
 	c := newReleaseTestRedis(t)
 	ctx := context.Background()
 
-	const eventID = int64(96003)
+	const eventID = "00000000-0000-4000-8000-000000017703"
 	const user = "release-user-3"
 	require.NoError(t, c.Set(ctx, InventoryKey(eventID), 100, 0).Err())
 	t.Cleanup(func() { _ = c.Del(ctx, InventoryKey(eventID)).Err() })
@@ -115,7 +115,7 @@ func TestReleaseSeat_NoInventory(t *testing.T) {
 	c := newReleaseTestRedis(t)
 	ctx := context.Background()
 
-	const eventID = int64(96004)
+	const eventID = "00000000-0000-4000-8000-000000017704"
 	outcome, err := ReleaseSeat(ctx, c, eventID, "release-user-4", 1)
 	require.NoError(t, err)
 	require.Equal(t, ReleaseSeatNoInventory, outcome)
@@ -126,7 +126,7 @@ func TestReleaseSeat_ZeroSeats(t *testing.T) {
 	c := newReleaseTestRedis(t)
 	ctx := context.Background()
 
-	outcome, err := ReleaseSeat(ctx, c, 96005, "release-user-5", 0)
+	outcome, err := ReleaseSeat(ctx, c, "00000000-0000-4000-8000-000000017705", "release-user-5", 0)
 	require.NoError(t, err)
 	require.Equal(t, ReleaseSeatDone, outcome)
 }

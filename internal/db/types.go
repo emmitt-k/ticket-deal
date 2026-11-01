@@ -21,7 +21,8 @@ import "time"
 //
 //	reservation_id  UUID assigned at /reserve time (idempotency key)
 //	user_id         token subject from JWT (sub claim)
-//	event_id        the event this ticket is for
+//	event_id        the event this ticket is for (a UUID, app-minted —
+//	                see internal/eventid)
 //	event_name      human-readable title (JOINed from events table; empty
 //	                string if the row has been hard-deleted upstream and
 //	                the FK was removed — shouldn't happen in normal flow,
@@ -46,7 +47,7 @@ import "time"
 type ReservationRow struct {
 	ReservationID string `json:"reservation_id"`
 	UserID        string `json:"user_id"`
-	EventID       int64  `json:"event_id"`
+	EventID       string `json:"event_id"`
 	EventName     string `json:"event_name"`
 	Status        string `json:"status"`
 	Seats         int    `json:"seats"`

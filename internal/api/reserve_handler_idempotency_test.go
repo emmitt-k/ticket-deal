@@ -50,7 +50,7 @@ func TestReserveHandler_Idempotency_Replay(t *testing.T) {
 	pub := &testPublisher{}
 	idem := newTestIdempotency(t, rdb)
 
-	const eventID = int64(77001)
+	const eventID = "00000000-0000-4000-8000-000000012cc9"
 	const owner = "u-idem-replay-1"
 
 	// Seed inventory 10→9 on first reserve; second call must not change it.
@@ -97,7 +97,7 @@ func TestReserveHandler_Idempotency_BodyMismatch(t *testing.T) {
 	pub := &testPublisher{}
 	idem := newTestIdempotency(t, rdb)
 
-	const eventID = int64(77002)
+	const eventID = "00000000-0000-4000-8000-000000012cca"
 	const owner = "u-idem-mismatch-1"
 	require.NoError(t, rdb.Set(context.Background(),
 		redis.InventoryKey(eventID), 10, 0).Err())
@@ -127,7 +127,7 @@ func TestReserveHandler_Idempotency_InvalidKey(t *testing.T) {
 	pub := &testPublisher{}
 	idem := newTestIdempotency(t, rdb)
 
-	const eventID = int64(77003)
+	const eventID = "00000000-0000-4000-8000-000000012ccb"
 	const owner = "u-idem-badkey-1"
 	require.NoError(t, rdb.Set(context.Background(),
 		redis.InventoryKey(eventID), 10, 0).Err())
@@ -176,7 +176,7 @@ func TestReserveHandler_Idempotency_ParallelRetries(t *testing.T) {
 	pub := &testPublisher{}
 	idem := newTestIdempotency(t, rdb)
 
-	const eventID = int64(77004)
+	const eventID = "00000000-0000-4000-8000-000000012ccc"
 	const owner = "u-idem-parallel-1"
 	require.NoError(t, rdb.Set(context.Background(),
 		redis.InventoryKey(eventID), 10, 0).Err())
@@ -272,7 +272,7 @@ func TestReserveHandler_Idempotency_ErrorsNotCached(t *testing.T) {
 	pub := &testPublisher{}
 	idem := newTestIdempotency(t, rdb)
 
-	const eventID = int64(77005)
+	const eventID = "00000000-0000-4000-8000-000000012ccd"
 	const owner = "u-idem-err-1"
 
 	// Inventory 0 → sold_out.
@@ -310,7 +310,7 @@ func TestReserveHandler_Idempotency_HeaderAbsent(t *testing.T) {
 	pub := &testPublisher{}
 	idem := newTestIdempotency(t, rdb)
 
-	const eventID = int64(77006)
+	const eventID = "00000000-0000-4000-8000-000000012cce"
 	const owner = "u-idem-nokey-1"
 	require.NoError(t, rdb.Set(context.Background(),
 		redis.InventoryKey(eventID), 10, 0).Err())
@@ -330,7 +330,7 @@ func TestReserveHandler_Idempotency_HeaderAbsent(t *testing.T) {
 // doReserveFull (which doesn't expose the wiring needed for parallel
 // httptest.NewRecorder instances).
 func newAuthedReserveHandler(t *testing.T, rdb *redis.Client, pub *testPublisher,
-	idem *redis.Idempotency, owner string, eventID int64,
+	idem *redis.Idempotency, owner string, eventID string,
 ) http.Handler {
 	t.Helper()
 	token, err := mustAuthErr(t, owner, eventID)
@@ -341,7 +341,7 @@ func newAuthedReserveHandler(t *testing.T, rdb *redis.Client, pub *testPublisher
 
 // mustAuth mints a JWT and returns the token string. Panics on
 // failure — test setup.
-func mustAuth(t *testing.T, owner string, eventID int64) string {
+func mustAuth(t *testing.T, owner string, eventID string) string {
 	t.Helper()
 	tok, err := mustAuthErr(t, owner, eventID)
 	require.NoError(t, err)
@@ -350,7 +350,7 @@ func mustAuth(t *testing.T, owner string, eventID int64) string {
 
 // mustAuthErr is the (token, error) variant. Kept separate so the
 // parallel-retry helper can do its own error handling.
-func mustAuthErr(t *testing.T, owner string, eventID int64) (string, error) {
+func mustAuthErr(t *testing.T, owner string, eventID string) (string, error) {
 	t.Helper()
 	return auth.Issue(owner, eventID, testSecret, 2*time.Minute)
 }

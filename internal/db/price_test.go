@@ -32,7 +32,7 @@ import (
 // allocation convention in reservations_test.go: event ids must be
 // globally unique across packages, because every test package shares
 // one Postgres database and `go test ./...` runs them in parallel.
-func seedPricedEvent(t *testing.T, pool *Pool, eventID int64, priceCents int64, currency string) {
+func seedPricedEvent(t *testing.T, pool *Pool, eventID string, priceCents int64, currency string) {
 	t.Helper()
 	name := "priced-test-event-" + uuid.NewString()
 	_, err := pool.Exec(context.Background(),
@@ -52,7 +52,7 @@ func seedPricedEvent(t *testing.T, pool *Pool, eventID int64, priceCents int64, 
 // the event's price, and the total is unit price × seats.
 func TestInsertIfAbsent_SnapshotsTheEventPrice(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(66001)
+	const eventID = "00000000-0000-4000-8000-0000000101d1"
 
 	seedPricedEvent(t, pool, eventID, 2500, "usd")
 
@@ -73,7 +73,7 @@ func TestInsertIfAbsent_SnapshotsTheEventPrice(t *testing.T) {
 // held; the held reservation keeps the price it was quoted.
 func TestInsertIfAbsent_PriceSnapshotDoesNotMove(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(66002)
+	const eventID = "00000000-0000-4000-8000-0000000101d2"
 
 	seedPricedEvent(t, pool, eventID, 2500, "usd")
 
@@ -108,7 +108,7 @@ func TestInsertIfAbsent_PriceSnapshotDoesNotMove(t *testing.T) {
 // nobody can reconstruct.
 func TestInsertIfAbsent_AuditRecordsThePrice(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(66003)
+	const eventID = "00000000-0000-4000-8000-0000000101d3"
 
 	seedPricedEvent(t, pool, eventID, 2500, "usd")
 
@@ -126,17 +126,23 @@ func TestInsertIfAbsent_AuditRecordsThePrice(t *testing.T) {
 	require.Equal(t, float64(2), events[0].Metadata["seats"])
 }
 
-// TestInsertIfAbsent_UnpricedEventIsZero — an event with no price
-// (the column default) produces a zero-priced reservation rather than
-// an error. The column is NOT NULL with a default, so "no price
-// configured" is a state, not a failure.
+// TestInsertIfAbsent_UnpricedEventUsesTheColumnDefault — an event
+// created WITHOUT the money columns takes the column's DEFAULT, and
+// the reservation snapshots that default.
 //
-// (A zero price is a dead end for Stripe — it rejects amounts below
-// $0.50 — but that is a payment-layer concern, not a reason for the
-// write path to explode.)
-func TestInsertIfAbsent_UnpricedEventIsZero(t *testing.T) {
+// The default used to be 0, and the test asserted a zero-priced
+// reservation. It is now 2500 (a $25.00 seat), because a $0.00 event
+// is a dead end for Stripe — it rejects amounts below $0.50 — and
+// there is no longer a seeded event to carry a price. The default
+// lives on the COLUMN so every event created from now on is sellable
+// without anyone remembering to price it.
+//
+// (An event created with an explicit price of 0 is still legal — the
+// CHECK constraint allows it. That is a payment-layer concern, not a
+// reason for the write path to explode.)
+func TestInsertIfAbsent_UnpricedEventUsesTheColumnDefault(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(66004)
+	const eventID = "00000000-0000-4000-8000-0000000101d4"
 
 	// seedEvent inserts without the money columns → the defaults apply.
 	seedEvent(t, pool, eventID)
@@ -147,9 +153,10 @@ func TestInsertIfAbsent_UnpricedEventIsZero(t *testing.T) {
 
 	row, err := GetReservation(context.Background(), pool, r.ReservationID)
 	require.NoError(t, err)
-	require.Equal(t, int64(0), row.UnitPriceCents)
+	require.Equal(t, int64(2500), row.UnitPriceCents,
+		"the reservation must snapshot the event's default price")
 	require.Equal(t, "usd", row.Currency)
-	require.Equal(t, int64(0), row.TotalPriceCents)
+	require.Equal(t, int64(2500), row.TotalPriceCents)
 }
 
 // TestInsertIfAbsent_DuplicateKeepsTheOriginalPrice — a redelivered
@@ -158,7 +165,7 @@ func TestInsertIfAbsent_UnpricedEventIsZero(t *testing.T) {
 // original snapshot stands.
 func TestInsertIfAbsent_DuplicateKeepsTheOriginalPrice(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(66005)
+	const eventID = "00000000-0000-4000-8000-0000000101d5"
 
 	seedPricedEvent(t, pool, eventID, 2500, "usd")
 

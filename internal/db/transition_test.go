@@ -103,7 +103,7 @@ func TestTransitionStatus_RejectsInvalidTransition(t *testing.T) {
 // build on.
 func TestTransitionStatus_HappyPath(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(62001)
+	const eventID = "00000000-0000-4000-8000-00000000f231"
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)
@@ -132,7 +132,7 @@ func TestTransitionStatus_HappyPath(t *testing.T) {
 // leave from. This is the "watcher got there first" case.
 func TestTransitionStatus_CASMiss(t *testing.T) {
 	pool := newTestPool(t)
-	const eventID = int64(62002)
+	const eventID = "00000000-0000-4000-8000-00000000f232"
 
 	seedEvent(t, pool, eventID)
 	r := validReservation(t, eventID)

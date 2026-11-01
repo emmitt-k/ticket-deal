@@ -13,7 +13,7 @@ import (
 
 func TestDrainer_StartsOnNotify(t *testing.T) {
 	rdb := testClient(t)
-	const eventID = int64(52000)
+	const eventID = "00000000-0000-4000-8000-00000000cb20"
 
 	// Pre-seed queue with one user
 	rdb.ZAdd(context.Background(), queueKeyForTest(eventID), redis.Z{Score: 100, Member: "queued-user"})
@@ -60,13 +60,13 @@ func TestDrainer_StartsOnNotify(t *testing.T) {
 // this function returns the channel so the caller can select on it alongside
 // ctx.Done(). The registration is cleaned up automatically when ctx is cancelled
 // (via deferred Unregister in the test).
-func WaitForAdmission(eventID int64, userID string) chan string {
+func WaitForAdmission(eventID string, userID string) chan string {
 	return Register(eventID, userID)
 }
 
 func TestDrainer_PromotesAndIssuesValidJWT(t *testing.T) {
 	rdb := testClient(t)
-	const eventID = int64(52001)
+	const eventID = "00000000-0000-4000-8000-00000000cb21"
 
 	// Seed a queue with 2 users
 	rdb.ZAdd(context.Background(), queueKeyForTest(eventID), redis.Z{Score: 100, Member: "user1"})
@@ -113,7 +113,7 @@ func TestDrainer_PromotesAndIssuesValidJWT(t *testing.T) {
 
 func TestDrainer_CleansUpAfterEmpty(t *testing.T) {
 	rdb := testClient(t)
-	const eventID = int64(52002)
+	const eventID = "00000000-0000-4000-8000-00000000cb22"
 
 	t.Cleanup(func() {
 		rdb.Del(context.Background(),
@@ -148,7 +148,7 @@ func TestDrainer_CleansUpAfterEmpty(t *testing.T) {
 
 func TestRegisterEventCallback(t *testing.T) {
 	rdb := testClient(t)
-	const eventID int64 = 52003
+	const eventID = "00000000-0000-4000-8000-00000000cb23"
 
 	t.Cleanup(func() {
 		rdb.Del(context.Background(),
@@ -158,7 +158,7 @@ func TestRegisterEventCallback(t *testing.T) {
 	})
 
 	var called int32
-	RegisterEventCallback(func(eid int64) {
+	RegisterEventCallback(func(eid string) {
 		if eid == eventID {
 			atomic.AddInt32(&called, 1)
 		}

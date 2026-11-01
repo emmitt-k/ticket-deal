@@ -21,7 +21,7 @@ import (
 type SweptRow struct {
 	ReservationID string
 	UserID        string
-	EventID       int64
+	EventID       string
 	Seats         int
 }
 

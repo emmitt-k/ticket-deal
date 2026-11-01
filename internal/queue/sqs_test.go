@@ -142,7 +142,7 @@ func TestSQSPublisher_SendReservation(t *testing.T) {
 	original := Reservation{
 		ReservationID: "res-abc",
 		UserID:        "alice",
-		EventID:       42,
+		EventID:       "9f8c1e2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
 		Seats:         3,
 		CreatedAt:     "2026-10-27T10:00:00Z",
 		ExpiresAt:     "2026-10-27T10:10:00Z",

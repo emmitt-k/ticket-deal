@@ -90,7 +90,7 @@ func CancelReservationHandler(pool *db.Pool, rdb *redis.Client) http.HandlerFunc
 			return
 		}
 		span.SetAttributes(
-			attribute.Int64("reservation.event_id", row.EventID),
+			attribute.String("reservation.event_id", row.EventID),
 			attribute.Int("reservation.seats", row.Seats),
 			attribute.String("reservation.current_status", row.Status),
 		)

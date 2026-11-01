@@ -29,8 +29,13 @@ type Reservation struct {
 	// UserID is the JWT subject (verified by middleware).
 	UserID string `json:"user_id"`
 
-	// EventID is the JWT event_id claim (also verified).
-	EventID int64 `json:"event_id"`
+	// EventID is the JWT event_id claim (also verified). It is a
+	// UUID carried as a string — see internal/eventid. It was an
+	// int64 before the event id became a UUID; the JSON encoding
+	// changed from a number to a string at the same time, so an
+	// in-flight message from the old shape fails to unmarshal into
+	// this field rather than silently carrying a wrong id.
+	EventID string `json:"event_id"`
 
 	// Seats is how many seats this reservation holds (default 1,
 	// max 10 — see api.ReserveHandler).

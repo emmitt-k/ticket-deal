@@ -89,18 +89,18 @@ func run() error {
 	count := 0
 	for rows.Next() {
 		var (
-			id   int64
+			id   string
 			name string
 			inv  int
 		)
 		if err := rows.Scan(&id, &name, &inv); err != nil {
 			return fmt.Errorf("scan event row: %w", err)
 		}
-		key := redis.InventoryKey(id) // canonical: "inventory:event:<id>"
+		key := redis.InventoryKey(id) // canonical: "inventory:event:<uuid>"
 		if err := rdb.Set(ctx, key, inv, 0).Err(); err != nil {
 			return fmt.Errorf("redis SET %s = %d: %w", key, inv, err)
 		}
-		log.Printf("seed: %s = %d (event %d: %q)", key, inv, id, name)
+		log.Printf("seed: %s = %d (event %s: %q)", key, inv, id, name)
 		count++
 	}
 	if err := rows.Err(); err != nil {

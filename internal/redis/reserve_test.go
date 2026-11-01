@@ -43,7 +43,7 @@ func withCleanKeys(t *testing.T, c *redisclient.Client, keys ...string) {
 func TestReserve_NoOversell(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(42000)
+	const eventID = "00000000-0000-4000-8000-00000000a410"
 
 	require.NoError(t, rdb.Set(ctx, InventoryKey(eventID), 10, 0).Err())
 	withCleanKeys(t, rdb, InventoryKey(eventID))
@@ -89,7 +89,7 @@ func TestReserve_NoOversell(t *testing.T) {
 func TestReserve_AlreadyHolding(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(42001)
+	const eventID = "00000000-0000-4000-8000-00000000a411"
 
 	require.NoError(t, rdb.Set(ctx, InventoryKey(eventID), 5, 0).Err())
 	withCleanKeys(t, rdb, InventoryKey(eventID), HoldKey(eventID, "u1"))
@@ -110,7 +110,7 @@ func TestReserve_AlreadyHolding(t *testing.T) {
 func TestReserve_EventNotFound(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(42002) // not seeded
+	const eventID = "00000000-0000-4000-8000-00000000a412" // not seeded
 
 	res, err := ReserveSeat(ctx, rdb, eventID, "u1", 600, 1)
 	require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestReserve_EventNotFound(t *testing.T) {
 func TestReserve_MultiSeat(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(42003)
+	const eventID = "00000000-0000-4000-8000-00000000a413"
 
 	require.NoError(t, rdb.Set(ctx, InventoryKey(eventID), 5, 0).Err())
 	withCleanKeys(t, rdb, InventoryKey(eventID), HoldKey(eventID, "group-buyer"))
@@ -139,7 +139,7 @@ func TestReserve_MultiSeat(t *testing.T) {
 func TestReserve_MultiSeatSoldOut(t *testing.T) {
 	rdb := newTestClient(t)
 	ctx := context.Background()
-	const eventID = int64(42004)
+	const eventID = "00000000-0000-4000-8000-00000000a414"
 
 	require.NoError(t, rdb.Set(ctx, InventoryKey(eventID), 2, 0).Err())
 	withCleanKeys(t, rdb, InventoryKey(eventID), HoldKey(eventID, "group-buyer"))
