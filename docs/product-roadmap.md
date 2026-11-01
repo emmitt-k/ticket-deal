@@ -514,7 +514,7 @@ Two things the plan did not anticipate, both found by writing the code:
   ':ticket-deal:event')::uuid`, which is reproducible by hand from the old id without
   reading a table.
 
-### 9b. Event CRUD for admins ⬜ Not started
+### 9b. Event CRUD for admins ✅ Done
 
 **Effort:** ~1 day. **Why:** the system can only ever sell ONE event — there is no catalogue,
 no way for a customer to browse, and no way for an organizer to put a new drop on sale
@@ -580,6 +580,37 @@ mid-sale: stop new reservations, fail unpaid payments and notify the customer, r
 paid ones) is a much bigger operation — it needs a drain state on the reservation state
 machine, a Stripe refund sweep, and a notification path. It is deliberately NOT built
 here. This item only covers the "not live yet, nothing sold" case.
+
+#### What actually landed
+
+The plan above is right about the shape. What shipped, and the three things it did not
+anticipate:
+
+- **The plan said "create an event (+ seed its inventory)" as one step. It is
+  ALL-OR-NOTHING across two stores.** Insert the row in Postgres, seed the counter in
+  Redis; if the seed fails, roll the row back. An event in Postgres with no counter in
+  Redis cannot sell a seat and answers `event_not_found` to every customer — a trap, not
+  a feature. The failure is reported as `409 inventory_seed_failed`, not a 500: it is a
+  conflict between two stores, not a server fault.
+
+- **The plan did not say what happens when a cancel is REFUSED.** The guard fires *after*
+  the inventory has already been taken off sale (Redis first, for the phantom-seat reason
+  above), so the counter has to be put back. And it has to be put back to **what it was**,
+  not to `initial_inventory` — the two differ whenever a seat is currently held, and
+  restoring the wrong one **resurrects a sold seat**. The drop would report more seats
+  than it ever had, and the oversell would not show up until the counter went negative.
+  The test caught this one.
+
+- **The plan did not say a cancelled event is not EDITABLE.** The tombstone is the record
+  of what happened; letting someone rename it afterwards makes the tombstone lie. The
+  guard lives in the UPDATE's own `WHERE` clause, so the write does not happen at all.
+
+**And the load test became a ZERO-SETUP command.** With no seed, a load test needs an
+event — and the plan did not say where one comes from. The answer is the admin API
+itself: `loadtest/create-event.sh` signs a request and creates one, so
+`make loadtest-burst` works with no `EVENT_ID`, no SQL, and no manual step. The event
+arrives with its inventory seeded and its price default applied, because it went through
+exactly the path an organizer would use.
 
 ### 10. Anti-bot hardening ⬜ Not started
 
@@ -679,14 +710,15 @@ engineer actually solves: signature verification, webhook idempotency,
 out-of-order delivery, and the race between the payment webhook and the expiry
 watcher.
 
-**Just done: item 9a (the event id becomes a UUID).** Two things changed
-underneath the whole system: the id is no longer a guessable counter, and
-**no event is seeded any more** — events are created through the admin API.
-That makes **item 9b (event CRUD) the next one, and it is now load-bearing
-rather than merely nice**: until it lands, a fresh database has zero events
-and there is nothing to sell.
+**Just done: items 9a (the event id becomes a UUID) and 9b (the event CRUD
+and the public catalogue).** Two things changed underneath the whole system:
+the id is no longer a guessable counter, and **no event is seeded any more** —
+events are created through the admin API. The catalogue is what makes the
+UUID an implementation detail instead of a burden on the customer, and the
+load test is now a zero-setup command: `make loadtest-burst` creates its own
+event through the admin API.
 
-**Then item 10 (anti-bot)**, the cheapest proof that you think
+**Next: item 10 (anti-bot)**, the cheapest proof that you think
 like an attacker. Item 8 (notifications) is the best demonstration that the
 queue design scales to a second consumer, but it is the least differentiating —
 so it goes third, unless the demo needs the MailHog inbox to look busy.
@@ -740,17 +772,17 @@ The biggest impact-portfolio item, ranked:
 | 2 | **State machine + cancel** (#1, #3) | The connective tissue. Makes Layer 2 possible. | ✅ Shipped |
 | 3 | **Audit log** (#6) | "Who did this when?" is the SOC2 question. | ✅ Shipped |
 | 4 | **Admin API** (#9) | Every real product has this; usually glossed over. | ✅ Shipped |
-| 5 | **Event CRUD** (#9b) | Without it there is no catalogue and nothing to sell — the admin override exists but has nothing to override *on*. | ⬜ Not started — **← next** |
-| 6 | **Anti-bot** (#10) | Proves you think like an attacker. | ⬜ Not started |
+| 5 | **Event CRUD** (#9b) | Without it there is no catalogue and nothing to sell — the admin override exists but has nothing to override *on*. | ✅ Shipped |
+| 6 | **Anti-bot** (#10) | Proves you think like an attacker. | ⬜ Not started — **← next** |
 | 7 | **Notifications** (#8) | Tests the design's flexibility claim. | ⬜ Not started |
 
-The four headline items are shipped, and they were the hard ones — the
-prerequisites (the state machine, the audit log), the money (Stripe) and the
-support override. What is left is the layer of polish and support tooling that
-makes a project look like it was *operated*, not just written: the catalogue,
-the bot defence, the notifications. That is where the remaining differentiator
-is, and it is a different kind of differentiator — less "impressive endpoint"
-and more "someone ran this in production and thought about what goes wrong".
+The five headline items are shipped, and they were the hard ones — the
+prerequisites (the state machine, the audit log), the money (Stripe), the
+support override and the catalogue. What is left is the layer of polish that
+makes a project look like it was *operated*, not just written: the bot defence
+and the notifications. That is where the remaining differentiator is, and it is
+a different kind of differentiator — less "impressive endpoint" and more
+"someone ran this in production and thought about what goes wrong".
 
 ---
 

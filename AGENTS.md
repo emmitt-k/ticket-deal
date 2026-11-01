@@ -85,10 +85,17 @@ Observability:
 | `POST /api/reservations/{id}/cancel` | JWT | Cancel a `PENDING_PAYMENT` reservation; releases the seat |
 | `POST /api/reservations/{id}/pay` | JWT | Create the Stripe PaymentIntent; returns the `client_secret` |
 | `POST /webhooks/stripe` | Stripe signature | Stripe's callback. Verifies, snapshots, queues — no state change here |
+| `GET /api/events` | none | **Public catalogue.** The live drops, with the live seat count |
+| `GET /api/events/{id}` | none | **Public read.** One live drop. A cancelled drop is a 404 here |
 | `GET /admin/reservations/lookup?user_id=` | HMAC | Support lookup — a user's reservations |
 | `GET /admin/reservations/{id}` | HMAC | Support lookup — one reservation |
 | `POST /admin/reservations/{id}/cancel` | HMAC | Cancel a held reservation; releases the seat |
 | `POST /admin/reservations/{id}/release-seat` | HMAC | Put a seat back on sale; the status does not change |
+| `POST /admin/events` | HMAC | Create an event (+ seed its inventory into Redis) |
+| `GET /admin/events` | HMAC | Ops list — **includes** the cancelled tombstones |
+| `GET /admin/events/{id}` | HMAC | Ops read one |
+| `PATCH /admin/events/{id}` | HMAC | Update the name / price / currency, and add seats |
+| `POST /admin/events/{id}/cancel` | HMAC | Cancel an event — only while it has ZERO reservations |
 
 **Key correctness invariants:**
 - The event id is a **UUID, minted by the application** (`internal/eventid`) — not a guessable
@@ -156,15 +163,21 @@ make stop-loadtest         # Kill any running k6 process (burst or ramp)
 
 **Both `loadtest-burst` and `loadtest-ramp` auto-reset state and mint JWTs before launching k6.** No need to call `loadtest-state` / `loadtest-jwts` first. Override the JWT count with `VUS=500` (Makefile) or as a positional arg to the wrapper script.
 
-**`EVENT_ID` is REQUIRED for every load-test target.** There is no seeded event any more, so
-there is no default to fall back on — and a default would silently test an event that does not
-exist (the burst would report zero reservations and still look like a pass). Get the id first:
+**`EVENT_ID` is optional for every load-test target — and the whole load test is a
+zero-setup command.** With no `EVENT_ID` given, the scripts **create an event through the
+admin API** (`loadtest/create-event.sh`), which is the same path an organizer uses — so the
+event arrives with its inventory seeded and its price default applied.
 
 ```bash
-docker exec -i ticket-postgres psql -U tickets -d tickets -c "SELECT id FROM events LIMIT 1"
-
-make loadtest-burst EVENT_ID=<uuid>
+make loadtest-burst                    # zero setup — creates its own event
+make loadtest-burst EVENT_ID=<uuid>    # reuse an existing event
+make event                             # just create one and print its id
 ```
+
+There is no seeded event any more (item 9a deleted the seed), so there is no id to default
+to — and a default would silently test an event that does not exist (the burst would report
+zero reservations and still look like a pass). Creating one is the right answer, not
+requiring the operator to write SQL first.
 
 **Load test logs** (never overwritten, timestamped):
 - `logs/burst/TS-burst.log`
@@ -645,6 +658,77 @@ it goes to the structured log with the actor — a deliberate deviation from the
 **The feature is OPTIONAL, like Stripe.** With no `ADMIN_API_KEYS` the routes are **not
 mounted at all** — off, not open.
 
+### Item 9b — The event CRUD, and the public catalogue
+
+`internal/db/events.go` + `internal/admin/events_handlers.go` + `internal/api/events_handlers.go`
++ `migrations/011_event_status.sql`.
+
+Until this existed, the only way to get an event into the system was a migration. That made
+the system unusable for anything but a demo: no catalogue, no way for a customer to browse,
+and no way for an organizer to put a drop on sale.
+
+```
+POST   /admin/events                    create (+ seed the inventory into Redis)
+GET    /admin/events                    ops list — INCLUDES the cancelled tombstones
+GET    /admin/events/{id}               ops read one
+PATCH  /admin/events/{id}               update the name / price / currency, add seats
+POST   /admin/events/{id}/cancel        cancel — only while it has ZERO reservations
+GET    /api/events                      PUBLIC catalogue (the live drops)
+GET    /api/events/{id}                 PUBLIC read (a cancelled drop is a 404 here)
+```
+
+**The events table gains a `status` column** — `active` | `cancelled`. The row is **NEVER
+deleted**: a cancelled event is a TOMBSTONE, so "we had a *Midnight Echo* drop, what
+happened to it?" still has an answer. The public catalogue filters the tombstones out; the
+admin view shows them.
+
+**An event lives in TWO stores, and that shapes everything:**
+
+| Store | Holds | Why |
+|---|---|---|
+| Postgres | the name, the price, the status | the durable record |
+| Redis | the live inventory counter | the source of truth AT SELL TIME — the Lua reserve script reads it atomically, and it is why zero overselling is possible |
+
+**Creating an event is ALL-OR-NOTHING across both.** The row is inserted, then the counter
+is seeded; if the seed fails, the row is rolled back. An event in Postgres with no counter
+in Redis cannot sell a single seat and answers `event_not_found` to every customer — a
+trap, not a feature.
+
+**Cancelling an event is REDIS FIRST, then Postgres** — the opposite of the obvious order,
+and the reason is the phantom seat:
+
+- **Redis first** (`DEL inventory:event:<id>`) then Postgres: if the Postgres write fails,
+  the event is still live but has no counter, so `reserve.lua` returns `event_not_found`.
+  The drop is unavailable, but **no seat is sold and no reservation is lost**. A retry fixes it.
+- **Postgres first** then Redis: if the Redis `DEL` fails, Redis **still reports seats
+  available against a cancelled event**. Reservations keep succeeding, the Lua script
+  decrements the counter, and the worker then fails the foreign key — the seat is gone but
+  no reservation row exists. That is a phantom seat.
+
+Same shape as the partial-Redis-failure convention, inverted: the write that can leave a
+phantom must not be the one that goes first.
+
+**The cancel guard: an event may only be cancelled while it has ZERO reservations.** The
+threshold is "any reservation EVER", not "any reservation is still live" — an expired
+reservation still proves a customer interacted with the drop, and pulling the event out
+from under someone who *tried* to buy is worse than refusing. It is also where the schema
+already draws the line: `reservations.event_id REFERENCES events(id)` has **no
+`ON DELETE CASCADE`**, so a hard delete would fail at the database level. The explicit
+check turns an ugly `23503 foreign_key_violation` into a clear `409 event_has_reservations`
+**with the count**.
+
+**The guard lives in the UPDATE's own WHERE clause**, not in a separate `SELECT` — the same
+shape as `db.TransitionStatus`'s compare-and-set (Convention #13). A read-then-write leaves
+a window where two admins both see zero reservations and both write.
+
+**Adding seats changes REDIS, not Postgres.** `initial_inventory` is the event's HISTORY
+("this drop was created with 100 seats"); the counter is the PRESENT ("there are 137 left").
+Keeping them separate means the two can never disagree about what the event *was*.
+
+**A cancelled event is not editable.** The tombstone is the record of what happened; letting
+someone rename it afterwards makes the tombstone lie. The guard is in the UPDATE's WHERE
+clause, so the write does not happen at all.
+
 ---
 
 ## Key Files & Directories
@@ -664,7 +748,8 @@ mounted at all** — off, not open.
 │   ├── api/                    # HTTP handlers: reserve, get, list, cancel, readyz, pay, stripe webhook, publisher seam
 │   ├── auth/                   # JWT middleware, JWT minting
 │   ├── config/                 # Env var config (incl. PostgresConfig/DSN composition)
-│   ├── db/                     # pgx pool, reservation writes, TransitionStatus, list queries, audit log
+│   ├── db/                     # pgx pool, reservation writes, TransitionStatus, list queries, audit log,
+│   │                           #   and events.go (the event CRUD: create/read/list/update/cancel)
 │   ├── eventid/                # The event id: a UUID, minted by the app, validated in ONE place
 │   ├── expire/                 # Expiration watcher, sweep, compensate
 │   ├── iplimit/                # Redis IP rate-limiter (token bucket)
@@ -682,7 +767,8 @@ mounted at all** — off, not open.
 │   ├── burst.js               # 1000-VU burst test script
 │   ├── ramp.js                # 7-stage ramp test script
 │   ├── dashboard.html         # Live dashboard (open in browser)
-│   ├── reset-state.sh         # Reset Redis + Postgres to clean state
+│   ├── reset-state.sh         # Reset Redis + Postgres to clean state (creates an event if needed)
+│   ├── create-event.sh        # Create an event via the admin API and print its id
 │   ├── mint-jwts.sh           # Mint N JWTs to /tmp/k6_jwts.txt
 │   ├── run-burst.sh           # Run burst — auto-resets state + mints JWTs; timestamped log → logs/burst/
 │   └── run-ramp.sh            # Run ramp — auto-resets state + mints JWTs; timestamped log → logs/ramp/
@@ -726,7 +812,8 @@ mounted at all** — off, not open.
 │   ├── 007_event_price.sql       # The price of a seat: events.price_cents + the reservation's snapshot
 │   ├── 008_stripe_payments.sql   # The payment_intents table (one reservation, one PaymentIntent)
 │   ├── 009_admin_audit.sql       # The SEAT_RELEASED audit event (the admin API)
-│   └── 010_event_id_uuid.sql     # The event id becomes a UUID (app-minted, no default)
+│   ├── 010_event_id_uuid.sql     # The event id becomes a UUID (app-minted, no default)
+│   └── 011_event_status.sql      # events.status: active | cancelled (the tombstone)
 ├── docker/
 │   └── elasticmq.conf         # Pre-creates the reservations queue on boot
 ├── docker-compose.yml         # 13 services: 8 infra (redis, postgres, elasticmq, prometheus,
@@ -911,7 +998,13 @@ from `main`; if not, branch from the tip and extend the stack.
     - **Why a UUID and not a counter:** a `BIGINT` id is guessable. A customer could walk `id=1, 2, 3…` and enumerate the whole catalogue — every drop's name, price and inventory with it. It also had to be allocated by hand, so an event could not be created without inventing an id.
     - **Why the validation is STRICTER than "parses as a uuid":** exactly ONE spelling is accepted — the canonical 36-character hyphenated lowercase form. `urn:uuid:…`, `{…}` and the unhyphenated form all name the same event but spell it differently, and a Redis key built from one spelling would not match a key built from another. A hold key that does not match its hold is a **seat that leaks silently** — nothing crashes, the watcher just skips it.
     - **The hold-key parser is the sharp edge.** `expire.ParseHoldKey` reads the event id back out of an expired key, and the keyspace channel fires for EVERY expired key — so the parser distinguishes `ErrNotHoldKey` (not ours, skip silently) from `ErrMalformedHoldKey` (ours but broken, log at ERROR — a seat may be held against an event we cannot identify). `TestParseHoldKey_RoundTripsHoldKey` is the test that catches a key-format/parser mismatch.
-    - **No event is seeded.** There is no `002_seed.sql` — events are created through the admin API. A fresh database has zero events, so the load-test targets require `EVENT_ID` to be passed in rather than defaulting to a number that no longer exists.
+    - **No event is seeded.** There is no `002_seed.sql` — events are created through the admin API (item 9b). A fresh database has zero events, so the load-test targets CREATE one through the admin API rather than defaulting to a number that no longer exists.
+24. **An event lives in TWO stores, and the ORDER of the writes is load-bearing.** Postgres holds the durable record (name, price, status); Redis holds the live inventory counter, which is the source of truth AT SELL TIME — the Lua reserve script reads it atomically, and that is why zero overselling is possible.
+    - **Creating is ALL-OR-NOTHING.** Insert the row, then seed the counter; if the seed fails, roll the row back. An event in Postgres with no counter in Redis cannot sell a seat and answers `event_not_found` to every customer — a trap, not a feature.
+    - **Cancelling is REDIS FIRST, then Postgres.** The opposite of the obvious order, and the reason is the phantom seat. Redis-first: if the Postgres write fails, the drop is live but has no counter, so `reserve.lua` returns `event_not_found` — **no seat is sold and no reservation is lost**, and a retry fixes it. Postgres-first: if the Redis `DEL` fails, Redis still reports seats available against a cancelled event, reservations keep succeeding, and the seat is gone with no reservation row to explain it.
+    - **The write that can leave a phantom must not be the one that goes first.** Same shape as Convention #11, inverted.
+    - **A refused cancel restores the counter to what it WAS, not to `initial_inventory`.** The two differ whenever a seat is currently held, and restoring the wrong one resurrects a sold seat — the drop would report more seats than it ever had, and the oversell would not show up until the counter went negative.
+    - **The cancel guard lives in the UPDATE's own WHERE clause**, not in a separate `SELECT` (Convention #13). And the threshold is "any reservation EVER", not "any reservation is still live" — an expired reservation still proves a customer interacted with the drop.
 
 ---
 

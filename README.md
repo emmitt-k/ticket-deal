@@ -34,10 +34,9 @@ Reserve a seat:
 ```bash
 make env
 
-# The event id is a UUID minted by the app — there is no seeded event,
-# so ask the database which one to sell.
-export EVENT_ID=$(docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
-  "SELECT id FROM events LIMIT 1")
+# Create a drop through the admin API (it seeds the inventory too,
+# so the event is immediately sellable) and keep its id.
+export EVENT_ID=$(make -s event SEATS=100)
 
 JWT=$(USER_ID=demo EVENT_ID=$EVENT_ID make -s mintjwt)
 
@@ -45,6 +44,13 @@ curl -s -X POST localhost:8080/api/tickets/reserve \
   -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
   -d '{"seats_requested":1}'
 # {"reservation_id":"…","seats":1,"expires_in":600}
+```
+
+Browse the catalogue — the public list of live drops:
+
+```bash
+curl -s localhost:8080/api/events
+# {"count":1,"events":[{"id":"…","name":"Load Test Event","seats_available":100,…}]}
 ```
 
 **You need:** Docker Desktop. Go 1.27 and k6 only if you plan to build or load-test.
@@ -157,7 +163,7 @@ reservation, and when?" has an answer that does not depend on log retention.
 | **298 tests** | 56.4% statement coverage, with a 45% floor enforced in CI |
 | **3 CI jobs** | Test (a real Postgres, Redis and SQS broker), Lint, E2E — and the E2E job boots the whole stack and drives a reservation through it |
 | **0 known CVEs** | `govulncheck` is a gate, not a report |
-| **15 routes · 9 migrations · 17 packages · 13 containers** | 5 Go binaries, 8 infrastructure services |
+| **22 routes · 10 migrations · 17 packages · 13 containers** | 5 Go binaries, 8 infrastructure services |
 
 The load test is the proof, and it is one command:
 
@@ -169,14 +175,14 @@ make loadtest-burst   # 1,000 VUs at once — the thundering herd
 Both reset the state, mint the JWTs and run themselves. The live k6 dashboard is on
 `:8082` while they run.
 
-They need an `EVENT_ID` — there is no seeded event, so pick the one you want to sell:
+They need an event, and there is no seeded one — so with no `EVENT_ID` they **create one
+through the admin API**. The whole load test is a zero-setup command:
 
 ```bash
-export EVENT_ID=$(docker exec -i ticket-postgres psql -U tickets -d tickets -tAc \
-  "SELECT id FROM events LIMIT 1")
-
 make loadtest-ramp    # 0 → 50 → 200 → 1,000 VUs, ~90 s
 make loadtest-burst   # 1,000 VUs at once — the thundering herd
+
+make loadtest-burst EVENT_ID=<uuid>   # reuse an existing event
 ```
 
 ---
@@ -196,10 +202,17 @@ make loadtest-burst   # 1,000 VUs at once — the thundering herd
 | `POST` | `/api/reservations/{id}/cancel` | JWT | Cancel a `PENDING_PAYMENT` reservation |
 | `POST` | `/api/reservations/{id}/pay` | JWT | Create the Stripe PaymentIntent; returns the `client_secret` |
 | `POST` | `/webhooks/stripe` | Stripe signature | Stripe's callback — verifies, snapshots, queues |
+| `GET` | `/api/events` | — | **The catalogue** — the live drops, with the seat count |
+| `GET` | `/api/events/{id}` | — | One live drop |
 | `GET` | `/admin/reservations/lookup?user_id=` | HMAC | Support lookup — a user's reservations |
 | `GET` | `/admin/reservations/{id}` | HMAC | Support lookup — one reservation |
 | `POST` | `/admin/reservations/{id}/cancel` | HMAC | Cancel a held reservation; releases the seat |
 | `POST` | `/admin/reservations/{id}/release-seat` | HMAC | Put a seat back on sale |
+| `POST` | `/admin/events` | HMAC | **Create a drop** — and seed its inventory |
+| `GET` | `/admin/events` | HMAC | Ops list — includes the cancelled tombstones |
+| `GET` | `/admin/events/{id}` | HMAC | Ops read one |
+| `PATCH` | `/admin/events/{id}` | HMAC | Update the name / price / currency, add seats |
+| `POST` | `/admin/events/{id}/cancel` | HMAC | Cancel a drop — only while it has sold nothing |
 
 **Retries are safe.** `POST /reserve` takes an `Idempotency-Key`: send it twice and you
 get the **same reservation** back — no second seat, no second message. Two genuinely

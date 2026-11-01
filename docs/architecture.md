@@ -1520,6 +1520,39 @@ Phase 8 dev-tool: serves the live k6 load-test dashboard on `http://localhost:80
 
 ### `internal/api/` — HTTP handler logic
 
+#### `internal/api/events_handlers.go` — the PUBLIC catalogue
+
+Two endpoints, no auth:
+
+```
+GET /api/events        the live drops
+GET /api/events/{id}   one live drop
+```
+
+**Why a public catalogue at all.** A ticket system with no catalogue is a reservation
+kernel: the customer has to already know an opaque event id to buy anything. The id is a
+UUID (item 9a), which is exactly right for a guessable-proof identifier and exactly wrong
+for something a customer is meant to browse. The catalogue is what makes the UUID an
+implementation detail instead of a burden on the customer.
+
+**Only ACTIVE events.** A cancelled event is a tombstone — a record of what happened, for
+the ops view — not something to sell. The public read of a cancelled event is a **404**,
+not a 409: the public catalogue does not know the drop ever existed.
+
+**The seat count is a HINT, not a promise.** It comes from Redis (the source of truth at
+sell-time), and it can be stale by the time the customer clicks, because a thousand people
+are clicking at once — that is what the `409 sold_out` is for. But a customer who sees
+"3 seats left" acts, and one who sees no number goes elsewhere.
+
+**A Redis failure reports the count as UNKNOWN (-1), not zero.** "Sold out" and "we could
+not read the counter" are different facts, and telling a customer an event is sold out
+when it is not loses the sale.
+
+The list is paginated and capped (`limit` clamps to [1, 100], default 20; `offset` >= 0),
+the same bounds the reservation listing uses. An out-of-range limit is **clamped, not
+ignored** — a client asking for 10000 gets 100 and is told so, rather than silently
+getting a different page size.
+
 #### `internal/api/publisher.go`
 
 Defines the `ReservationPublisher` interface (`Publish(ctx, []byte) error`) — the seam between the handler and the message queue. Also defines `LogPublisher`, the Phase 5 stub that logs messages with a `[STUB SQS publish]` prefix. The handler depends on this small interface; the queue package supplies the Phase 6 implementation.
@@ -1647,6 +1680,26 @@ binary by hand.
 ---
 
 ### `internal/db/` — Postgres pool + reservation writes
+
+#### `internal/db/events.go`
+
+The event resource — the thing a ticket is FOR. Until this file existed, the only code that touched the `events` table was the reservation INSERT's price subquery and the dev seeder: there was no way to create, read, list, update or cancel an event.
+
+`EventRow` is the read model. `EventCreate` and `EventPatch` are the write models, and **their money fields are POINTERS** — "not supplied" and "supplied as zero" are different intents. A `PATCH` that omits `price_cents` must not set the price to 0, and a `PATCH` that sets it to 0 must actually set it (a free event is legal; Stripe rejects it, which is a payment-layer concern).
+
+`CreateEvent` **mints the id** (`eventid.New()`) and lets the COLUMN DEFAULT apply when the caller supplied no price — the `INSERT` does not name the column at all in that case, because naming it with a 0 would override the default and produce an event Stripe refuses to charge.
+
+`CancelEvent` carries the guard **in the UPDATE's own `WHERE` clause**:
+
+```sql
+UPDATE events SET status = 'cancelled'
+ WHERE id = $1 AND status = 'active'
+   AND NOT EXISTS (SELECT 1 FROM reservations WHERE event_id = $1)
+```
+
+A `SELECT` then `UPDATE` would leave a window where two admins both see zero reservations and both write (Convention #13). The threshold is "any reservation EVER", not "any reservation is still live" — an expired reservation still proves a customer interacted with the drop.
+
+`ListEvents(ctx, pool, includeCancelled, limit, offset)` is the difference between the two audiences: the **public** catalogue passes `false` (live drops only) and the **admin** view passes `true` (the tombstones too). An empty result is an empty slice, never nil — a nil slice serialises to `null` in JSON.
 
 #### `internal/db/pool.go`
 
@@ -1851,14 +1904,46 @@ Exposed groups (full list in the file):
 
 ### `internal/admin/` — the support/ops API
 
-Four endpoints, all behind one HMAC verifier:
+Nine endpoints, all behind one HMAC verifier — the reservation resource and the event
+resource, sharing the same authentication, the same error shape and the same access log:
 
 ```
-GET  /admin/reservations/lookup?user_id=…   support lookup
-GET  /admin/reservations/{id}                support lookup
-POST /admin/reservations/{id}/cancel         cancel a held reservation
-POST /admin/reservations/{id}/release-seat   put a seat back on sale
+GET   /admin/reservations/lookup?user_id=…   support lookup
+GET   /admin/reservations/{id}                support lookup
+POST  /admin/reservations/{id}/cancel         cancel a held reservation
+POST  /admin/reservations/{id}/release-seat   put a seat back on sale
+
+POST  /admin/events                           create an event (+ seed its inventory)
+GET   /admin/events                           ops list (includes the tombstones)
+GET   /admin/events/{id}                      ops read one
+PATCH /admin/events/{id}                      update the name / price / currency, add seats
+POST  /admin/events/{id}/cancel               cancel an event (zero reservations only)
 ```
+
+#### `internal/admin/events_handlers.go` — the event resource
+
+**Creating an event writes to TWO stores, and it is all-or-nothing.** Insert the row in
+Postgres, seed the counter in Redis; if the seed fails, roll the row back. An event in
+Postgres with no counter in Redis cannot sell a seat and answers `event_not_found` to
+every customer — a trap, not a feature. The failure is `409 inventory_seed_failed`, not a
+500: it is a conflict between two stores, not a server fault.
+
+**Cancelling is REDIS FIRST, then Postgres.** The opposite of the obvious order, and the
+reason is the phantom seat. Redis-first: if the Postgres write fails, the drop is live but
+has no counter, so `reserve.lua` returns `event_not_found` — **no seat is sold and no
+reservation is lost**, and a retry fixes it. Postgres-first: if the Redis `DEL` fails,
+Redis still reports seats available against a cancelled event, reservations keep
+succeeding, and the seat is gone with no reservation row to explain it.
+
+**A refused cancel restores the counter to what it WAS.** The current count is read
+*before* the `DEL`, because `initial_inventory` and the live counter differ whenever a
+seat is currently held — and restoring the wrong one resurrects a sold seat. The drop
+would report more seats than it ever had, and the oversell would not show up until the
+counter went negative.
+
+**Adding seats changes Redis, not Postgres.** `initial_inventory` is the event's history
+("created with 100 seats"); the counter is the present ("137 left"). The two can never
+disagree about what the event *was*.
 
 **The signature.** `HMAC-SHA256(secret, method + "\n" + uri + "\n" + body + "\n" + timestamp)`,
 sent as `X-Admin-Key` (hex) + `X-Admin-Timestamp` (unix seconds). The URI includes the
@@ -2135,7 +2220,15 @@ Deterministic rather than random because a re-run of a half-finished migration m
 
 The migration handles **both** database shapes: an existing one (BIGINT → UUID) and a fresh one (where `001_init.sql` already declares the column as UUID and the migration has nothing to swap). The branch is on `pg_typeof` inside a `DO` block, because Postgres resolves a cast at parse time — a `CASE` containing `id::uuid` is rejected outright on a bigint column, even in a branch that would never be taken.
 
-**No event is seeded.** `migrations/002_seed.sql` is gone: events are created through the admin API, so a fresh database has zero events and the load-test targets require `EVENT_ID` to be passed in.
+**No event is seeded.** `migrations/002_seed.sql` is gone: events are created through the admin API, so a fresh database has zero events and the load-test targets CREATE one through that API.
+
+#### `migrations/011_event_status.sql`
+
+The `events` table gains a `status` column — `active` | `cancelled` — with a `CHECK` constraint so the allowed set is data, not a convention.
+
+The row is **NEVER deleted**. A cancelled event is a TOMBSTONE: it stays so that "we had a *Midnight Echo* drop, what happened to it?" still has an answer. The `DEFAULT 'active'` backfills every existing event without an `UPDATE` — an event that was sellable before this migration is still sellable after it.
+
+There is deliberately no index on `status` yet: the public catalogue lists a handful of drops, so a sequential scan is fine. When the catalogue grows to thousands, the index would be a partial one (`WHERE status = 'active'`).
 
 #### `migrations/003_add_seats.sql`
 
