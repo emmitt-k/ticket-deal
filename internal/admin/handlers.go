@@ -40,6 +40,19 @@ func (h *Handlers) Register(r chi.Router) {
 		// The two writes. Both are audited with actor_type='admin'.
 		r.Post("/reservations/{id}/cancel", h.Cancel)
 		r.Post("/reservations/{id}/release-seat", h.ReleaseSeat)
+
+		// The event resource (Layer 2, item 9b). The same
+		// verifier, the same error shape, the same access log.
+		//
+		// These routes are mounted under /admin, NOT under
+		// /admin/reservations, so the two resources stay
+		// separable: /admin/events is about the drop, and
+		// /admin/reservations is about a ticket.
+		r.Post("/events", h.CreateEvent)
+		r.Get("/events", h.ListEvents)
+		r.Get("/events/{id}", h.GetEvent)
+		r.Patch("/events/{id}", h.PatchEvent)
+		r.Post("/events/{id}/cancel", h.CancelEvent)
 	})
 }
 
