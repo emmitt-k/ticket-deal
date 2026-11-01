@@ -9,15 +9,19 @@
 #   ./loadtest/mint-jwts.sh 500       # 500 JWTs
 #   JWT_FILE=/tmp/custom.txt ./loadtest/mint-jwts.sh 1000
 #
-# ── EVENT_ID is REQUIRED ──────────────────────────────────────────────
+# ── EVENT_ID is optional ──────────────────────────────────────────────
 #
 # The event id is a UUID minted by the application, and no event is
-# seeded any more — so there is no id to default to. A default would
-# mint a thousand tokens scoped to an event that does not exist, and
-# every one of them would fail at the reserve step with a confusing
-# "event_not_found".
+# seeded any more — so there is no id to default to. But the admin API
+# can create one, so there is no need to write SQL by hand either.
 #
-# Get the id from the database:
+#   EVENT_ID=<uuid>   mint for this event
+#   (unset)           create one via the admin API, and mint for that
+#
+# The auto-create path is what makes the load test a zero-setup
+# command. It goes through the SAME admin API an organizer would use.
+#
+# To reuse an existing event:
 #
 #   docker exec -i ticket-postgres psql -U tickets -d tickets \
 #     -c "SELECT id FROM events LIMIT 1"
@@ -27,13 +31,15 @@ set -euo pipefail
 N=${1:-1000}
 JWT_FILE=${JWT_FILE:-/tmp/k6_jwts.txt}
 USER_PREFIX=${USER_PREFIX:-k6user}
-EVENT_ID=${EVENT_ID:-}
+
+if [ -z "${EVENT_ID:-}" ]; then
+    echo "▶ No EVENT_ID given — creating one via the admin API..."
+    EVENT_ID=$(./loadtest/create-event.sh 100 "Load Test Event")
+    echo "  created event: $EVENT_ID"
+fi
 
 if [ -z "$EVENT_ID" ]; then
-    echo "ERROR: EVENT_ID is required — it is the UUID of the event to load-test." >&2
-    echo "" >&2
-    echo "  Get it with:" >&2
-    echo "    docker exec -i ticket-postgres psql -U tickets -d tickets -c \"SELECT id FROM events LIMIT 1\"" >&2
+    echo "ERROR: EVENT_ID could not be determined." >&2
     exit 1
 fi
 # 600s matches the reserve-hold TTL — long enough for the 90s ramp test plus

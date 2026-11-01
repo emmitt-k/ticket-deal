@@ -2,40 +2,46 @@
 # Reset the system to a known clean state for the load test.
 #
 # Steps (idempotent — safe to re-run between test runs):
-#   1. Delete the reservations for $EVENT_ID, plus their audit + payment rows
-#   2. Delete all hold:* keys for that event in Redis
-#   3. Re-seed inventory:event:$EVENT_ID from Postgres via cmd/seed-inventory
-#   4. Print a one-line summary so you can eyeball it
+#   1. Make sure there is an event to test against
+#   2. Delete the reservations for $EVENT_ID, plus their audit + payment rows
+#   3. Delete all hold:* keys for that event in Redis
+#   4. Re-seed inventory:event:$EVENT_ID from Postgres via cmd/seed-inventory
+#   5. Print a one-line summary so you can eyeball it
 #
 # Run from the repo root.
 #
-# ── EVENT_ID is REQUIRED ──────────────────────────────────────────────
+# ── EVENT_ID is optional ───────────────────────────────────────────────
 #
-# There is no seeded event any more: the event id is a UUID minted by
-# the application, and events are created through the admin API. So
-# there is no id to default to — a default would silently reset an
-# event that does not exist, and the burst test would then measure
-# nothing while looking like it worked.
+# There is no seeded event any more (item 9a deleted the seed), so
+# there is no id to default to. But there IS a way to get one without
+# writing SQL: the admin API can create an event.
 #
-# Get the id from the database:
+#   EVENT_ID=<uuid>   use this event
+#   (unset)           CREATE one via the admin API, and use that
+#
+# The auto-create path is what makes `make loadtest-burst` a
+# zero-setup command. It goes through the SAME admin API an organizer
+# would use, so the event arrives with its inventory seeded and its
+# price default applied.
+#
+# To reuse an existing event:
 #
 #   docker exec -i ticket-postgres psql -U tickets -d tickets \
 #     -c "SELECT id FROM events LIMIT 1"
-#
-# or pass it in:
-#
-#   EVENT_ID=<uuid> ./loadtest/reset-state.sh
 
 set -euo pipefail
 
-EVENT_ID=${EVENT_ID:-}
 EXPECTED_INV=${EXPECTED_INV:-100}
 
+# ── 1. Make sure there is an event ─────────────────────────────────────
+if [ -z "${EVENT_ID:-}" ]; then
+    echo "▶ No EVENT_ID given — creating one via the admin API..."
+    EVENT_ID=$(./loadtest/create-event.sh "$EXPECTED_INV" "Load Test Event")
+    echo "  created event: $EVENT_ID"
+fi
+
 if [ -z "$EVENT_ID" ]; then
-    echo "ERROR: EVENT_ID is required — it is the UUID of the event to reset." >&2
-    echo "" >&2
-    echo "  Get it with:" >&2
-    echo "    docker exec -i ticket-postgres psql -U tickets -d tickets -c \"SELECT id FROM events LIMIT 1\"" >&2
+    echo "ERROR: could not determine an event id to load-test against." >&2
     exit 1
 fi
 

@@ -5,14 +5,17 @@
 # is documented via `##` after the colon; `make help` lists them.
 #
 # Common overrides (any target):
-#   make loadtest-burst VUS=500 EVENT_ID=<uuid>
+#   make loadtest-burst VUS=500
 #   make seed-inventory
 #
-# EVENT_ID is the event's UUID and is REQUIRED for the load-test
-# targets — no event is seeded any more, so there is no default. Get
-# the id with:
-#   docker exec -i ticket-postgres psql -U tickets -d tickets \
-#     -c "SELECT id FROM events LIMIT 1"
+# The load-test targets need an event, and there is no seeded one any
+# more — so with no EVENT_ID given they CREATE one through the admin
+# API. The whole load test is therefore a zero-setup command:
+#
+#   make loadtest-burst
+#
+# To reuse an existing event:
+#   make loadtest-burst EVENT_ID=<uuid>
 # ──────────────────────────────────────────────────────────────────────
 
 # ─── Variables ────────────────────────────────────────────────────────
@@ -22,6 +25,7 @@ PID_DIR         := $(LOG_DIR)
 JWT_FILE        ?= /tmp/k6_jwts.txt
 EVENT_ID        ?= 1
 VUS             ?= 1000
+SEATS           ?= 100
 K6_REST_ADDR    ?= localhost:6565
 DASHBOARD_ADDR  ?= :8082
 
@@ -70,6 +74,15 @@ migrate: ## Apply all SQL migrations in order
 
 seed: ## Seed Redis inventory from Postgres (cmd/seed-inventory)
 	$(GO) run ./cmd/seed-inventory
+
+# Create an event through the admin API and print its id. The
+# inventory is seeded into Redis at the same time, so the event is
+# immediately sellable.
+#
+#   make create-event              # 100 seats
+#   make create-event SEATS=250
+event: ## Create an event via the admin API (SEATS=100)
+	@./loadtest/create-event.sh $(SEATS)
 
 doctor: ## Check prereqs (go, docker, k6, curl)
 	@printf '\033[1mChecking prereqs...\033[0m\n'
